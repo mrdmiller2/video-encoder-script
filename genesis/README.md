@@ -2,6 +2,15 @@
 
 These are the earlier single-purpose encoders that `convert-v4.0.5.sh` grew from.
 
+## `convert-v1.sh` (original)
+
+- **Era:** Linux / NVIDIA (nvdec)
+- **Scope:** Current directory only; finds `.avi`, `.mp4`, `.mkv`, `.ts`
+- **Behavior:** AV1 transcode via HandBrake preset `AV1 MKV 2160p60 4K`, `svt_av1_10bit` q26, Opus 192 kbps, lapsharp, nvdec; or metadata-only when already AV1
+- **Output:** `{filename}-av1.mkv` beside the original
+
+This was the first general movie/TV batch encoder. The anime-specific variants below forked from it with different quality presets and platform targets.
+
 ## `convert-anime.sh`
 
 - **Era:** macOS / VideoToolbox

@@ -6,8 +6,9 @@ Portable Bash library organizer and batch transcoder for large home-media trees.
 
 ## Genesis
 
-This project evolved from two small anime-focused encoders in [`genesis/`](genesis/):
+This project evolved from three small batch encoders in [`genesis/`](genesis/):
 
+- **`convert-v1.sh`** — original Linux/nvdec AV1 encoder (`.avi`, `.mp4`, `.mkv`, `.ts` in cwd)
 - **`convert-anime.sh`** — macOS HandBrakeCLI + VideoToolbox, SVT-AV1 anime profile, Opus audio
 - **`convert-anime-flatpak.sh`** — same pipeline via Flatpak HandBrake + nvdec
 
