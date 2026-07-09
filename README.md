@@ -8,7 +8,7 @@ This script is portable (because I often have my windows laptop, mac, and linux 
 
 Bash library organizer and batch transcoder for large home-media trees. Targets **MKV + AV1** (kept when not more than **20% larger** than the source) with **x265** fallback, optional **ISO/Blu-ray** disc handling, and **sharded** directory scans for multi-thousand-file libraries.
 
-**Current release:** `convert-v4.0.8.sh` (v4.0.8)
+**Current release:** `convert-v4.0.18.sh` (v4.0.18)
 
 ## About this project
 
@@ -27,7 +27,17 @@ Each release is a **new file** — prior scripts stay in the repo for reference:
 | `convert-v4.0.5.sh` | 4.0.5 | Initial v4 release; 8 GB AV1 oversized threshold |
 | `convert-v4.0.6.sh` | 4.0.6 | 20% vs-original AV1 policy; `SCRIPT_NAME` check |
 | `convert-v4.0.7.sh` | 4.0.7 | Dry-run media inspection (name, format, length, resolution) |
-| `convert-v4.0.8.sh` | 4.0.8 | **Current** — `--skip-av1` / `--skip-x265`; dry-run skips encoder bake-off |
+| `convert-v4.0.8.sh` | 4.0.8 | `--skip-av1` / `--skip-x265`; dry-run skips encoder bake-off |
+| `convert-v4.0.9.sh` | 4.0.9 | Sequential jobs with live encode progress |
+| `convert-v4.0.10.sh` | 4.0.10 | Auto-resume + shard change detection |
+| `convert-v4.0.11.sh` | 4.0.11 | Bake-off failures no longer abort the queue |
+| `convert-v4.0.12.sh` | 4.0.12 | NVENC AV1 uses `nvenc_av1_10bit` + `slowest` + HQ encopts |
+| `convert-v4.0.13.sh` | 4.0.13 | Per-encoder CQ, Dolby Vision/HDR color metadata |
+| `convert-v4.0.14.sh` | 4.0.14 | Bake-off per profile class (movie/anime × SDR/HDR) |
+| `convert-v4.0.15.sh` | 4.0.15 | Auto-detect NVENC `tune=uhq` vs `tune=hq` |
+| `convert-v4.0.16.sh` | 4.0.16 | Validate existing outputs on restart before skip |
+| `convert-v4.0.17.sh` | 4.0.17 | First/last 30s decode validation (faster, catches aborts) |
+| `convert-v4.0.18.sh` | 4.0.18 | **Current** — master log at `--path`; shard logs merged/cleaned at end |
 
 When bumping version: copy the latest script to `convert-v{NEW}.sh`, update `VERSION` and `SCRIPT_NAME`, keep all older files. Do not rename or overwrite.
 
@@ -56,19 +66,19 @@ sudo dnf install ffmpeg mkvtoolnix HandBrake-cli
 ## Quick start
 
 ```bash
-chmod +x convert-v4.0.8.sh
+chmod +x convert-v4.0.9.sh
 
 # Dry-run on a large movies root (sharded by language folder)
-./convert-v4.0.8.sh -p /mnt/BigMomma/Media/Movies --dry-run
+./convert-v4.0.9.sh -p /mnt/BigMomma/Media/Movies --dry-run
 
 # Transcode only — one English letter shelf
-./convert-v4.0.8.sh -p /mnt/BigMomma/Media/Movies/English/D --convert-only --no-shard
+./convert-v4.0.9.sh -p /mnt/BigMomma/Media/Movies/English/D --convert-only --no-shard
 
 # Skip files already in AV1 or HEVC (e.g. only process h264 sources)
-./convert-v4.0.8.sh -p /mnt/BigMomma/Media/Movies --skip-av1 --skip-x265
+./convert-v4.0.9.sh -p /mnt/BigMomma/Media/Movies --skip-av1 --skip-x265
 
 # Television — preview one region first
-./convert-v4.0.8.sh -p /mnt/BabyBear/Media/Television/Thai --dry-run
+./convert-v4.0.9.sh -p /mnt/BabyBear/Media/Television/Thai --dry-run
 ```
 
 ## What it does
@@ -86,12 +96,15 @@ Before organize/convert phases, the script probes each video and disc source wit
 
 ### Phase 2 — Convert (default on)
 
-- Queue sorted **largest first**
-- **AV1** (svt_av1_10bit or nvenc_av1) kept when output is not more than **20% larger** than the source; else **x265** / nvenc_h265
+- Queue sorted **largest first**, processed **one file at a time** with live HandBrake progress (`Job 3 of 47`, percent complete, ETA)
+- **Auto-resume:** interrupted runs continue from the last incomplete file, or the next file after a completed one (`convert-v4.state` in the search path; `--no-resume` to start fresh)
+- **Shard tracking:** compares `convert-v4.shards` between runs and logs added/removed/changed shards and new files
+- **AV1** (svt_av1_10bit or nvenc_av1_10bit) kept when output is not more than **20% larger** than the source; else **x265** / nvenc_h265
 - Oversized AV1 (>20% vs original): 60s mid-file sample test before x265 retry
 - **ISO** and **BDMV** discs: auto-pick dominant title (>40% longer than all others); ambiguous discs skipped and logged
 - Originals are **never** deleted; outputs are `{Title}.AV1.mkv` or `{Title}.x265.mkv`
-- Session log: `{search-path}/convert-v4.log`
+- Session log: `{--path}/convert-v4.log` — single master log for the whole job (`tail -f` here). Runtime `[convert]` lines and stats both land here; never written to movie subfolders.
+- Per-shard scan logs (`convert-v4.shard.log`) may appear briefly under shard directories during sharded finds; they are merged into the master log and deleted when the session ends. Orphan `convert-v4.log` files under subfolders (e.g. from older per-movie runs) are merged and removed on startup/finalize.
 
 ## Large paths and sharding
 
@@ -99,13 +112,13 @@ Default `--shard-depth 1` discovers top-level subdirectories under `--path` and 
 
 ```bash
 # Movies — shard by language (default)
-./convert-v4.0.8.sh -p /mnt/BigMomma/Media/Movies
+./convert-v4.0.9.sh -p /mnt/BigMomma/Media/Movies
 
 # English only — shard by letter bucket (A, B, C, …)
-./convert-v4.0.8.sh -p /mnt/BigMomma/Media/Movies/English --shard-depth 2
+./convert-v4.0.9.sh -p /mnt/BigMomma/Media/Movies/English --shard-depth 2
 
 # Small tree — single find
-./convert-v4.0.8.sh -p /mnt/BigMomma/Media/Movies/English/D --no-shard
+./convert-v4.0.9.sh -p /mnt/BigMomma/Media/Movies/English/D --no-shard
 ```
 
 ## Common options
@@ -119,7 +132,7 @@ Default `--shard-depth 1` discovers top-level subdirectories under `--path` and 
 | `--organize-only` | Phase 1 only |
 | `--convert-only` | Phase 2 only |
 | `--shard-depth N` | Shard find at depth N (default: 1) |
-| `--no-shard` | Monolithic find |
+| `--no-resume` | Ignore saved resume state and process the full pending queue |
 | `--ffmpeg`, `--handbrake`, … | Tool path overrides |
 | `--help` | Full usage |
 
