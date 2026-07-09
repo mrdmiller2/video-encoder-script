@@ -1,8 +1,8 @@
 # Video Encoder script
 
-Portable Bash library organizer and batch transcoder for large home-media trees. Targets **MKV + AV1** (kept only when smaller than the source) with **x265** fallback, optional **ISO/Blu-ray** disc handling, and **sharded** directory scans for multi-thousand-file libraries.
+Portable Bash library organizer and batch transcoder for large home-media trees. Targets **MKV + AV1** (kept when not more than **20% larger** than the source) with **x265** fallback, optional **ISO/Blu-ray** disc handling, and **sharded** directory scans for multi-thousand-file libraries.
 
-**Current release:** `convert-v4.0.5.sh` (v4.0.5)
+**Current release:** `convert-v4.0.5.sh` (v4.0.6)
 
 ## Genesis
 
@@ -53,8 +53,8 @@ chmod +x convert-v4.0.5.sh
 ### Phase 2 — Convert (default on)
 
 - Queue sorted **largest first**
-- **AV1** (svt_av1_10bit or nvenc_av1) kept only if output ≤ original size; else **x265** / nvenc_h265
-- Oversized AV1 (>8 GB): 60s mid-file sample test before x265 retry
+- **AV1** (svt_av1_10bit or nvenc_av1) kept when output is not more than **20% larger** than the source; else **x265** / nvenc_h265
+- Oversized AV1 (>20% vs original): 60s mid-file sample test before x265 retry
 - **ISO** and **BDMV** discs: auto-pick dominant title (>40% longer than all others); ambiguous discs skipped and logged
 - Originals are **never** deleted; outputs are `{Title}.AV1.mkv` or `{Title}.x265.mkv`
 - Session log: `{search-path}/convert-v4.log`

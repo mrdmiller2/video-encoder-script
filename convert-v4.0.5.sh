@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # convert-v4.0.5.sh — Organize movie folders, transcode TV/movies to AV1/x265 MKV.
-# Version: 4.0.5
+# Version: 4.0.6
 #
 # Portable: Linux/WSL/Cygwin (bash 4+), macOS (auto re-exec under zsh — default Terminal shell).
 # Tool paths: CONVERT_* env vars or --ffmpeg/--handbrake/etc. CLI overrides.
 #   Processes largest files first. Logs space used/saved to convert-v4.log in source path.
 #   AV1 paths (svt + nvenc): Opus 112 kbps, all audio tracks kept, dialog DRC boost.
 #   x265 paths (x265 + nvenc_h265): AAC 128 kbps only. All subtitles/audio kept + labeled.
-#   AV1 kept only when output size <= original. Otherwise fall back to x265.
-#   Oversized AV1 (>8 GB): sample-test x265; re-encode only when sample is smaller.
+#   AV1 kept when output is not more than 20% larger than the original; else x265 fallback.
+#   Existing .AV1.mkv over 20% vs source: sample-test x265; re-encode when sample is smaller.
 #   Existing HEVC MKV is remux-copied to Title.x265.mkv (no re-encode).
 # Movies: every loose video goes into Title/Title.ext (years parenthesized, e.g. Sakura 1992
 #   -> Sakura (1992)/Sakura (1992).mkv). English libraries also use A–Z + 0 buckets.
@@ -41,7 +41,7 @@ fi
 
 set -euo pipefail
 
-VERSION="4.0.5"
+VERSION="4.0.6"
 SEARCH_PATH="."
 DRY_RUN=false
 DO_ORGANIZE=true
@@ -51,7 +51,7 @@ NO_SHARD=false
 DISK_TITLE_DOMINANCE_PCT=40
 SAMPLE_SECONDS=60
 SIZE_OVERSHOOT_PCT=5
-AV1_OVERSIZE_BYTES=$((8 * 1024 * 1024 * 1024))
+AV1_MAX_OVERSHOOT_PCT=20
 GPU_AV1=0
 GPU_HEVC_PRIMARY=0
 GPU_HEVC_FALLBACK=1
@@ -119,8 +119,8 @@ Tool paths (when not in PATH):
 Portable: Linux/WSL/Cygwin (bash 4+), macOS (zsh — re-exec'd automatically). macOS hw-decode: videotoolbox.
 
 Target format:
-  MKV container with AV1 video (kept only when output size <= original) or x265 fallback.
-  AV1 files over 8 GB are sample-tested; x265 is used when the sample compresses better.
+  MKV container with AV1 video (kept when ≤20% larger than source) or x265 fallback.
+  AV1 outputs more than 20% larger than the source trigger x265 fallback (sample-tested on existing .AV1.mkv).
   Outputs: {Title}.AV1.mkv or {Title}.x265.mkv alongside originals (originals never deleted).
   Disks (.iso / BDMV): dominant title auto-selected; ambiguous discs are skipped and logged.
   -h, --help              Show this help
@@ -644,8 +644,43 @@ av1_output_path() {
 
 is_oversized_av1() {
   local src="$1"
-  [ "$(video_codec "$src")" = "av1" ] || return 1
-  [ "$(file_size_bytes "$src")" -gt "$AV1_OVERSIZE_BYTES" ]
+  local orig orig_sz av1_sz
+  orig="$(find_original_source_for_av1 "$src")"
+  [ -n "$orig" ] || return 1
+  orig_sz="$(file_size_bytes "$orig")"
+  av1_sz="$(file_size_bytes "$src")"
+  awk -v o="$orig_sz" -v a="$av1_sz" -v lim="$AV1_MAX_OVERSHOOT_PCT" \
+    'BEGIN { if (o <= 0) exit 1; exit !(((a - o) / o) * 100 > lim) }'
+}
+
+# Non-derived sibling used as size reference for an AV1 output or AV1 library file.
+find_original_source_for_av1() {
+  local src="$1"
+  local dir title ext f
+  dir="$(dirname "$src")"
+  title="$(canonical_title_from_file "$src")"
+  for ext in mkv mp4 avi ts; do
+    f="$dir/$title.$ext"
+    [ -f "$f" ] || continue
+    [ "$f" = "$src" ] && continue
+    is_derived_output "$f" && continue
+    printf '%s' "$f"
+    return 0
+  done
+  return 1
+}
+
+av1_overshoot_pct_vs_original() {
+  local src="$1"
+  local orig orig_sz av1_sz
+  orig="$(find_original_source_for_av1 "$src")"
+  [ -n "$orig" ] || return 0
+  orig_sz="$(file_size_bytes "$orig")"
+  av1_sz="$(file_size_bytes "$src")"
+  awk -v o="$orig_sz" -v a="$av1_sz" 'BEGIN {
+    if (o <= 0) { print 0; exit }
+    printf "%.1f", ((a - o) / o) * 100
+  }'
 }
 
 needs_oversized_av1_recheck() {
@@ -1501,10 +1536,16 @@ validate_mkv_output() {
 size_keep_policy_av1() {
   local orig_sz="$1"
   local new_sz="$2"
+  local pct
   if [ "$new_sz" -le "$orig_sz" ]; then
     echo keep
-  else
+    return 0
+  fi
+  pct="$(awk -v o="$orig_sz" -v n="$new_sz" 'BEGIN { if (o<=0) print 100; else print ((n-o)/o)*100 }')"
+  if awk -v p="$pct" -v lim="$AV1_MAX_OVERSHOOT_PCT" 'BEGIN { exit !(p>lim) }'; then
     echo reject
+  else
+    echo keep
   fi
 }
 
@@ -1929,20 +1970,20 @@ process_existing_av1() {
 
   if is_oversized_av1 "$src"; then
     sz="$(file_size_bytes "$src")"
-    gb="$(awk -v s="$sz" 'BEGIN { printf "%.2f", s/1024/1024/1024 }')"
+    pct="$(av1_overshoot_pct_vs_original "$src")"
     if [ -f "$x265_out" ]; then
-      log "Oversized AV1 (${gb} GB) — x265 replacement already exists: $x265_out"
+      log "AV1 output ${pct}% vs original — x265 replacement already exists: $x265_out"
       finalize_mkv_output "$src" "$src" "$title"
       record_skip "$src" "x265 replacement exists"
       return 0
     fi
-    log "Oversized AV1 (${gb} GB) — testing whether x265 compresses better: $src"
+    log "AV1 output ${pct}% larger than original ($(human_size_bytes "$sz")) — testing whether x265 compresses better: $src"
     if x265_sample_smaller_than_av1 "$src"; then
-      warn "x265 sample was smaller — re-encoding oversized AV1 to x265"
+      warn "x265 sample was smaller — re-encoding bloated AV1 to x265"
       try_x265_convert "$src"
       return $?
     fi
-    log "x265 sample was not smaller — keeping oversized AV1"
+    log "x265 sample was not smaller — keeping AV1 (${pct}% vs original)"
     finalize_mkv_output "$src" "$src" "$title"
     record_conversion_result "$src" ""
     return 0
@@ -2012,7 +2053,7 @@ try_av1_convert() {
     return 0
   fi
 
-  warn "AV1 output larger than original ($(awk -v o="$orig_sz" -v n="$new_sz" 'BEGIN { printf "%.1f%%", (n/o)*100 }')) — trying x265 fallback"
+  warn "AV1 output >${AV1_MAX_OVERSHOOT_PCT}% larger than original ($(awk -v o="$orig_sz" -v n="$new_sz" 'BEGIN { printf "%.1f%%", (n/o)*100 }')) — trying x265 fallback"
   remove_output_only "$out"
   try_x265_convert "$src" "$hb_title" "$hb_dur"
 }
