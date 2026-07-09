@@ -8,7 +8,7 @@ This script is portable (because I often have my windows laptop, mac, and linux 
 
 Bash library organizer and batch transcoder for large home-media trees. Targets **MKV + AV1** (kept when not more than **20% larger** than the source) with **x265** fallback, optional **ISO/Blu-ray** disc handling, and **sharded** directory scans for multi-thousand-file libraries.
 
-**Current release:** `convert-v4.0.25.sh` (v4.0.25)
+**Current release:** `convert-v4.0.26.sh` (v4.0.26)
 
 ## About this project
 
@@ -44,7 +44,8 @@ Each release is a **new file** — prior scripts stay in the repo for reference:
 | `convert-v4.0.22.sh` | 4.0.22 | `sudo` + NFS: root writes mount, HandBrake as `$SUDO_USER` |
 | `convert-v4.0.23.sh` | 4.0.23 | Read-only NFS: log/resume in `~/.cache/convert-v4/` |
 | `convert-v4.0.24.sh` | 4.0.24 | `grep` required (not `rg`); fixes WSL without ripgrep |
-| `convert-v4.0.25.sh` | 4.0.25 | **Current** — prefers `rg`, falls back to `grep` |
+| `convert-v4.0.25.sh` | 4.0.25 | Prefers `rg`, falls back to `grep` |
+| `convert-v4.0.26.sh` | 4.0.26 | **Current** — 5-way HW matrix: NVIDIA / QSV / AMD VCE / VideoToolbox / software |
 
 When bumping version: copy the latest script to `convert-v{NEW}.sh`, update `VERSION` and `SCRIPT_NAME`, keep all older files. Do not rename or overwrite.
 
@@ -62,26 +63,60 @@ Those scripts scanned the current directory and wrote `{title}-av1.mkv`. v4 keep
 
 The script runs on **Linux**, **WSL2**, **Cygwin/MSYS2/Git Bash**, and **macOS**. It does **not** run in plain Windows PowerShell or CMD.
 
-### Tools (all platforms)
+### Prerequisites (install separately)
 
-| Tool | Used for |
-|------|----------|
-| **ffmpeg** / **ffprobe** | Probing, remux, validation decode windows, NVENC tune probe |
-| **HandBrakeCLI** | Transcode (AV1, HEVC, disc scan), hardware decode when available |
-| **mkvmerge** / **mkvpropedit** | Subtitles, metadata, output validation |
-| **grep** or **ripgrep (`rg`)** | Dolby Vision / HDR detection, encoder probes (prefers `rg`, falls back to `grep`) |
+These are **not** part of a default Linux, Windows, or macOS install. You must install them (or point the script at them with `CONVERT_*` / `--ffmpeg`, `--handbrake`, …).
 
-Override paths with `CONVERT_FFMPEG`, `CONVERT_HANDBRAKE`, etc., or `--ffmpeg`, `--handbrake`, …
+| Tool | Required? | Used for |
+|------|-----------|----------|
+| **ffmpeg** / **ffprobe** | Yes | Probing, remux, validation decode windows, NVENC tune probe |
+| **HandBrakeCLI** | Yes | Transcode (AV1, HEVC, disc scan), hardware decode when available |
+| **mkvmerge** / **mkvpropedit** (MKVToolNix) | Yes | Subtitle merge, track labels, metadata, output validation |
+| **python3** | Yes | Post-encode MKV track labeling (`label_mkv_tracks`; uses stdlib only) |
+| **grep** | Yes* | Dolby Vision / HDR detection, encoder probes (*normally preinstalled; required if `rg` is absent) |
 
-**Text search:** v4.0.25+ uses **ripgrep (`rg`) when installed**, otherwise **GNU `grep`**. At least one must be on `PATH`. Startup logs `search=rg` or `search=grep`.
+On startup the script prints the binaries it picked — that line is the source of truth for your machine.
+
+**Install examples (all required tools):**
 
 ```bash
-# Optional (faster on large ffprobe/HandBrake output):
+# Fedora / RHEL
+sudo dnf install ffmpeg mkvtoolnix HandBrake-cli python3 grep
+
+# Debian / Ubuntu / WSL
+sudo apt install ffmpeg mkvtoolnix handbrake-cli python3 grep
+
+# macOS
+brew install ffmpeg mkvtoolnix handbrake python3
+# grep and python3 are usually present; install python3 if `python3 --version` fails
+```
+
+### Optional tools (not required, but improve the workflow)
+
+**Hardware encoding:** For any large library, treat a GPU or Quick Sync / VCE encoder as a practical requirement — see **Hardware-accelerated encoding** below.
+
+| Tool | Platform | Used for |
+|------|----------|----------|
+| **ripgrep (`rg`)** | All | Faster text search on large ffprobe/HandBrake output (v4.0.25+ prefers `rg`, falls back to `grep`) |
+| **NVIDIA driver + `nvidia-smi`** | Linux / WSL / Cygwin | GPU encode detection; script can fall back to HandBrake's NVENC probe |
+| **Windows HandBrake** (`HandBrakeCLI.exe`) | WSL2 | NVENC on gaming laptops while ffmpeg/mkv tools stay in Linux WSL |
+| **Flatpak + HandBrake** (`fr.handbrake.ghb`) | Linux / WSL | Alternative HandBrake install when distro packages are missing |
+| **GNU `timeout`** | Linux / WSL | Caps NVENC tune probe at 120s; script runs the probe without a cap if absent |
+| **Homebrew** | macOS | Convenient way to install ffmpeg, MKVToolNix, HandBrake, and python3 |
+
+```bash
+# Optional — faster text search (v4.0.25+ logs search=rg when installed):
 sudo dnf install ripgrep    # Fedora
 sudo apt install ripgrep    # Debian/Ubuntu/WSL
 ```
 
-On startup the script prints the binaries it picked — that line is the source of truth for your machine.
+**Text search:** v4.0.25+ uses **ripgrep (`rg`) when installed**, otherwise **GNU `grep`**. At least one must be on `PATH`. Startup logs `search=rg` or `search=grep`.
+
+### Baseline OS utilities (no separate install on full distros)
+
+The script also expects standard Unix tools that ship with Linux, macOS, WSL, and Cygwin/Git Bash: `bash` 4+ (or `zsh` on macOS), `find`, `sort`, `awk`, `sed`, `stat`, `date`, `mktemp`, `mkdir`, `mv`, `rm`, `basename`, `dirname`, `cut`, `tr`, and on WSL **`wslpath`** (for Windows HandBrake path translation). Minimal container or embedded images may need `coreutils`, `findutils`, and `grep` in addition to the prerequisites above.
+
+Override tool paths with `CONVERT_FFMPEG`, `CONVERT_HANDBRAKE`, etc., or `--ffmpeg`, `--handbrake`, …
 
 ### Minimum versions (feature support)
 
@@ -104,23 +139,94 @@ HandBrakeCLI --help 2>&1 | grep -E 'nvenc_av1|nvenc_h265|svt_av1'
 
 Without a supported GPU, the script uses **software** encoders (`svt_av1_10bit`, `x265`) — correct but much slower.
 
+### Hardware-accelerated encoding (strongly recommended)
+
+For home-media libraries with thousands of files, **hardware-assisted encoding is not optional in practice** — software AV1/x265 on CPU can take many hours per title and will leave a large tree running for weeks. A GPU or integrated graphics encoder is the difference between an overnight batch and a multi-month backlog.
+
+| Vendor | Technology | HandBrake encoders (examples) | In this script |
+|--------|------------|-------------------------------|----------------|
+| **NVIDIA** | NVENC / NVDEC | `nvenc_av1_10bit`, `nvenc_h265` | **Auto-detected** on Linux, WSL2, and Cygwin — used for AV1 and HEVC |
+| **Intel** | Quick Sync Video (QSV) | `qsv_h265`, `qsv_h264` (`qsv_av1` on newer Arc) | **Auto-detected in v4.0.26+** — default priority **below NVIDIA**, above software; `qsv_h265` for HEVC |
+| **AMD** | VCE / VCN | `vce_h265`, `vce_h264` | **Auto-detected in v4.0.26+** — default below NVIDIA/QSV; needs amdgpu-pro/AMF on Linux for many distros |
+| **Apple** | VideoToolbox | `vt_h265`, `vt_h264` (encode); `videotoolbox` (decode) | **macOS only** — `vt_h265` for HEVC; AV1 via `svt_av1_10bit` with VideoToolbox decode. No NVIDIA/QSV path on Mac |
+
+**What to install for hardware encode:**
+
+- **NVIDIA (Linux / WSL / Windows host):** Proprietary drivers so `nvidia-smi` works (or HandBrake reports NVENC). No CUDA Toolkit required. RTX 40-series+ for GPU AV1; most GTX 10-series+ for HEVC NVENC.
+- **Intel:** CPU/iGPU with Quick Sync — ensure your distro HandBrake build includes QSV (`HandBrakeCLI --help | grep -i qsv`). You still need working drivers (`intel-media-driver`, `i915`, etc. on Linux).
+- **AMD:** Discrete or APU with VCE/AMF — ensure HandBrake was built with AMF/VCE support and Mesa/AMD drivers are current.
+
+Verify what HandBrake sees on your machine:
+
+```bash
+HandBrakeCLI --help 2>&1 | grep -iE 'nvenc|qsv|vce|amf|videotoolbox'
+```
+
+**Bottom line:** Run large jobs on a machine with **hardware encode** when possible. **NVIDIA NVENC** is the fastest path (GPU AV1 + HEVC). **Intel Quick Sync** (v4.0.26+) speeds up the HEVC/x265 fallback path substantially on laptops without a discrete GPU. **AMD CPUs** without NVIDIA still use software encoders in this script — fine for small batches, slow for whole regions.
+
+### Hardware combinations (v4.0.26+)
+
+The script probes **all** encoders HandBrake reports, then picks one **active** path. AV1 is always `svt_av1_10bit` (CPU) except when NVIDIA is active (`nvenc_av1_10bit` bake-off).
+
+| # | Hardware | Default active encoder | Override flag | If override HW missing |
+|---|----------|------------------------|---------------|-------------------------|
+| **1** | AMD CPU + NVIDIA GPU | NVIDIA NVENC | `--prefer-amd-vce` | Software (not NVIDIA) |
+| **2** | AMD CPU, no NVIDIA | AMD VCE/VCN → software | — | — |
+| **3** | Intel CPU + NVIDIA GPU | NVIDIA NVENC | `--prefer-intel-qsv` | Software (not NVIDIA) |
+| **4** | Intel CPU, no dGPU | Intel Quick Sync → software | — | — |
+| **5** | macOS | VideoToolbox (`vt_h265`) → software | — | — |
+
+**Default chain (Linux/WSL/Windows, no override):** NVIDIA → Intel QSV → AMD VCE → software
+
+```bash
+# Combo 1: AMD CPU + NVIDIA — prefer AMD iGPU/APU encode over discrete GPU
+./convert-v4.0.26.sh -p /mnt/Media/... --prefer-amd-vce
+
+# Combo 3: Intel CPU + NVIDIA — prefer Quick Sync over discrete GPU
+./convert-v4.0.26.sh -p /mnt/Media/... --prefer-intel-qsv
+
+# Force when HandBrake shows an encoder but auto-detect misses it
+export CONVERT_FORCE_AMD_VCE=1
+export CONVERT_FORCE_INTEL_QSV=1
+export CONVERT_FORCE_NVIDIA=1
+```
+
+`CONVERT_FORCE_*` takes precedence over `--prefer-*`. macOS ignores NVIDIA/QSV/AMD flags — VideoToolbox only.
+
+Startup logs: `nvidia=` `intel_qsv=` `amd_vce=` `active_encode=nvenc|qsv|amd_vce|videotoolbox|software`
+
+### Two-machine example (AMD desktop + Intel WSL2 laptop)
+
+| Machine | Typical hardware | What the script does |
+|---------|------------------|----------------------|
+| **AMD Linux desktop** | No NVIDIA; VCE if amdgpu-pro + HandBrake built with VCE | `amd_vce` or `software` — your AMD box likely lands on **software** unless VCE is in `HandBrakeCLI --help` |
+| **Intel WSL2 laptop** | iGPU with Quick Sync | **Use this for big TV/movie jobs.** Install **HandBrake for Windows** on the host; v4.0.26+ auto-picks `HandBrakeCLI.exe` when it reports QSV |
+
+**Intel WSL2 laptop (recommended workflow):**
+
+```bash
+# Verify Windows HandBrake sees Quick Sync (run in WSL):
+'/mnt/c/Program Files/HandBrake/HandBrakeCLI.exe' --help 2>&1 | grep -i qsv
+
+# Convert a large TV region — Linux ffmpeg/mkv, Windows HandBrake for QSV
+sudo ./convert-v4.0.26.sh -p /mnt/BabyBear/Media/Television/American \
+  --convert-only --no-shard \
+  --handbrake '/mnt/c/Program Files/HandBrake/HandBrakeCLI.exe'
+```
+
+Startup should log `WSL hybrid: Windows HandBrake (Intel Quick Sync)` and `HandBrake reports Intel Quick Sync — qsv_h265 for HEVC`. AV1 encodes still use CPU (`svt_av1_10bit`), but when a file falls back to x265 you get Quick Sync hardware speed.
+
+If QSV is present but not detected: `export CONVERT_FORCE_INTEL_QSV=1` or set `--handbrake` to the Windows `.exe` explicitly.
+
+**Note:** Intel QSV inside **Linux WSL** (distro `handbrake-cli`) usually does **not** work — the iGPU is not exposed the same way. The Windows HandBrake hybrid path is the reliable fix, same pattern as NVIDIA gaming laptops.
+
 ---
 
 ### Linux (native)
 
 **Shell:** bash 4+
 
-**Install example (Fedora):**
-
-```bash
-sudo dnf install ffmpeg mkvtoolnix HandBrake-cli
-```
-
-**Install example (Debian/Ubuntu):**
-
-```bash
-sudo apt install ffmpeg mkvtoolnix handbrake-cli
-```
+**Install:** see **Prerequisites** above (`ffmpeg`, `mkvtoolnix`, `HandBrake-cli`, `python3`, `grep`).
 
 **Optional:** Flatpak HandBrake (`fr.handbrake.ghb`) — auto-detected if distro packages are missing.
 
@@ -128,7 +234,7 @@ sudo apt install ffmpeg mkvtoolnix handbrake-cli
 
 On **WSL2 laptops**, GPU detection tries, in order: `nvidia-smi` (including `/mnt/c/Windows/System32/nvidia-smi.exe`), then **HandBrake's NVENC/NVDEC probe**. Override with `CONVERT_FORCE_NVIDIA=1` if needed.
 
-**WSL hybrid toolchain (common on gaming laptops):** Install **ffmpeg + mkvtoolnix + handbrake-cli** inside WSL (Linux packages). Install **HandBrake for Windows** on the host for NVENC. v4.0.20+ auto-detects `HandBrakeCLI.exe` under `/mnt/c/Program Files/HandBrake/` when it reports NVENC, while ffmpeg/ffprobe/mkvmerge stay on Linux PATH. File paths passed to the Windows `.exe` are translated via `wslpath -w`. Override only HandBrake if needed:
+**WSL hybrid toolchain (gaming laptops & Intel iGPU):** Install **ffmpeg + mkvtoolnix + handbrake-cli** inside WSL (Linux packages). Install **HandBrake for Windows** on the host for NVENC (NVIDIA) or Quick Sync (Intel). v4.0.26+ auto-detects `HandBrakeCLI.exe` under `/mnt/c/Program Files/HandBrake/` when it reports NVENC or QSV, while ffmpeg/ffprobe/mkvmerge stay on Linux PATH. File paths passed to the Windows `.exe` are translated via `wslpath -w`. Override only HandBrake if needed:
 
 ```bash
 export CONVERT_HANDBRAKE='/mnt/c/Program Files/HandBrake/HandBrakeCLI.exe'
@@ -163,8 +269,8 @@ Use quotes around the HandBrake path. Invoke as `sudo ./script.sh` (not `sudo ba
 **Linux vs Windows binaries:** ffmpeg, ffprobe, mkvmerge, and mkvpropedit are resolved from **Linux WSL PATH** only. HandBrake is special on WSL2 laptops — discovery order:
 
 1. `CONVERT_HANDBRAKE` / `--handbrake` override  
-2. Linux `HandBrakeCLI` on PATH (if it reports NVENC)  
-3. **Windows** `HandBrakeCLI.exe` at `/mnt/c/Program Files/HandBrake/` (or `CONVERT_HANDBRAKE_WIN`) when it reports NVENC  
+2. Linux `HandBrakeCLI` on PATH (if it reports NVENC or QSV)  
+3. **Windows** `HandBrakeCLI.exe` at `/mnt/c/Program Files/HandBrake/` (or `CONVERT_HANDBRAKE_WIN`) when it reports NVENC or QSV  
 4. Linux HandBrake on PATH (software encoders)  
 5. Flatpak HandBrake (Linux/WSL only)
 
@@ -175,7 +281,7 @@ When the Windows `.exe` is selected, input/output paths are translated with `wsl
 export CONVERT_HANDBRAKE='/mnt/c/Program Files/HandBrake/HandBrakeCLI.exe'
 ```
 
-**Recommendation:** **Linux packages inside WSL** for ffmpeg + mkvtoolnix; let v4.0.20+ auto-pick Windows HandBrake for NVENC.
+**Recommendation:** **Linux packages inside WSL** for ffmpeg + mkvtoolnix; let v4.0.26+ auto-pick Windows HandBrake for NVENC (NVIDIA laptop) or QSV (Intel laptop).
 
 **Mounting media in WSL:**
 
@@ -237,15 +343,16 @@ Less tested than WSL2; prefer WSL2 for large library jobs.
 
 **Shell:** zsh (automatic re-exec from bash 3.2).
 
-**Tools:**
-
-```bash
-brew install ffmpeg mkvtoolnix handbrake
-```
+**Install:** see **Prerequisites** above (`brew install ffmpeg mkvtoolnix handbrake python3`).
 
 HandBrake is also searched under `/Applications/HandBrake.app/Contents/MacOS/HandBrakeCLI`.
 
-**GPU:** No NVIDIA NVENC path on Apple Silicon / Intel Macs in this script. Hardware **decode** uses **VideoToolbox** when HandBrake supports it; **encode** is **software** (`svt_av1_10bit`, `x265`). Expect longer runtimes than a Linux/WSL NVIDIA box.
+**GPU / hardware encode:** macOS uses **VideoToolbox** (`vt_h265`) when HandBrake reports it — not NVIDIA or Intel Quick Sync. AV1 uses CPU (`svt_av1_10bit`) with VideoToolbox hardware **decode** when available. If VideoToolbox is missing, both paths fall back to software (`svt_av1_10bit`, `x265`).
+
+```bash
+# Verify VideoToolbox encoders
+HandBrakeCLI --help 2>&1 | grep -iE 'vt_h265|videotoolbox'
+```
 
 **Mounting media:**
 

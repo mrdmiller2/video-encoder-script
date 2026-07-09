@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# convert-v4.0.25.sh — Organize movie folders, transcode TV/movies to AV1/x265 MKV.
-# Version: 4.0.25
+# convert-v4.0.26.sh — Organize movie folders, transcode TV/movies to AV1/x265 MKV.
+# Version: 4.0.26
 # Naming: SCRIPT_NAME must match VERSION (convert-v{VERSION}.sh).
 #   On each bump: copy the prior script to a NEW filename; keep all older versions in the repo.
 #
@@ -17,8 +17,12 @@
 #   -> Sakura (1992)/Sakura (1992).mkv). English libraries also use A–Z + 0 buckets.
 # TV shows: S01E01 / EP01 / -01 patterns, or folders under Television/Anime — episodes stay put.
 # Encoders: NVENC when NVIDIA GPUs are present (nvidia-smi or HandBrake NVENC probe);
-#   otherwise svt_av1_10bit + x265 (software). CONVERT_FORCE_NVIDIA=1 to override.
-#   WSL2 hybrid: auto-picks Windows HandBrakeCLI.exe (NVENC) + Linux ffmpeg/mkvtoolnix.
+#   Intel Quick Sync (qsv_h265) when HandBrake reports QSV and NVIDIA is not selected;
+#   otherwise svt_av1_10bit + x265 (software).
+#   Linux/WSL/Windows priority: NVIDIA > Intel QSV > AMD VCE/VCN > software.
+#   Override NVIDIA: CONVERT_PREFER_INTEL_QSV=1 or CONVERT_PREFER_AMD_VCE=1.
+#   macOS: VideoToolbox (vt_h265) only — no NVIDIA/QSV/AMD path.
+#   WSL2 hybrid: auto-picks Windows HandBrakeCLI.exe (NVENC or QSV) + Linux ffmpeg/mkvtoolnix.
 #   ./convert-v4.0.8.sh --path /mnt/BigMomma/Media/Movies/Chinese
 #   ./convert-v4.0.8.sh -p /mnt/BigMomma/Media/Movies/English/D --dry-run
 #   ./convert-v4.0.8.sh -p /path --organize-only
@@ -51,7 +55,7 @@ fi
 
 set -euo pipefail
 
-VERSION="4.0.25"
+VERSION="4.0.26"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 SEARCH_PATH="."
 DRY_RUN=false
@@ -71,6 +75,16 @@ GPU_AV1=0
 GPU_HEVC_PRIMARY=0
 GPU_HEVC_FALLBACK=1
 HAS_NVIDIA=false
+HAS_INTEL_QSV=false
+HAS_AMD_VCE=false
+USE_NVIDIA_ENCODE=false
+USE_QSV_ENCODE=false
+USE_AMD_VCE_ENCODE=false
+USE_VT_ENCODE=false
+HAS_VIDEOTOOLBOX=false
+NVDEC_AVAILABLE=false
+QSV_DECODE_AVAILABLE=false
+ACTIVE_ENCODE_MODE=software
 NVIDIA_GPU_COUNT=0
 PLATFORM=unknown
 HAS_HW_DECODE=false
@@ -157,6 +171,8 @@ Options:
   --shard-depth N         Find media per subdirectory at depth N (default: 1; avoids huge finds)
   --no-shard              Single find across entire --path (old behavior)
   --no-resume             Ignore saved resume state and start the convert queue from scratch
+  --prefer-intel-qsv      Prefer Intel Quick Sync over NVIDIA when both are available
+  --prefer-amd-vce        Prefer AMD VCE/VCN over NVIDIA when both are available
 
 Tool paths (when not in PATH):
   --ffmpeg PATH           ffmpeg binary (or set CONVERT_FFMPEG)
@@ -173,6 +189,17 @@ Target format:
   Outputs: {Title}.AV1.mkv or {Title}.x265.mkv alongside originals (originals never deleted).
   Disks (.iso / BDMV): dominant title auto-selected; ambiguous discs are skipped and logged.
   -h, --help              Show this help
+
+Encoder priority (Linux/WSL/Windows):
+  1 AMD+NVIDIA GPU:  NVIDIA default; --prefer-amd-vce tries AMD VCE, else software
+  2 AMD, no NVIDIA:  AMD VCE if available, else software
+  3 Intel+NVIDIA:    NVIDIA default; --prefer-intel-qsv tries Quick Sync, else software
+  4 Intel, no NVIDIA: Quick Sync if available, else software
+  Chain: NVIDIA > Intel QSV > AMD VCE > software (when no override)
+  CONVERT_FORCE_NVIDIA=1 | CONVERT_FORCE_INTEL_QSV=1 | CONVERT_FORCE_AMD_VCE=1
+
+macOS (combination 5):
+  VideoToolbox (vt_h265) when HandBrake reports it, else software
 
 Examples:
   $0 --path /mnt/BigMomma/Media/Movies/Chinese
@@ -516,6 +543,26 @@ _handbrake_reports_nvenc() {
   fi
 }
 
+_handbrake_reports_qsv() {
+  local candidate="$1"
+  [ -n "$candidate" ] || return 1
+  if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$PLATFORM" = wsl ] && [[ "$candidate" == *.exe ]]; then
+    sudo -u "$SUDO_USER" -H -- "$candidate" --help 2>&1 | search_cie 'qsv_h265|qsv_h264|qsv_av1'
+  else
+    "$candidate" --help 2>&1 | search_cie 'qsv_h265|qsv_h264|qsv_av1'
+  fi
+}
+
+_handbrake_reports_amd_vce() {
+  local candidate="$1"
+  [ -n "$candidate" ] || return 1
+  if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$PLATFORM" = wsl ] && [[ "$candidate" == *.exe ]]; then
+    sudo -u "$SUDO_USER" -H -- "$candidate" --help 2>&1 | search_cie 'vce_h265|vce_h264|vcn_h265|vcn_h264'
+  else
+    "$candidate" --help 2>&1 | search_cie 'vce_h265|vce_h264|vcn_h265|vcn_h264'
+  fi
+}
+
 _wsl_windows_handbrake_candidates() {
   local candidate
   for candidate in \
@@ -581,7 +628,7 @@ _handbrake_translate_argv() {
 }
 
 discover_handbrake_cli() {
-  local candidate id linux_hb="" win_hb="" win_nvenc=""
+  local candidate id linux_hb="" win_hb="" win_nvenc="" win_qsv="" win_amd=""
 
   if candidate="$(resolve_configured_tool "$TOOL_HANDBRAKE" HandBrakeCLI)"; then
     _set_handbrake_cmd "$candidate"
@@ -598,6 +645,12 @@ discover_handbrake_cli() {
         win_nvenc="$candidate"
         break
       fi
+      if [ -z "$win_qsv" ] && _handbrake_reports_qsv "$candidate"; then
+        win_qsv="$candidate"
+      fi
+      if [ -z "$win_amd" ] && _handbrake_reports_amd_vce "$candidate"; then
+        win_amd="$candidate"
+      fi
       [ -z "$win_hb" ] && win_hb="$candidate"
     done < <(_wsl_windows_handbrake_candidates)
 
@@ -606,20 +659,40 @@ discover_handbrake_cli() {
       log "WSL hybrid: Windows HandBrake (NVENC); ffmpeg/mkv tools stay on Linux PATH"
       return 0
     fi
+    if [ -n "$win_qsv" ]; then
+      _set_handbrake_cmd "$win_qsv"
+      log "WSL hybrid: Windows HandBrake (Intel Quick Sync); ffmpeg/mkv tools stay on Linux PATH"
+      return 0
+    fi
+    if [ -n "$win_amd" ]; then
+      _set_handbrake_cmd "$win_amd"
+      log "WSL hybrid: Windows HandBrake (AMD VCE/VCN); ffmpeg/mkv tools stay on Linux PATH"
+      return 0
+    fi
     if [ -n "$linux_hb" ] && _handbrake_reports_nvenc "$linux_hb"; then
       _set_handbrake_cmd "$linux_hb"
+      return 0
+    fi
+    if [ -n "$linux_hb" ] && _handbrake_reports_qsv "$linux_hb"; then
+      _set_handbrake_cmd "$linux_hb"
+      log "Linux HandBrake reports Intel Quick Sync"
+      return 0
+    fi
+    if [ -n "$linux_hb" ] && _handbrake_reports_amd_vce "$linux_hb"; then
+      _set_handbrake_cmd "$linux_hb"
+      log "Linux HandBrake reports AMD VCE/VCN"
       return 0
     fi
     if [ -n "$linux_hb" ]; then
       _set_handbrake_cmd "$linux_hb"
       if [ -n "$win_hb" ]; then
-        warn "Linux HandBrake has no NVENC; install Windows HandBrake or set CONVERT_HANDBRAKE to the .exe path"
+        warn "Linux HandBrake has no NVENC/QSV/AMD VCE; install Windows HandBrake or set CONVERT_HANDBRAKE to the .exe path"
       fi
       return 0
     fi
     if [ -n "$win_hb" ]; then
       _set_handbrake_cmd "$win_hb"
-      warn "Using Windows HandBrake without NVENC probe — set CONVERT_FORCE_NVIDIA=1 if GPU encode is available"
+      warn "Using Windows HandBrake without hardware probe — set CONVERT_FORCE_NVIDIA=1, CONVERT_FORCE_INTEL_QSV=1, or CONVERT_FORCE_AMD_VCE=1 if needed"
       return 0
     fi
   else
@@ -813,41 +886,192 @@ end_convert_job() {
 
 detect_hw_environment() {
   HAS_NVIDIA=false
+  HAS_INTEL_QSV=false
+  HAS_AMD_VCE=false
+  USE_NVIDIA_ENCODE=false
+  USE_QSV_ENCODE=false
+  USE_AMD_VCE_ENCODE=false
+  USE_VT_ENCODE=false
   NVIDIA_GPU_COUNT=0
+  NVDEC_AVAILABLE=false
+  QSV_DECODE_AVAILABLE=false
   HAS_HW_DECODE=false
   HW_DECODE_NAME=""
+  ACTIVE_ENCODE_MODE=software
 
   case "$PLATFORM" in
     macos)
-      if run_handbrake --help 2>&1 | search_ci videotoolbox; then
+      if _detect_videotoolbox_via_handbrake; then
+        USE_VT_ENCODE=true
+        ACTIVE_ENCODE_MODE=videotoolbox
         HAS_HW_DECODE=true
         HW_DECODE_NAME=videotoolbox
-        log "Hardware decode: videotoolbox (macOS)"
+        log "Active encoder: VideoToolbox (vt_h265 for HEVC; AV1 via svt_av1_10bit)"
       else
-        warn "videotoolbox not available — software decode"
+        warn "VideoToolbox not available — software encoders (svt_av1_10bit, x265)"
       fi
       ;;
     linux|wsl|windows)
       if [ "${CONVERT_FORCE_NVIDIA:-}" = 1 ] || [ "${CONVERT_FORCE_NVIDIA:-}" = true ]; then
         HAS_NVIDIA=true
         NVIDIA_GPU_COUNT=1
-        HAS_HW_DECODE=true
-        HW_DECODE_NAME=nvdec
-        log "NVIDIA forced (CONVERT_FORCE_NVIDIA) — using nvenc + nvdec"
-      elif _detect_nvidia_via_smi; then
-        :
-      elif _detect_nvidia_via_handbrake; then
-        :
+        NVDEC_AVAILABLE=true
+        log "NVIDIA encode capability forced (CONVERT_FORCE_NVIDIA)"
+      else
+        _detect_nvidia_via_smi || _detect_nvidia_via_handbrake || true
       fi
-      if [ "$HAS_NVIDIA" = false ]; then
-        warn "No NVIDIA GPU — using software encoders (svt_av1_10bit, x265)"
-        warn "If HandBrake shows NVENC/NVDEC, set CONVERT_FORCE_NVIDIA=1 or install nvidia-smi in WSL"
+
+      if [ "${CONVERT_FORCE_INTEL_QSV:-}" = 1 ] || [ "${CONVERT_FORCE_INTEL_QSV:-}" = true ]; then
+        HAS_INTEL_QSV=true
+        QSV_DECODE_AVAILABLE=true
+        log "Intel Quick Sync capability forced (CONVERT_FORCE_INTEL_QSV)"
+      else
+        _detect_intel_qsv_via_handbrake || true
+      fi
+
+      if [ "${CONVERT_FORCE_AMD_VCE:-}" = 1 ] || [ "${CONVERT_FORCE_AMD_VCE:-}" = true ]; then
+        HAS_AMD_VCE=true
+        log "AMD VCE/VCN capability forced (CONVERT_FORCE_AMD_VCE)"
+      else
+        _detect_amd_vce_via_handbrake || true
+      fi
+
+      _resolve_hw_encode_priority
+
+      if [ "$USE_NVIDIA_ENCODE" = false ] && [ "$USE_QSV_ENCODE" = false ] \
+        && [ "$USE_AMD_VCE_ENCODE" = false ]; then
+        warn "No hardware encoder selected — using software (svt_av1_10bit, x265)"
+        if [ "$HAS_NVIDIA" = false ] && [ "$HAS_INTEL_QSV" = false ] && [ "$HAS_AMD_VCE" = false ]; then
+          warn "If HandBrake shows NVENC, QSV, or VCE, set CONVERT_FORCE_NVIDIA=1, CONVERT_FORCE_INTEL_QSV=1, or CONVERT_FORCE_AMD_VCE=1"
+        fi
       fi
       ;;
     *)
       warn "Unknown platform — software encoders only"
       ;;
   esac
+}
+
+_apply_active_hw_decode() {
+  HAS_HW_DECODE=false
+  HW_DECODE_NAME=""
+  if [ "$USE_NVIDIA_ENCODE" = true ] && [ "$NVDEC_AVAILABLE" = true ]; then
+    HAS_HW_DECODE=true
+    HW_DECODE_NAME=nvdec
+  elif [ "$USE_QSV_ENCODE" = true ] && [ "$QSV_DECODE_AVAILABLE" = true ]; then
+    HAS_HW_DECODE=true
+    HW_DECODE_NAME=qsv
+  fi
+}
+
+_resolve_hw_encode_priority() {
+  USE_NVIDIA_ENCODE=false
+  USE_QSV_ENCODE=false
+  USE_AMD_VCE_ENCODE=false
+  ACTIVE_ENCODE_MODE=software
+
+  if [ "${CONVERT_FORCE_NVIDIA:-}" = 1 ] || [ "${CONVERT_FORCE_NVIDIA:-}" = true ]; then
+    USE_NVIDIA_ENCODE=true
+    ACTIVE_ENCODE_MODE=nvenc
+    _apply_active_hw_decode
+    log "Active encoder: NVIDIA NVENC (forced)"
+    return 0
+  fi
+
+  if [ "${CONVERT_FORCE_INTEL_QSV:-}" = 1 ] || [ "${CONVERT_FORCE_INTEL_QSV:-}" = true ]; then
+    if [ "$HAS_INTEL_QSV" = true ]; then
+      USE_QSV_ENCODE=true
+      ACTIVE_ENCODE_MODE=qsv
+      _apply_active_hw_decode
+      log "Active encoder: Intel Quick Sync (forced)"
+    else
+      warn "CONVERT_FORCE_INTEL_QSV set but Quick Sync not available — software encoders"
+    fi
+    return 0
+  fi
+
+  if [ "${CONVERT_FORCE_AMD_VCE:-}" = 1 ] || [ "${CONVERT_FORCE_AMD_VCE:-}" = true ]; then
+    if [ "$HAS_AMD_VCE" = true ]; then
+      USE_AMD_VCE_ENCODE=true
+      ACTIVE_ENCODE_MODE=amd_vce
+      _apply_active_hw_decode
+      log "Active encoder: AMD VCE/VCN (forced)"
+    else
+      warn "CONVERT_FORCE_AMD_VCE set but AMD VCE/VCN not available — software encoders"
+    fi
+    return 0
+  fi
+
+  if [ "${CONVERT_PREFER_INTEL_QSV:-}" = 1 ] || [ "${CONVERT_PREFER_INTEL_QSV:-}" = true ]; then
+    if [ "$HAS_INTEL_QSV" = true ]; then
+      USE_QSV_ENCODE=true
+      ACTIVE_ENCODE_MODE=qsv
+      _apply_active_hw_decode
+      if [ "$HAS_NVIDIA" = true ]; then
+        log "Active encoder: Intel Quick Sync (CONVERT_PREFER_INTEL_QSV; NVIDIA skipped)"
+      else
+        log "Active encoder: Intel Quick Sync"
+      fi
+    else
+      warn "CONVERT_PREFER_INTEL_QSV set but Quick Sync not available — software encoders (NVIDIA skipped)"
+    fi
+    return 0
+  fi
+
+  if [ "${CONVERT_PREFER_AMD_VCE:-}" = 1 ] || [ "${CONVERT_PREFER_AMD_VCE:-}" = true ]; then
+    if [ "$HAS_AMD_VCE" = true ]; then
+      USE_AMD_VCE_ENCODE=true
+      ACTIVE_ENCODE_MODE=amd_vce
+      _apply_active_hw_decode
+      if [ "$HAS_NVIDIA" = true ]; then
+        log "Active encoder: AMD VCE/VCN (CONVERT_PREFER_AMD_VCE; NVIDIA skipped)"
+      else
+        log "Active encoder: AMD VCE/VCN"
+      fi
+    else
+      warn "CONVERT_PREFER_AMD_VCE set but AMD VCE/VCN not available — software encoders (NVIDIA skipped)"
+    fi
+    return 0
+  fi
+
+  if [ "$HAS_NVIDIA" = true ]; then
+    USE_NVIDIA_ENCODE=true
+    ACTIVE_ENCODE_MODE=nvenc
+    _apply_active_hw_decode
+    _log_alternate_hw_encoders "NVIDIA NVENC"
+    return 0
+  fi
+
+  if [ "$HAS_INTEL_QSV" = true ]; then
+    USE_QSV_ENCODE=true
+    ACTIVE_ENCODE_MODE=qsv
+    _apply_active_hw_decode
+    log "Active encoder: Intel Quick Sync"
+    return 0
+  fi
+
+  if [ "$HAS_AMD_VCE" = true ]; then
+    USE_AMD_VCE_ENCODE=true
+    ACTIVE_ENCODE_MODE=amd_vce
+    _apply_active_hw_decode
+    log "Active encoder: AMD VCE/VCN"
+    return 0
+  fi
+
+  log "Active encoder: software (svt_av1_10bit, x265)"
+}
+
+_log_alternate_hw_encoders() {
+  local primary="$1"
+  local -a alt=()
+
+  [ "$HAS_INTEL_QSV" = true ] && alt+=("Intel Quick Sync")
+  [ "$HAS_AMD_VCE" = true ] && alt+=("AMD VCE/VCN")
+  if [ "${#alt[@]}" -eq 0 ]; then
+    log "Active encoder: $primary"
+    return 0
+  fi
+  log "Active encoder: $primary (${alt[*]} also detected; use --prefer-intel-qsv or --prefer-amd-vce to override)"
 }
 
 # Resolve nvidia-smi on WSL/Cygwin where it may not be on PATH (Windows .exe still works).
@@ -882,9 +1106,8 @@ _detect_nvidia_via_smi() {
   NVIDIA_GPU_COUNT="$(search_count_e '^GPU [0-9]+:' "$list")"
   if [ "${NVIDIA_GPU_COUNT:-0}" -gt 0 ]; then
     HAS_NVIDIA=true
-    HAS_HW_DECODE=true
-    HW_DECODE_NAME=nvdec
-    log "Detected $NVIDIA_GPU_COUNT NVIDIA GPU(s) via $smi — nvenc + nvdec available"
+    NVDEC_AVAILABLE=true
+    log "Detected $NVIDIA_GPU_COUNT NVIDIA GPU(s) via $smi — NVENC available"
     return 0
   fi
   return 1
@@ -902,11 +1125,58 @@ _detect_nvidia_via_handbrake() {
   HAS_NVIDIA=true
   NVIDIA_GPU_COUNT=1
   if search_cie 'nvdec: is available|Use .nvdec. to enable' <<<"$hb_help"; then
-    HAS_HW_DECODE=true
-    HW_DECODE_NAME=nvdec
-    log "HandBrake reports NVENC/NVDEC (no nvidia-smi) — using GPU encoders"
+    NVDEC_AVAILABLE=true
+    log "HandBrake reports NVENC/NVDEC (no nvidia-smi)"
   else
-    log "HandBrake reports NVENC (no nvidia-smi) — using GPU encoders; software decode"
+    log "HandBrake reports NVENC (no nvidia-smi); hardware decode not confirmed"
+  fi
+  return 0
+}
+
+_detect_intel_qsv_via_handbrake() {
+  local hb_help
+
+  hb_help="$(run_handbrake --help 2>&1)" || return 1
+  if ! search_cie 'qsv_h265|qsv_h264|qsv_av1' <<<"$hb_help"; then
+    return 1
+  fi
+
+  HAS_INTEL_QSV=true
+  if search_cie 'qsv: is available|Use .qsv. to enable' <<<"$hb_help"; then
+    QSV_DECODE_AVAILABLE=true
+    log "HandBrake reports Intel Quick Sync (encode + decode)"
+  else
+    log "HandBrake reports Intel Quick Sync encoders; hardware decode not confirmed"
+  fi
+  return 0
+}
+
+_detect_amd_vce_via_handbrake() {
+  local hb_help
+
+  hb_help="$(run_handbrake --help 2>&1)" || return 1
+  if ! search_cie 'vce_h265|vce_h264|vcn_h265|vcn_h264' <<<"$hb_help"; then
+    return 1
+  fi
+
+  HAS_AMD_VCE=true
+  log "HandBrake reports AMD VCE/VCN (vce_h265); no hardware decode in HandBrake"
+  return 0
+}
+
+_detect_videotoolbox_via_handbrake() {
+  local hb_help
+
+  hb_help="$(run_handbrake --help 2>&1)" || return 1
+  if ! search_cie 'vt_h265|vt_h264' <<<"$hb_help"; then
+    return 1
+  fi
+
+  HAS_VIDEOTOOLBOX=true
+  if search_ci videotoolbox <<<"$hb_help"; then
+    log "HandBrake reports VideoToolbox (vt_h265 encode + videotoolbox decode)"
+  else
+    log "HandBrake reports VideoToolbox encoders (vt_h265)"
   fi
   return 0
 }
@@ -921,7 +1191,7 @@ detect_nvenc_av1_tune() {
   local -a hb_args=()
 
   NVENC_AV1_TUNE=hq
-  if [ "$HAS_NVIDIA" = false ]; then
+  if [ "$USE_NVIDIA_ENCODE" = false ]; then
     return 0
   fi
 
@@ -1017,6 +1287,8 @@ while [ $# -gt 0 ]; do
     --shard-depth) SHARD_DEPTH="$2"; shift 2 ;;
     --no-shard) NO_SHARD=true; shift ;;
     --no-resume) NO_RESUME=true; shift ;;
+    --prefer-intel-qsv) CONVERT_PREFER_INTEL_QSV=1; shift ;;
+    --prefer-amd-vce) CONVERT_PREFER_AMD_VCE=1; shift ;;
     --ffmpeg) TOOL_FFMPEG="$2"; shift 2 ;;
     --ffprobe) TOOL_FFPROBE="$2"; shift 2 ;;
     --handbrake) TOOL_HANDBRAKE="$2"; shift 2 ;;
@@ -1956,7 +2228,7 @@ init_stats_log() {
     echo "path: $SEARCH_PATH"
     echo "log_dir: $JOB_SIDECAR_DIR"
     echo "job_root_writable: $JOB_ROOT_WRITABLE"
-    echo "dry_run: $DRY_RUN | organize: $DO_ORGANIZE | convert: $DO_CONVERT | skip_av1: $SKIP_AV1 | skip_x265: $SKIP_X265 | nvidia: $HAS_NVIDIA"
+    echo "dry_run: $DRY_RUN | organize: $DO_ORGANIZE | convert: $DO_CONVERT | skip_av1: $SKIP_AV1 | skip_x265: $SKIP_X265 | nvidia: $HAS_NVIDIA | intel_qsv: $HAS_INTEL_QSV | amd_vce: $HAS_AMD_VCE | active_encode: $ACTIVE_ENCODE_MODE"
     echo "order: largest to smallest"
     if [ "$DRY_RUN" = true ]; then
       echo "inspect: name | video format | length | resolution (no conversion)"
@@ -2878,7 +3150,7 @@ encoder_ssim_score() {
 }
 
 bakeoff_default_av1_encoder() {
-  if [ "$HAS_NVIDIA" = true ]; then
+  if [ "$USE_NVIDIA_ENCODE" = true ]; then
     AV1_ENCODER="svt_av1_10bit"
     warn "Bake-off incomplete — defaulting to $AV1_ENCODER (nvenc_av1_10bit sample failed)"
   else
@@ -2975,6 +3247,33 @@ load_encoder_profile() {
         EP_AUDIO_BITRATE=$AAC_BITRATE
         EP_HW_DECODE=true
         ;;
+      qsv_h265)
+        EP_PRESET=medium
+        EP_QUALITY=24
+        EP_ENCOPTS='lowpower=0'
+        EP_VIDEO_FILTERS=(--lapsharp=light)
+        EP_AUDIO_CODEC=aac
+        EP_AUDIO_BITRATE=$AAC_BITRATE
+        EP_HW_DECODE=true
+        ;;
+      vt_h265)
+        EP_PRESET=
+        EP_QUALITY=60
+        EP_ENCOPTS='bframes=1'
+        EP_VIDEO_FILTERS=(--lapsharp=light)
+        EP_AUDIO_CODEC=aac
+        EP_AUDIO_BITRATE=$AAC_BITRATE
+        EP_HW_DECODE=true
+        ;;
+      vce_h265)
+        EP_PRESET=
+        EP_QUALITY=22
+        EP_ENCOPTS='preanalysis=1'
+        EP_VIDEO_FILTERS=(--lapsharp=light)
+        EP_AUDIO_CODEC=aac
+        EP_AUDIO_BITRATE=$AAC_BITRATE
+        EP_HW_DECODE=false
+        ;;
       *)
         err "Unknown encoder profile: $encoder"
         return 1
@@ -3015,6 +3314,30 @@ load_encoder_profile() {
       EP_AUDIO_CODEC=aac
       EP_AUDIO_BITRATE=$AAC_BITRATE
       EP_HW_DECODE=true
+      ;;
+    qsv_h265)
+      EP_PRESET=medium
+      EP_QUALITY=22
+      EP_ENCOPTS='lowpower=0'
+      EP_AUDIO_CODEC=aac
+      EP_AUDIO_BITRATE=$AAC_BITRATE
+      EP_HW_DECODE=true
+      ;;
+    vt_h265)
+      EP_PRESET=
+      EP_QUALITY=58
+      EP_ENCOPTS='bframes=1'
+      EP_AUDIO_CODEC=aac
+      EP_AUDIO_BITRATE=$AAC_BITRATE
+      EP_HW_DECODE=true
+      ;;
+    vce_h265)
+      EP_PRESET=
+      EP_QUALITY=22
+      EP_ENCOPTS='preanalysis=1'
+      EP_AUDIO_CODEC=aac
+      EP_AUDIO_BITRATE=$AAC_BITRATE
+      EP_HW_DECODE=false
       ;;
     *)
       err "Unknown encoder profile: $encoder"
@@ -3072,10 +3395,13 @@ build_handbrake_args() {
 
   _out=(
     -i "$src" -o "$dst" -f mkv -m -O
-    -e "$encoder" -q "$EP_QUALITY" --encoder-preset "$EP_PRESET"
+    -e "$encoder" -q "$EP_QUALITY"
     --all-subtitles --keep-subname
     --subtitle-burned=none --subtitle-default=none
   )
+  if [ -n "$EP_PRESET" ]; then
+    _out+=(--encoder-preset "$EP_PRESET")
+  fi
 
   if [ -n "$hb_title" ]; then
     _out+=(-t "$hb_title")
@@ -3112,7 +3438,7 @@ pick_av1_encoder() {
   svt_out="$tmp/svt.mkv"
 
   if [ "$DRY_RUN" = true ]; then
-    if [ "$HAS_NVIDIA" = true ]; then
+    if [ "$USE_NVIDIA_ENCODE" = true ]; then
       AV1_ENCODER="nvenc_av1_10bit"
       log "[dry-run] Would run encoder bake-off; defaulting to $AV1_ENCODER"
     else
@@ -3128,7 +3454,7 @@ pick_av1_encoder() {
   local svt_cq nv_cq
   load_encoder_profile svt_av1_10bit "$sample_src"
   svt_cq="$EP_QUALITY"
-  if [ "$HAS_NVIDIA" = true ]; then
+  if [ "$USE_NVIDIA_ENCODE" = true ]; then
     load_encoder_profile nvenc_av1_10bit "$sample_src"
     nv_cq="$EP_QUALITY"
     log "Bake-off CQ (scales differ): svt_av1_10bit=$svt_cq vs nvenc_av1_10bit=$nv_cq"
@@ -3175,7 +3501,7 @@ pick_av1_encoder() {
       "${EP_VIDEO_FILTERS[@]}" "${hb_color_extra[@]}" || warn "Bake-off: svt_av1_10bit sample encode failed"
   fi
 
-  if [ "$HAS_NVIDIA" = true ]; then
+  if [ "$USE_NVIDIA_ENCODE" = true ]; then
     load_encoder_profile nvenc_av1_10bit "$sample_src"
     if [ -n "$hb_title" ]; then
       CUDA_VISIBLE_DEVICES="$GPU_AV1" run_handbrake_with_progress "Bake-off: nvenc_av1_10bit" -i "$sample_src" -t "$hb_title" -o "$nvenc_out" -f mkv \
@@ -3243,9 +3569,18 @@ encode_sample_x265() {
   local encoder gpu
   local -a hb_args=()
 
-  if [ "$HAS_NVIDIA" = true ]; then
+  if [ "$USE_NVIDIA_ENCODE" = true ]; then
     encoder="nvenc_h265"
     gpu="$GPU_HEVC_PRIMARY"
+  elif [ "$USE_QSV_ENCODE" = true ]; then
+    encoder="qsv_h265"
+    gpu=""
+  elif [ "$USE_VT_ENCODE" = true ]; then
+    encoder="vt_h265"
+    gpu=""
+  elif [ "$USE_AMD_VCE_ENCODE" = true ]; then
+    encoder="vce_h265"
+    gpu=""
   else
     encoder="x265"
     gpu=""
@@ -3313,7 +3648,7 @@ handbrake_encode() {
 
   local progress_label="Encoding ($encoder)"
   local saved_cuda="${CUDA_VISIBLE_DEVICES:-}"
-  if [ -n "$gpu" ] && [ "$HAS_NVIDIA" = true ]; then
+  if [ -n "$gpu" ] && [ "$USE_NVIDIA_ENCODE" = true ]; then
     export CUDA_VISIBLE_DEVICES="$gpu"
   else
     unset CUDA_VISIBLE_DEVICES 2>/dev/null || CUDA_VISIBLE_DEVICES=
@@ -3411,7 +3746,7 @@ try_av1_convert() {
   [ -n "$AV1_ENCODER" ] || AV1_ENCODER="svt_av1_10bit"
 
   gpu="$GPU_AV1"
-  if [ "$AV1_ENCODER" = "svt_av1_10bit" ] || [ "$HAS_NVIDIA" = false ]; then
+  if [ "$AV1_ENCODER" = "svt_av1_10bit" ] || [ "$USE_NVIDIA_ENCODE" = false ]; then
     gpu=""
   fi
 
@@ -3482,7 +3817,7 @@ try_x265_convert() {
     return 0
   fi
 
-  if [ "$HAS_NVIDIA" = true ]; then
+  if [ "$USE_NVIDIA_ENCODE" = true ]; then
     encoder="nvenc_h265"
     gpu="$GPU_HEVC_PRIMARY"
     log "x265 transcode (nvenc_h265, GPU $gpu): $src"
@@ -3495,6 +3830,18 @@ try_x265_convert() {
         return 1
       fi
     }
+  elif [ "$USE_QSV_ENCODE" = true ]; then
+    encoder="qsv_h265"
+    log "x265 transcode (qsv_h265, Intel Quick Sync): $src"
+    handbrake_encode "$src" "$out" "$encoder" "" "$hb_title" || { remove_output_only "$out"; return 1; }
+  elif [ "$USE_VT_ENCODE" = true ]; then
+    encoder="vt_h265"
+    log "x265 transcode (vt_h265, VideoToolbox): $src"
+    handbrake_encode "$src" "$out" "$encoder" "" "$hb_title" || { remove_output_only "$out"; return 1; }
+  elif [ "$USE_AMD_VCE_ENCODE" = true ]; then
+    encoder="vce_h265"
+    log "x265 transcode (vce_h265, AMD VCE/VCN): $src"
+    handbrake_encode "$src" "$out" "$encoder" "" "$hb_title" || { remove_output_only "$out"; return 1; }
   else
     encoder="x265"
     log "x265 transcode (software x265): $src"
@@ -3745,7 +4092,7 @@ main() {
   detect_nvenc_av1_tune
   trap resume_on_signal INT TERM
   log "$SCRIPT_NAME v$VERSION"
-  log "Path: $SEARCH_PATH (platform=$PLATFORM shell=$(shell_name) dry_run=$DRY_RUN organize=$DO_ORGANIZE convert=$DO_CONVERT skip_av1=$SKIP_AV1 skip_x265=$SKIP_X265 shard_depth=$SHARD_DEPTH no_shard=$NO_SHARD nvidia=$HAS_NVIDIA hw_decode=${HW_DECODE_NAME:-none})"
+  log "Path: $SEARCH_PATH (platform=$PLATFORM shell=$(shell_name) dry_run=$DRY_RUN organize=$DO_ORGANIZE convert=$DO_CONVERT skip_av1=$SKIP_AV1 skip_x265=$SKIP_X265 shard_depth=$SHARD_DEPTH no_shard=$NO_SHARD nvidia=$HAS_NVIDIA intel_qsv=$HAS_INTEL_QSV amd_vce=$HAS_AMD_VCE videotoolbox=$HAS_VIDEOTOOLBOX active_encode=$ACTIVE_ENCODE_MODE hw_decode=${HW_DECODE_NAME:-none})"
   log "Master log: $MASTER_LOG_FILE (job_root_writable=$JOB_ROOT_WRITABLE)"
 
   if [ "$DRY_RUN" = true ]; then
