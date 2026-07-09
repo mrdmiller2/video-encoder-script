@@ -10,6 +10,14 @@ Bash library organizer and batch transcoder for large home-media trees. Targets 
 
 **Current release:** `convert-v4.0.8.sh` (v4.0.8)
 
+## About this project
+
+I started this project back in 2024 because my video libraries were getting too large — I can't keep buying drives — and I wanted uniformity in file formats. After more than ten years of collecting, I needed a way to convert and let it run. HandBrakeCLI does a great job at conversion, but it takes too long to batch things by hand. And I like my data organized where possible.
+
+Hence this little project. It converts, organizes, and strips out old junk metadata. We get things from "places" and don't want Plex or other apps surfacing that, so at the end you have a nice clean AV1 file or an x265 file — whichever works best and gives the best size. It has been my experience that not every conversion yields good results, so I added logic: if the AV1 output is larger than the source, try x265 instead.
+
+The script is portable because I often have my Windows laptop, Mac, and Linux machines working on the same libraries. Over time that meant three or six separate scripts — some for anime, some for Flatpak HandBrake, some for regular movies and TV shows. This script tries to unify them into one uber-script. The original use-case-specific sources live in the [`genesis/`](genesis/) folder.
+
 ## Version progression
 
 Each release is a **new file** — prior scripts stay in the repo for reference:
@@ -132,6 +140,11 @@ Run dry-run per region before converting an entire Television tree.
 HandBrake treats `.iso` files and folders containing `BDMV/` as disc sources. The script scans titles and converts the longest only when it is more than **40% longer** than every other title; otherwise it logs:
 
 > Unable to Determine which title you wish to convert, process this manually
+
+## Contributors
+
+- **Minnie** (Yorkie) — watches a lot of this with me
+- **Di-Di** (Maltese) — watches a lot of this with me
 
 ## License
 
