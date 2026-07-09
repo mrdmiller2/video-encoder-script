@@ -2,7 +2,7 @@
 
 Portable Bash library organizer and batch transcoder for large home-media trees. Targets **MKV + AV1** (kept when not more than **20% larger** than the source) with **x265** fallback, optional **ISO/Blu-ray** disc handling, and **sharded** directory scans for multi-thousand-file libraries.
 
-**Current release:** `convert-v4.0.6.sh` (v4.0.6)
+**Current release:** `convert-v4.0.8.sh` (v4.0.8)
 
 ## Version progression
 
@@ -11,7 +11,9 @@ Each release is a **new file** — prior scripts stay in the repo for reference:
 | File | Version | Notes |
 |------|---------|--------|
 | `convert-v4.0.5.sh` | 4.0.5 | Initial v4 release; 8 GB AV1 oversized threshold |
-| `convert-v4.0.6.sh` | 4.0.6 | **Current** — 20% vs-original AV1 policy; `SCRIPT_NAME` check |
+| `convert-v4.0.6.sh` | 4.0.6 | 20% vs-original AV1 policy; `SCRIPT_NAME` check |
+| `convert-v4.0.7.sh` | 4.0.7 | Dry-run media inspection (name, format, length, resolution) |
+| `convert-v4.0.8.sh` | 4.0.8 | **Current** — `--skip-av1` / `--skip-x265`; dry-run skips encoder bake-off |
 
 When bumping version: copy the latest script to `convert-v{NEW}.sh`, update `VERSION` and `SCRIPT_NAME`, keep all older files. Do not rename or overwrite.
 
@@ -40,19 +42,26 @@ sudo dnf install ffmpeg mkvtoolnix HandBrake-cli
 ## Quick start
 
 ```bash
-chmod +x convert-v4.0.6.sh
+chmod +x convert-v4.0.8.sh
 
 # Dry-run on a large movies root (sharded by language folder)
-./convert-v4.0.6.sh -p /mnt/BigMomma/Media/Movies --dry-run
+./convert-v4.0.8.sh -p /mnt/BigMomma/Media/Movies --dry-run
 
 # Transcode only — one English letter shelf
-./convert-v4.0.6.sh -p /mnt/BigMomma/Media/Movies/English/D --convert-only --no-shard
+./convert-v4.0.8.sh -p /mnt/BigMomma/Media/Movies/English/D --convert-only --no-shard
+
+# Skip files already in AV1 or HEVC (e.g. only process h264 sources)
+./convert-v4.0.8.sh -p /mnt/BigMomma/Media/Movies --skip-av1 --skip-x265
 
 # Television — preview one region first
-./convert-v4.0.6.sh -p /mnt/BabyBear/Media/Television/Thai --dry-run
+./convert-v4.0.8.sh -p /mnt/BabyBear/Media/Television/Thai --dry-run
 ```
 
 ## What it does
+
+### Dry-run inspection (`--dry-run`)
+
+Before organize/convert phases, the script probes each video and disc source with ffprobe/HandBrake scan (no transcoding). Each entry in `convert-v4.log` includes **name**, **video format (codec)**, **length**, and **resolution**.
 
 ### Phase 1 — Organize (optional, default on)
 
@@ -76,13 +85,13 @@ Default `--shard-depth 1` discovers top-level subdirectories under `--path` and 
 
 ```bash
 # Movies — shard by language (default)
-./convert-v4.0.6.sh -p /mnt/BigMomma/Media/Movies
+./convert-v4.0.8.sh -p /mnt/BigMomma/Media/Movies
 
 # English only — shard by letter bucket (A, B, C, …)
-./convert-v4.0.6.sh -p /mnt/BigMomma/Media/Movies/English --shard-depth 2
+./convert-v4.0.8.sh -p /mnt/BigMomma/Media/Movies/English --shard-depth 2
 
 # Small tree — single find
-./convert-v4.0.6.sh -p /mnt/BigMomma/Media/Movies/English/D --no-shard
+./convert-v4.0.8.sh -p /mnt/BigMomma/Media/Movies/English/D --no-shard
 ```
 
 ## Common options
@@ -90,7 +99,9 @@ Default `--shard-depth 1` discovers top-level subdirectories under `--path` and 
 | Flag | Purpose |
 |------|---------|
 | `-p`, `--path DIR` | Root to scan (required) |
-| `--dry-run` | Log actions only |
+| `--dry-run` | Log actions only; inspect each file (name, codec, length, resolution) without converting |
+| `--skip-av1` | Skip sources whose video codec is AV1 (inspection still runs) |
+| `--skip-x265` | Skip sources whose video codec is HEVC/x265 (inspection still runs) |
 | `--organize-only` | Phase 1 only |
 | `--convert-only` | Phase 2 only |
 | `--shard-depth N` | Shard find at depth N (default: 1) |

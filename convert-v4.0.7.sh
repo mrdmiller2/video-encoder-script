@@ -1,0 +1,2457 @@
+#!/usr/bin/env bash
+# convert-v4.0.7.sh — Organize movie folders, transcode TV/movies to AV1/x265 MKV.
+# Version: 4.0.7
+# Naming: SCRIPT_NAME must match VERSION (convert-v{VERSION}.sh).
+#   On each bump: copy the prior script to a NEW filename; keep all older versions in the repo.
+#
+# Portable: Linux/WSL/Cygwin (bash 4+), macOS (auto re-exec under zsh — default Terminal shell).
+# Tool paths: CONVERT_* env vars or --ffmpeg/--handbrake/etc. CLI overrides.
+#   Processes largest files first. Logs space used/saved to convert-v4.log in source path.
+#   AV1 paths (svt + nvenc): Opus 112 kbps, all audio tracks kept, dialog DRC boost.
+#   x265 paths (x265 + nvenc_h265): AAC 128 kbps only. All subtitles/audio kept + labeled.
+#   AV1 kept when output is not more than 20% larger than the original; else x265 fallback.
+#   Existing .AV1.mkv over 20% vs source: sample-test x265; re-encode when sample is smaller.
+#   Existing HEVC MKV is remux-copied to Title.x265.mkv (no re-encode).
+# Movies: every loose video goes into Title/Title.ext (years parenthesized, e.g. Sakura 1992
+#   -> Sakura (1992)/Sakura (1992).mkv). English libraries also use A–Z + 0 buckets.
+# TV shows: S01E01 / EP01 / -01 patterns, or folders under Television/Anime — episodes stay put.
+# Encoders: NVENC when NVIDIA GPUs are present; otherwise svt_av1_10bit + x265 (software).
+#   ./convert-v4.0.7.sh --path /mnt/BigMomma/Media/Movies/Chinese
+#   ./convert-v4.0.7.sh -p /mnt/BigMomma/Media/Movies/English/D --dry-run
+#   ./convert-v4.0.7.sh -p /path --organize-only
+#   ./convert-v4.0.7.sh -p /path --convert-only
+#   ./convert-v4.0.7.sh -p /mnt/Movies --shard-depth 1   # per top-level subdir find (default)
+#   ./convert-v4.0.7.sh -p /mnt/Movies --no-shard          # monolithic find (large trees)
+#   --dry-run inspects each file (name, codec, length, resolution) and logs to convert-v4.log
+#
+# Disks: .iso files and Blu-ray folders (BDMV) are HandBrake "disc" sources.
+#   Auto-converts the dominant title when it is >40% longer than every other title;
+#   otherwise skips with a log entry for manual processing.
+#
+# GPUs: RTX 5080 (index 0) — AV1 + HEVC. RTX A4500 (index 1) — HEVC only.
+# Original files are never deleted.
+
+# macOS: re-exec under zsh (Terminal default). System bash is 3.2 and lacks bash 4 features.
+if [ -z "${CONVERT_V4_ZSH:-}" ]; then
+  case "$(uname -s 2>/dev/null)" in
+    Darwin)
+      if command -v zsh >/dev/null 2>&1; then
+        CONVERT_V4_ZSH=1 exec zsh "$0" "$@"
+      fi
+      ;;
+  esac
+fi
+
+set -euo pipefail
+
+VERSION="4.0.7"
+SCRIPT_NAME="convert-v${VERSION}.sh"
+SEARCH_PATH="."
+DRY_RUN=false
+DO_ORGANIZE=true
+DO_CONVERT=true
+SHARD_DEPTH=1
+NO_SHARD=false
+DISK_TITLE_DOMINANCE_PCT=40
+SAMPLE_SECONDS=60
+SIZE_OVERSHOOT_PCT=5
+AV1_MAX_OVERSHOOT_PCT=20
+GPU_AV1=0
+GPU_HEVC_PRIMARY=0
+GPU_HEVC_FALLBACK=1
+HAS_NVIDIA=false
+NVIDIA_GPU_COUNT=0
+PLATFORM=unknown
+HAS_HW_DECODE=false
+HW_DECODE_NAME=""
+TOOL_FFMPEG="${CONVERT_FFMPEG:-}"
+TOOL_FFPROBE="${CONVERT_FFPROBE:-}"
+TOOL_HANDBRAKE="${CONVERT_HANDBRAKE:-}"
+TOOL_MKVPROPEDIT="${CONVERT_MKVPROPEDIT:-}"
+TOOL_MKVMERGE="${CONVERT_MKVMERGE:-}"
+
+AV1_ENCODER=""
+BAKEOFF_DONE=false
+OPUS_BITRATE=112
+AAC_BITRATE=128
+AUDIO_DRC=2.0
+AUDIO_GAIN=1.0
+STATS_LOG_FILE=""
+STATS_OUTPUT_BYTES=0
+STATS_SAVED_BYTES=0
+STATS_PROCESSED=0
+STATS_SKIPPED=0
+STATS_INSPECTED=0
+
+# Resolved tool commands (arrays — HandBrake may be a flatpak invocation)
+FFMPEG_CMD=()
+FFPROBE_CMD=()
+HANDBRAKE_CMD=()
+MKVPROPEDIT_CMD=()
+MKVMERGE_CMD=()
+HANDBRAKE_DISPLAY="HandBrakeCLI"
+HAND_BRAKE_FLATPAK_IDS=(fr.handbrake.ghb com.handbrake.ghb)
+
+VIDEO_EXTS=(avi mp4 mkv ts)
+SUB_EXTS=(srt sub idx ass ssa vtt sup)
+
+Color_Off='\033[0m'
+Green='\033[0;32m'
+Yellow='\033[1;33m'
+Red='\033[0;31m'
+Bold='\033[1m'
+
+usage() {
+  cat <<EOF
+Usage: $0 --path DIR [options]
+
+Options:
+  -p, --path DIR          Root directory to scan (required for non-interactive use)
+  --dry-run               Show actions without moving/encoding/deleting outputs
+  --organize-only         Only fix per-movie folder layout + subtitle names
+  --convert-only          Skip organization; only transcode/remux
+  --sample-seconds N      Encoder bake-off sample length (default: 60, from middle of file)
+  --shard-depth N         Find media per subdirectory at depth N (default: 1; avoids huge finds)
+  --no-shard              Single find across entire --path (old behavior)
+
+Tool paths (when not in PATH):
+  --ffmpeg PATH           ffmpeg binary (or set CONVERT_FFMPEG)
+  --ffprobe PATH          ffprobe binary (or set CONVERT_FFPROBE)
+  --handbrake PATH        HandBrakeCLI binary (or set CONVERT_HANDBRAKE)
+  --mkvpropedit PATH      mkvpropedit binary (or set CONVERT_MKVPROPEDIT)
+  --mkvmerge PATH         mkvmerge binary (or set CONVERT_MKVMERGE)
+
+Portable: Linux/WSL/Cygwin (bash 4+), macOS (zsh — re-exec'd automatically). macOS hw-decode: videotoolbox.
+
+Target format:
+  MKV container with AV1 video (kept when ≤20% larger than source) or x265 fallback.
+  AV1 outputs more than 20% larger than the source trigger x265 fallback (sample-tested on existing .AV1.mkv).
+  Outputs: {Title}.AV1.mkv or {Title}.x265.mkv alongside originals (originals never deleted).
+  Disks (.iso / BDMV): dominant title auto-selected; ambiguous discs are skipped and logged.
+  -h, --help              Show this help
+
+Examples:
+  $0 --path /mnt/BigMomma/Media/Movies/Chinese
+  $0 -p /mnt/BigMomma/Media/Movies/English/D --dry-run
+EOF
+}
+
+log() { echo -e "${Green}[convert]${Color_Off} $*"; }
+warn() { echo -e "${Yellow}[warn]${Color_Off} $*" >&2; }
+err() { echo -e "${Red}[error]${Color_Off} $*" >&2; }
+
+init_shell_compat() {
+  if [ -n "${ZSH_VERSION:-}" ]; then
+    emulate -L bash 2>/dev/null || true
+    setopt PIPE_FAIL 2>/dev/null || true
+    setopt KSH_ARRAYS 2>/dev/null || true
+    return 0
+  fi
+  if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+    err "bash 4+ required on Linux/WSL/Cygwin (macOS should auto-switch to zsh)"
+    exit 1
+  fi
+}
+
+shell_name() {
+  if [ -n "${ZSH_VERSION:-}" ]; then
+    printf 'zsh %s' "$ZSH_VERSION"
+  elif [ -n "${BASH_VERSION:-}" ]; then
+    printf 'bash %s' "$BASH_VERSION"
+  else
+    printf 'sh'
+  fi
+}
+
+shell_nullglob_on() {
+  if [ -n "${ZSH_VERSION:-}" ]; then
+    setopt NULL_GLOB 2>/dev/null || true
+  else
+    shopt -s nullglob
+  fi
+}
+
+shell_nullglob_off() {
+  if [ -n "${ZSH_VERSION:-}" ]; then
+    unsetopt NULL_GLOB 2>/dev/null || true
+  else
+    shopt -u nullglob 2>/dev/null || true
+  fi
+}
+
+to_lower() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+detect_platform() {
+  local uname_s
+  uname_s="$(uname -s 2>/dev/null || echo unknown)"
+  case "$uname_s" in
+    Linux)
+      if [ -r /proc/version ] && grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; then
+        PLATFORM=wsl
+      else
+        PLATFORM=linux
+      fi
+      ;;
+    Darwin) PLATFORM=macos ;;
+    CYGWIN*|MINGW*|MSYS*) PLATFORM=windows ;;
+    *) PLATFORM=unknown ;;
+  esac
+}
+
+canonical_path() {
+  local p="$1"
+  if command -v realpath >/dev/null 2>&1; then
+    realpath "$p" 2>/dev/null && return 0
+  fi
+  if [ "$PLATFORM" = linux ] || [ "$PLATFORM" = wsl ]; then
+    readlink -f "$p" 2>/dev/null && return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import os,sys; print(os.path.realpath(os.path.expanduser(sys.argv[1])))' "$p" 2>/dev/null && return 0
+  fi
+  printf '%s' "$p"
+}
+
+platform_extra_paths() {
+  local tool="$1"
+  case "$PLATFORM" in
+    macos)
+      printf '%s\n' \
+        "/opt/homebrew/bin/$tool" \
+        "/usr/local/bin/$tool" \
+        "/Applications/HandBrake.app/Contents/MacOS/$tool"
+      ;;
+    windows)
+      printf '%s\n' \
+        "/cygdrive/c/Program Files/HandBrake/$tool.exe" \
+        "/cygdrive/c/Program Files (x86)/HandBrake/$tool.exe" \
+        "/cygdrive/c/Program Files/ffmpeg/bin/$tool.exe"
+      ;;
+    linux|wsl)
+      printf '%s\n' \
+        "/usr/bin/$tool" \
+        "/usr/local/bin/$tool" \
+        "$HOME/.local/bin/$tool"
+      ;;
+    *)
+      printf '%s\n' "/usr/bin/$tool" "/usr/local/bin/$tool"
+      ;;
+  esac
+}
+
+print_tool_install_help() {
+  err "One or more required tools were not found."
+  cat >&2 <<EOF
+
+Install the tools or point to them explicitly:
+
+  Environment variables:
+    CONVERT_FFMPEG      path to ffmpeg
+    CONVERT_FFPROBE     path to ffprobe
+    CONVERT_HANDBRAKE   path to HandBrakeCLI
+    CONVERT_MKVPROPEDIT path to mkvpropedit
+    CONVERT_MKVMERGE    path to mkvmerge
+
+  Command-line overrides:
+    --ffmpeg PATH  --ffprobe PATH  --handbrake PATH
+    --mkvpropedit PATH  --mkvmerge PATH
+
+  Platform: $PLATFORM
+    Linux/WSL:  sudo apt install ffmpeg mkvtoolnix handbrake-cli
+                or: sudo dnf install ffmpeg mkvtoolnix HandBrake-cli
+    macOS:      uses zsh automatically (default Terminal shell)
+                brew install ffmpeg mkvtoolnix handbrake  # if tools missing
+    Cygwin:     install ffmpeg, mkvtoolnix, HandBrakeCLI via Cygwin/Windows installers
+
+  HandBrake Flatpak (Linux): fr.handbrake.ghb
+EOF
+}
+
+resolve_configured_tool() {
+  local configured="$1"
+  local name="$2"
+  local candidate
+
+  if [ -z "$configured" ]; then
+    return 1
+  fi
+  if [ -x "$configured" ]; then
+    printf '%s' "$configured"
+    return 0
+  fi
+  err "Configured $name path is not executable: $configured"
+  return 1
+}
+
+discover_binary() {
+  local name="$1"
+  local candidate
+
+  if candidate="$(command -v "$name" 2>/dev/null)"; then
+    printf '%s' "$candidate"
+    return 0
+  fi
+
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] && [ -x "$candidate" ] && printf '%s' "$candidate" && return 0
+  done < <(platform_extra_paths "$name")
+
+  return 1
+}
+
+discover_handbrake_cli() {
+  local candidate id
+
+  if candidate="$(resolve_configured_tool "$TOOL_HANDBRAKE" HandBrakeCLI)"; then
+    HANDBRAKE_CMD=("$candidate")
+    HANDBRAKE_DISPLAY="$candidate"
+    return 0
+  fi
+
+  if candidate="$(discover_binary HandBrakeCLI)"; then
+    HANDBRAKE_CMD=("$candidate")
+    HANDBRAKE_DISPLAY="$candidate"
+    return 0
+  fi
+
+  if [ "$PLATFORM" = linux ] || [ "$PLATFORM" = wsl ]; then
+    if command -v flatpak >/dev/null 2>&1; then
+      for id in "${HAND_BRAKE_FLATPAK_IDS[@]}"; do
+        if flatpak info "$id" >/dev/null 2>&1; then
+          HANDBRAKE_CMD=(flatpak run --command=HandBrakeCLI "$id")
+          HANDBRAKE_DISPLAY="flatpak run --command=HandBrakeCLI $id"
+          return 0
+        fi
+      done
+    fi
+  fi
+
+  return 1
+}
+
+discover_tools() {
+  local tool extra=()
+
+  if tool="$(resolve_configured_tool "$TOOL_FFMPEG" ffmpeg)" || tool="$(discover_binary ffmpeg)"; then
+    FFMPEG_CMD=("$tool")
+  else
+    print_tool_install_help
+    err "Missing: ffmpeg"
+    return 1
+  fi
+
+  if tool="$(resolve_configured_tool "$TOOL_FFPROBE" ffprobe)" || tool="$(discover_binary ffprobe)"; then
+    FFPROBE_CMD=("$tool")
+  else
+    print_tool_install_help
+    err "Missing: ffprobe"
+    return 1
+  fi
+
+  if ! discover_handbrake_cli; then
+    print_tool_install_help
+    err "Missing: HandBrakeCLI"
+    return 1
+  fi
+
+  if tool="$(resolve_configured_tool "$TOOL_MKVPROPEDIT" mkvpropedit)" || tool="$(discover_binary mkvpropedit)"; then
+    MKVPROPEDIT_CMD=("$tool")
+  else
+    print_tool_install_help
+    err "Missing: mkvpropedit"
+    return 1
+  fi
+
+  if tool="$(resolve_configured_tool "$TOOL_MKVMERGE" mkvmerge)" || tool="$(discover_binary mkvmerge)"; then
+    MKVMERGE_CMD=("$tool")
+  else
+    print_tool_install_help
+    err "Missing: mkvmerge"
+    return 1
+  fi
+
+  log "Platform: $PLATFORM | shell: $(shell_name) | ffmpeg=${FFMPEG_CMD[*]} | HandBrake=${HANDBRAKE_DISPLAY}"
+}
+
+run_ffmpeg() { "${FFMPEG_CMD[@]}" "$@"; }
+run_ffprobe() { "${FFPROBE_CMD[@]}" "$@"; }
+run_handbrake() { "${HANDBRAKE_CMD[@]}" "$@"; }
+run_mkvpropedit() { "${MKVPROPEDIT_CMD[@]}" "$@"; }
+run_mkvmerge() { "${MKVMERGE_CMD[@]}" "$@"; }
+
+detect_hw_environment() {
+  HAS_NVIDIA=false
+  NVIDIA_GPU_COUNT=0
+  HAS_HW_DECODE=false
+  HW_DECODE_NAME=""
+
+  case "$PLATFORM" in
+    macos)
+      if run_handbrake --help 2>&1 | grep -q videotoolbox; then
+        HAS_HW_DECODE=true
+        HW_DECODE_NAME=videotoolbox
+        log "Hardware decode: videotoolbox (macOS)"
+      else
+        warn "videotoolbox not available — software decode"
+      fi
+      ;;
+    linux|wsl|windows)
+      if command -v nvidia-smi >/dev/null 2>&1; then
+        local list
+        list="$(nvidia-smi -L 2>/dev/null)" || list=""
+        NVIDIA_GPU_COUNT="$(grep -cE '^GPU [0-9]+:' <<<"$list" || true)"
+        if [ "${NVIDIA_GPU_COUNT:-0}" -gt 0 ]; then
+          HAS_NVIDIA=true
+          HAS_HW_DECODE=true
+          HW_DECODE_NAME=nvdec
+          log "Detected $NVIDIA_GPU_COUNT NVIDIA GPU(s) — nvenc + nvdec available"
+        fi
+      fi
+      if [ "$HAS_NVIDIA" = false ]; then
+        warn "No NVIDIA GPU — using software encoders (svt_av1_10bit, x265)"
+      fi
+      ;;
+    *)
+      warn "Unknown platform — software encoders only"
+      ;;
+  esac
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p|--path) SEARCH_PATH="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    --organize-only) DO_ORGANIZE=true; DO_CONVERT=false; shift ;;
+    --convert-only) DO_ORGANIZE=false; DO_CONVERT=true; shift ;;
+    --sample-seconds) SAMPLE_SECONDS="$2"; shift 2 ;;
+    --shard-depth) SHARD_DEPTH="$2"; shift 2 ;;
+    --no-shard) NO_SHARD=true; shift ;;
+    --ffmpeg) TOOL_FFMPEG="$2"; shift 2 ;;
+    --ffprobe) TOOL_FFPROBE="$2"; shift 2 ;;
+    --handbrake) TOOL_HANDBRAKE="$2"; shift 2 ;;
+    --mkvpropedit) TOOL_MKVPROPEDIT="$2"; shift 2 ;;
+    --mkvmerge) TOOL_MKVMERGE="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) err "Unknown option: $1"; usage; exit 1 ;;
+  esac
+done
+
+detect_platform
+init_shell_compat
+
+SEARCH_PATH="$(canonical_path "$SEARCH_PATH")"
+if [ ! -d "$SEARCH_PATH" ]; then
+  err "Path not found: $SEARCH_PATH"
+  exit 1
+fi
+
+discover_tools || exit 1
+
+assert_script_name_matches_version() {
+  local base
+  base="$(basename "$0")"
+  if [ "$base" != "$SCRIPT_NAME" ]; then
+    err "Version $VERSION requires script filename $SCRIPT_NAME (found: $base)"
+    err "Create $SCRIPT_NAME as a new file when bumping VERSION; do not overwrite prior versions."
+    exit 1
+  fi
+}
+
+is_video_file() {
+  local f="$1" ext
+  ext="$(to_lower "${f##*.}")"
+  local e
+  for e in "${VIDEO_EXTS[@]}"; do
+    [ "$ext" = "$e" ] && return 0
+  done
+  return 1
+}
+
+is_subtitle_file() {
+  local f="$1" ext
+  ext="$(to_lower "${f##*.}")"
+  local e
+  for e in "${SUB_EXTS[@]}"; do
+    [ "$ext" = "$e" ] && return 0
+  done
+  return 1
+}
+
+is_derived_output() {
+  local base="${1##*/}"
+  [[ "$base" =~ \.(AV1|av1|x265|X265)\.mkv$ ]] && return 0
+  [[ "$base" =~ -av1\.mkv$ ]] && return 0
+  return 1
+}
+
+is_iso_file() {
+  [ "$(to_lower "${1##*.}")" = "iso" ]
+}
+
+is_bluray_root() {
+  [ -d "$1/BDMV" ]
+}
+
+is_disk_source() {
+  is_iso_file "$1" || is_bluray_root "$1"
+}
+
+# Directory holding sidecar subtitles and output MKVs for a source.
+media_content_dir() {
+  local src="$1"
+  if is_bluray_root "$src"; then
+    printf '%s' "$src"
+  else
+    dirname "$src"
+  fi
+}
+
+# English-scale libraries bucket movies under single-letter dirs (A–Z) and 0 (digit-led).
+uses_letter_bucket_library() {
+  local p="$1"
+  case "$p" in
+    */English|*/English/*|*/english|*/english/*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+is_numeric_shelf_dir() {
+  [ "$(basename "$1")" = "0" ]
+}
+
+is_letter_shelf_dir() {
+  local name
+  name="$(basename "$1")"
+  [[ "$name" =~ ^[A-Za-z]$ ]]
+}
+
+is_shelf_dir() {
+  is_numeric_shelf_dir "$1" || is_letter_shelf_dir "$1"
+}
+
+# Shelf 0: titles whose first significant character is a digit (007, 9 Heads…, $50K…).
+title_for_numeric_shelf() {
+  local title="$1"
+  title="${title#"${title%%[![:space:]]*}"}"
+  [[ "$title" =~ ^[0-9] ]] && return 0
+  [[ "$title" =~ ^[^[:alnum:]]*[0-9] ]] && return 0
+  return 1
+}
+
+# First letter for A–Z shelf placement; leading articles "The" and "A" are ignored.
+# (Organize still folders any loose file already sitting in a shelf, regardless of letter.)
+title_first_letter() {
+  local title="$1" c
+  title="${title#"${title%%[![:space:]]*}"}"
+  title="$(printf '%s' "$title" | sed -E \
+    's/^[Tt][Hh][Ee][[:space:]]+//; s/^[Aa][[:space:]]+//')"
+  c="$(printf '%s' "$title" | sed 's/^[^[:alpha:]]*//' | cut -c1)"
+  [ -n "$c" ] || return 0
+  printf '%s' "$c" | tr '[:lower:]' '[:upper:]'
+}
+
+title_belongs_in_shelf() {
+  local title="$1"
+  local shelf="$2"
+  shelf="$(printf '%s' "$shelf" | tr '[:lower:]' '[:upper:]')"
+  if [ "$shelf" = "0" ]; then
+    title_for_numeric_shelf "$title"
+    return $?
+  fi
+  if [[ "$shelf" =~ ^[A-Z]$ ]]; then
+    [ "$(title_first_letter "$title")" = "$shelf" ]
+    return $?
+  fi
+  return 1
+}
+
+movie_title_from_file() {
+  local f="$1"
+  local cooked="${f##*/}"
+  printf '%s' "${cooked%.*}"
+}
+
+# Organize layout: parenthesize trailing release year (Sakura 1992 -> Sakura (1992)).
+canonical_organize_title() {
+  local title="$1"
+  printf '%s' "$title" | sed -E \
+    's/^[[:space:]]+//; s/[[:space:]]+$//;
+     s/^(.+)[[:space:]]+\(([0-9]{4})\)$/\1 (\2)/;
+     t same;
+     s/^(.+)[[:space:]]+([0-9]{4})$/\1 (\2)/;
+     :same'
+}
+
+is_movie_language_dir() {
+  local dir="$1" name
+  name="$(basename "$dir")"
+  is_shelf_dir "$dir" && return 1
+  case "$name" in
+    Japanese|Chinese|English|Korean|French|German|Spanish|Italian|Cantonese|Mandarin|Hindi|Thai|Vietnamese|Russian|Portuguese|Polish|Dutch|Swedish|Norwegian|Danish|Finnish|Greek|Turkish|Arabic|Hebrew|Indonesian|Malay|Filipino|Tagalog|Other|Misc)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+# Parent directory where a loose movie file should be foldered.
+is_movie_organize_parent() {
+  local parent="$1"
+  if is_shelf_dir "$parent"; then
+    uses_letter_bucket_library "$parent" && return 0
+    return 1
+  fi
+  is_movie_language_dir "$parent" && return 0
+  [ "$parent" = "$SEARCH_PATH" ] && return 0
+  return 1
+}
+
+subtitle_matches_organize_title() {
+  local sub="$1"
+  local raw_title="$2"
+  local canon_title="$3"
+  local stem
+  stem="$(movie_title_from_file "$sub")"
+  [[ "$stem" == "$raw_title"* ]] || [[ "$raw_title" == *"$stem"* ]] && return 0
+  [[ "$stem" == "$canon_title"* ]] || [[ "$canon_title" == *"$stem"* ]] && return 0
+  return 1
+}
+
+# Strip .AV1 / .x265 suffixes so replacements get clean output names.
+canonical_title_from_file() {
+  local title
+  title="$(movie_title_from_file "$1")"
+  title="${title%.AV1}"
+  title="${title%.av1}"
+  title="${title%.x265}"
+  title="${title%.X265}"
+  printf '%s' "$title"
+}
+
+canonical_title_from_source() {
+  local src="$1"
+  if is_bluray_root "$src"; then
+    basename "$src"
+  else
+    canonical_title_from_file "$src"
+  fi
+}
+
+x265_output_path() {
+  local src="$1"
+  local dir title
+  dir="$(media_content_dir "$src")"
+  title="$(canonical_title_from_source "$src")"
+  printf '%s/%s.x265.mkv' "$dir" "$title"
+}
+
+av1_output_path() {
+  local src="$1"
+  local dir title
+  dir="$(media_content_dir "$src")"
+  title="$(canonical_title_from_source "$src")"
+  printf '%s/%s.AV1.mkv' "$dir" "$title"
+}
+
+is_oversized_av1() {
+  local src="$1"
+  local orig orig_sz av1_sz
+  orig="$(find_original_source_for_av1 "$src")"
+  [ -n "$orig" ] || return 1
+  orig_sz="$(file_size_bytes "$orig")"
+  av1_sz="$(file_size_bytes "$src")"
+  awk -v o="$orig_sz" -v a="$av1_sz" -v lim="$AV1_MAX_OVERSHOOT_PCT" \
+    'BEGIN { if (o <= 0) exit 1; exit !(((a - o) / o) * 100 > lim) }'
+}
+
+# Non-derived sibling used as size reference for an AV1 output or AV1 library file.
+find_original_source_for_av1() {
+  local src="$1"
+  local dir title ext f
+  dir="$(dirname "$src")"
+  title="$(canonical_title_from_file "$src")"
+  for ext in mkv mp4 avi ts; do
+    f="$dir/$title.$ext"
+    [ -f "$f" ] || continue
+    [ "$f" = "$src" ] && continue
+    is_derived_output "$f" && continue
+    printf '%s' "$f"
+    return 0
+  done
+  return 1
+}
+
+av1_overshoot_pct_vs_original() {
+  local src="$1"
+  local orig orig_sz av1_sz
+  orig="$(find_original_source_for_av1 "$src")"
+  [ -n "$orig" ] || return 0
+  orig_sz="$(file_size_bytes "$orig")"
+  av1_sz="$(file_size_bytes "$src")"
+  awk -v o="$orig_sz" -v a="$av1_sz" 'BEGIN {
+    if (o <= 0) { print 0; exit }
+    printf "%.1f", ((a - o) / o) * 100
+  }'
+}
+
+needs_oversized_av1_recheck() {
+  local f="$1"
+  is_derived_output "$f" || return 1
+  is_oversized_av1 "$f" || return 1
+  [ ! -f "$(x265_output_path "$f")" ]
+}
+
+# Path hints: /Television/, /Anime/, etc. (see BabyBear/BigPoppa layouts)
+is_tv_library_path() {
+  local p="$1"
+  case "$p" in
+    */Television/*|*/Television|*/Anime/*|*/Anime|*/TV\ Shows/*|*/TV\ Shows|*/Series/*|*/Series)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+is_anime_content() {
+  local p="$1"
+  case "$p" in
+    */Anime/*|*/Anime|*/anime/*|*/anime)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+uses_anime_profile() {
+  local src="${1:-}"
+  is_anime_content "$src" && return 0
+  is_anime_content "$SEARCH_PATH" && return 0
+  return 1
+}
+
+# TV episode markers: S01E01, EP1, Episode 1, 1x01, trailing -01, leading 01-
+is_tv_episode() {
+  local f="$1"
+  local stem
+  stem="$(movie_title_from_file "$f")"
+
+  [[ "$stem" =~ [Ss][0-9]{1,2}[Ee][0-9]{1,3} ]] && return 0
+  [[ "$stem" =~ [Ss][0-9]{1,2}[[:space:]_\.-]+[Ee][0-9]{1,3} ]] && return 0
+  [[ "$stem" =~ [Ee][Pp][[:space:]]*[0-9]{1,3} ]] && return 0
+  [[ "$stem" =~ [Ee]pisode[[:space:]]*[0-9]{1,3} ]] && return 0
+  [[ "$stem" =~ [0-9]{1,2}[xX][0-9]{1,2} ]] && return 0
+  [[ "$stem" =~ -[[:space:]]*[0-9]{1,2}$ ]] && return 0
+  [[ "$stem" =~ [[:space:]][0-9]{1,2}$ ]] && return 0
+  [[ "$stem" =~ ^[0-9]{2}- ]] && return 0
+  return 1
+}
+
+# Parent folder holds TV episodes — keep the folder intact.
+is_tv_show_directory() {
+  local dir="$1"
+  local f count=0 videos=0
+  shell_nullglob_on
+  for f in "$dir"/*; do
+    [ -f "$f" ] || continue
+    is_video_file "$f" || continue
+    is_derived_output "$f" && continue
+    videos=$((videos + 1))
+    is_tv_episode "$f" && count=$((count + 1))
+  done
+  shell_nullglob_off
+  [ "$count" -ge 1 ] && return 0
+  if is_tv_library_path "$dir" && [ "$videos" -ge 2 ]; then
+    return 0
+  fi
+  return 1
+}
+
+sample_start_middle() {
+  local dur="$1"
+  awk -v d="$dur" -v s="$SAMPLE_SECONDS" 'BEGIN {
+    if (d <= 0) { print 0; exit }
+    if (d <= s) { print 0; exit }
+    start = (d / 2) - (s / 2)
+    if (start < 0) start = 0
+    if (start + s > d) start = d - s
+    if (start < 0) start = 0
+    printf "%.3f", start
+  }'
+}
+
+file_size_bytes() {
+  case "$PLATFORM" in
+    macos) stat -f%z "$1" 2>/dev/null || echo 0 ;;
+    *) stat -c%s "$1" 2>/dev/null || echo 0 ;;
+  esac
+}
+
+disc_source_size_bytes() {
+  local src="$1"
+  if is_iso_file "$src"; then
+    file_size_bytes "$src"
+  elif is_bluray_root "$src"; then
+    du -sb "$src" 2>/dev/null | awk '{print $1+0}' || echo 0
+  else
+    echo 0
+  fi
+}
+
+human_size_bytes() {
+  awk -v b="$1" 'BEGIN {
+    if (b >= 1073741824) printf "%.2f GB", b/1073741824
+    else if (b >= 1048576) printf "%.2f MB", b/1048576
+    else if (b > 0) printf "%.0f KB", b/1024
+    else print "0 B"
+  }'
+}
+
+sort_paths_by_size_desc() {
+  local -n _paths="$1"
+  local -a sized=() entry sz path
+  local -a sorted_paths=()
+
+  for path in "${_paths[@]}"; do
+    if is_disk_source "$path"; then
+      sz="$(disc_source_size_bytes "$path")"
+    else
+      sz="$(file_size_bytes "$path")"
+    fi
+    sized+=("${sz}"$'\t'"${path}")
+  done
+
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    path="${entry#*$'\t'}"
+    sorted_paths+=("$path")
+  done < <(printf '%s\n' "${sized[@]}" | sort -t $'\t' -k1 -nr)
+
+  _paths=("${sorted_paths[@]}")
+}
+
+get_scan_roots() {
+  local -n _roots="$1"
+  local shard
+
+  _roots=()
+  if [ "$NO_SHARD" = true ]; then
+    _roots=("$SEARCH_PATH")
+    return 0
+  fi
+
+  while IFS= read -r shard; do
+    [ -n "$shard" ] || continue
+    _roots+=("$shard")
+  done < <(find "$SEARCH_PATH" -mindepth "$SHARD_DEPTH" -maxdepth "$SHARD_DEPTH" -type d 2>/dev/null | LC_ALL=C sort)
+
+  if [ "${#_roots[@]}" -eq 0 ]; then
+    _roots=("$SEARCH_PATH")
+  fi
+}
+
+find_videos_under() {
+  local root="$1"
+  find "$root" -type f \( \
+    -iname '*.avi' -o -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.ts' \) \
+    ! -iname '*.AV1.mkv' ! -iname '*.x265.mkv' 2>/dev/null
+}
+
+find_convert_videos_under() {
+  local root="$1"
+  find "$root" -type f \( \
+    -iname '*.avi' -o -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.ts' \) 2>/dev/null
+}
+
+find_videos_at_root() {
+  local root="$1"
+  find "$root" -maxdepth 1 -type f \( \
+    -iname '*.avi' -o -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.ts' \) \
+    ! -iname '*.AV1.mkv' ! -iname '*.x265.mkv' 2>/dev/null
+}
+
+find_isos_under() {
+  local root="$1"
+  find "$root" -type f -iname '*.iso' 2>/dev/null
+}
+
+find_isos_at_root() {
+  local root="$1"
+  find "$root" -maxdepth 1 -type f -iname '*.iso' 2>/dev/null
+}
+
+find_bluray_roots_under() {
+  local root="$1"
+  find "$root" -type d -name BDMV 2>/dev/null | while IFS= read -r bdmv; do
+    [ -n "$bdmv" ] || continue
+    dirname "$bdmv"
+  done | LC_ALL=C sort -u
+}
+
+find_bluray_roots_at_root() {
+  local root="$1"
+  find "$root" -mindepth 1 -maxdepth 2 -type d -name BDMV 2>/dev/null | while IFS= read -r bdmv; do
+    [ -n "$bdmv" ] || continue
+    dirname "$bdmv"
+  done | LC_ALL=C sort -u
+}
+
+discover_disk_sources() {
+  local -n _out="$1"
+  local -a roots=() raw=()
+  local shard line
+
+  _out=()
+  get_scan_roots roots
+
+  for shard in "${roots[@]}"; do
+    while IFS= read -r line; do
+      [ -n "$line" ] && raw+=("$line")
+    done < <(find_isos_under "$shard")
+    while IFS= read -r line; do
+      [ -n "$line" ] && raw+=("$line")
+    done < <(find_bluray_roots_under "$shard")
+  done
+
+  if [ "$NO_SHARD" = false ] && [ "${#roots[@]}" -gt 1 ]; then
+    while IFS= read -r line; do
+      [ -n "$line" ] && raw+=("$line")
+    done < <(find_isos_at_root "$SEARCH_PATH")
+    while IFS= read -r line; do
+      [ -n "$line" ] && raw+=("$line")
+    done < <(find_bluray_roots_at_root "$SEARCH_PATH")
+  fi
+
+  if [ "${#raw[@]}" -eq 0 ]; then
+    return 0
+  fi
+
+  while IFS= read -r line; do
+    [ -n "$line" ] && _out+=("$line")
+  done < <(printf '%s\n' "${raw[@]}" | LC_ALL=C sort -u)
+}
+
+handbrake_scan_title_durations() {
+  local src="$1"
+  local scan_txt
+
+  scan_txt="$(run_handbrake -t 0 --scan -i "$src" 2>&1 || true)"
+  awk '
+    BEGIN { idx = 0; dur = 0 }
+    /^\+ title [0-9]+:/ {
+      if (idx > 0 && dur > 0) print idx ":" dur
+      if (match($0, /title ([0-9]+)/, m)) idx = m[1] + 0; else idx = 0
+      dur = 0
+    }
+    /^  \+ duration: / {
+      n = split($3, t, ":")
+      if (n >= 3) dur = t[1] * 3600 + t[2] * 60 + int(t[3]) + 0
+    }
+    END { if (idx > 0 && dur > 0) print idx ":" dur }
+  ' <<< "$scan_txt"
+}
+
+# Prints SELECT:<title>:<seconds> or SKIP:<reason>
+select_dominant_disk_title() {
+  local src="$1"
+  local -a lines=()
+  local line result
+
+  while IFS= read -r line; do
+    [ -n "$line" ] && lines+=("$line")
+  done < <(handbrake_scan_title_durations "$src")
+
+  if [ "${#lines[@]}" -eq 0 ]; then
+    printf 'SKIP:%s' "no titles found on disc"
+    return 0
+  fi
+
+  if [ "${#lines[@]}" -eq 1 ]; then
+    printf 'SELECT:%s' "${lines[0]}"
+    return 0
+  fi
+
+  result="$(printf '%s\n' "${lines[@]}" | awk -v pct="$DISK_TITLE_DOMINANCE_PCT" '
+    BEGIN { cnt = 0; thresh = 1 + pct / 100 }
+    {
+      split($0, a, ":")
+      idx[cnt] = a[1]
+      dur[cnt] = a[2] + 0
+      cnt++
+    }
+    END {
+      if (cnt < 1) {
+        print "SKIP"
+        exit
+      }
+      if (cnt == 1) {
+        print "SELECT:" idx[0] ":" dur[0]
+        exit
+      }
+      max_i = 0
+      for (i = 1; i < cnt; i++) {
+        if (dur[i] > dur[max_i]) max_i = i
+      }
+      max_d = dur[max_i]
+      for (i = 0; i < cnt; i++) {
+        if (i == max_i) continue
+        if (max_d <= dur[i] * thresh) {
+          print "SKIP"
+          exit
+        }
+      }
+      print "SELECT:" idx[max_i] ":" max_d
+    }
+  ')"
+
+  if [ "$result" = SKIP ]; then
+    printf 'SKIP:%s' "Unable to Determine which title you wish to convert, process this manually"
+  else
+    printf '%s' "$result"
+  fi
+}
+
+init_stats_log() {
+  STATS_LOG_FILE="$SEARCH_PATH/convert-v4.log"
+  local ts
+  ts="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+  {
+    echo ""
+    echo "=== $SCRIPT_NAME v$VERSION — $ts ==="
+    echo "path: $SEARCH_PATH"
+    echo "dry_run: $DRY_RUN | organize: $DO_ORGANIZE | convert: $DO_CONVERT | nvidia: $HAS_NVIDIA"
+    echo "order: largest to smallest"
+    if [ "$DRY_RUN" = true ]; then
+      echo "inspect: name | video format | length | resolution (no conversion)"
+    fi
+  } >>"$STATS_LOG_FILE"
+}
+
+stats_log_append() {
+  [ -n "$STATS_LOG_FILE" ] || return 0
+  printf '%s\n' "$*" >>"$STATS_LOG_FILE"
+}
+
+stats_log_running_totals() {
+  stats_log_append "--- running totals ---"
+  stats_log_append "files processed: $STATS_PROCESSED"
+  stats_log_append "files skipped: $STATS_SKIPPED"
+  if [ "$STATS_INSPECTED" -gt 0 ]; then
+    stats_log_append "files inspected: $STATS_INSPECTED"
+  fi
+  stats_log_append "output space used: $(human_size_bytes "$STATS_OUTPUT_BYTES") ($STATS_OUTPUT_BYTES bytes)"
+  stats_log_append "space saved vs sources: $(human_size_bytes "$STATS_SAVED_BYTES") ($STATS_SAVED_BYTES bytes)"
+  stats_log_append ""
+}
+
+record_conversion_result() {
+  local src="$1"
+  local out="${2:-}"
+  local orig_sz out_sz saved
+  if is_disk_source "$src"; then
+    orig_sz="$(disc_source_size_bytes "$src")"
+  else
+    orig_sz="$(file_size_bytes "$src")"
+  fi
+
+  if [ -n "$out" ] && [ -f "$out" ] && [ "$DRY_RUN" = false ]; then
+    out_sz="$(file_size_bytes "$out")"
+    STATS_OUTPUT_BYTES=$((STATS_OUTPUT_BYTES + out_sz))
+    if [ "$out_sz" -lt "$orig_sz" ]; then
+      saved=$((orig_sz - out_sz))
+      STATS_SAVED_BYTES=$((STATS_SAVED_BYTES + saved))
+      stats_log_append "[$(date -u '+%H:%M:%S')] KEPT: $(basename "$src")"
+      stats_log_append "  source: $(human_size_bytes "$orig_sz") — $(basename "$src")"
+      stats_log_append "  output: $(human_size_bytes "$out_sz") — $(basename "$out")"
+      stats_log_append "  space used (output): +$(human_size_bytes "$out_sz")"
+      stats_log_append "  space saved vs source: $(human_size_bytes "$saved")"
+    else
+      stats_log_append "[$(date -u '+%H:%M:%S')] KEPT (larger): $(basename "$src")"
+      stats_log_append "  source: $(human_size_bytes "$orig_sz")"
+      stats_log_append "  output: $(human_size_bytes "$out_sz") (+$(human_size_bytes "$((out_sz - orig_sz))") vs source)"
+    fi
+  elif [ "$DRY_RUN" = true ] && [ -n "$out" ]; then
+    stats_log_append "[$(date -u '+%H:%M:%S')] [dry-run] would create: $(basename "$out")"
+    stats_log_append "  source: $(human_size_bytes "$orig_sz") — $(basename "$src")"
+  elif [ -z "$out" ]; then
+    stats_log_append "[$(date -u '+%H:%M:%S')] METADATA: $(basename "$src") ($(human_size_bytes "$orig_sz"))"
+  fi
+
+  STATS_PROCESSED=$((STATS_PROCESSED + 1))
+  stats_log_running_totals
+}
+
+record_skip() {
+  local src="$1"
+  local reason="${2:-already exists}"
+  STATS_SKIPPED=$((STATS_SKIPPED + 1))
+  stats_log_append "[$(date -u '+%H:%M:%S')] SKIP: $(basename "$src") — $reason"
+  stats_log_running_totals
+}
+
+finalize_stats_log() {
+  [ -n "$STATS_LOG_FILE" ] || return 0
+  stats_log_append "=== session complete — $(date -u '+%Y-%m-%d %H:%M:%S UTC') ==="
+  stats_log_append "files processed: $STATS_PROCESSED"
+  stats_log_append "files skipped: $STATS_SKIPPED"
+  if [ "$STATS_INSPECTED" -gt 0 ]; then
+    stats_log_append "files inspected: $STATS_INSPECTED"
+  fi
+  stats_log_append "total output space used: $(human_size_bytes "$STATS_OUTPUT_BYTES") ($STATS_OUTPUT_BYTES bytes)"
+  stats_log_append "total space saved vs sources: $(human_size_bytes "$STATS_SAVED_BYTES") ($STATS_SAVED_BYTES bytes)"
+  stats_log_append "note: originals are never deleted; output space is additive"
+  stats_log_append ""
+}
+
+video_codec() {
+  run_ffprobe -v error -select_streams v:0 -show_entries stream=codec_name \
+    -of default=noprint_wrappers=1:nokey=1 "$1" 2>/dev/null || echo unknown
+}
+
+video_height() {
+  run_ffprobe -v error -select_streams v:0 -show_entries stream=height \
+    -of default=noprint_wrappers=1:nokey=1 "$1" 2>/dev/null || echo 0
+}
+
+video_duration() {
+  run_ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$1" 2>/dev/null || echo 0
+}
+
+video_width() {
+  run_ffprobe -v error -select_streams v:0 -show_entries stream=width \
+    -of default=noprint_wrappers=1:nokey=1 "$1" 2>/dev/null || echo 0
+}
+
+format_duration_hms() {
+  awk -v s="$1" 'BEGIN {
+    if (s <= 0) { print "unknown"; exit }
+    h = int(s / 3600)
+    m = int((s % 3600) / 60)
+    sec = int(s % 60)
+    printf "%d:%02d:%02d", h, m, sec
+  }'
+}
+
+video_resolution() {
+  local src="$1"
+  local w h
+  w="$(video_width "$src")"
+  h="$(video_height "$src")"
+  if [ "$w" -gt 0 ] && [ "$h" -gt 0 ]; then
+    printf '%sx%s' "$w" "$h"
+  else
+    printf 'unknown'
+  fi
+}
+
+handbrake_title_resolution() {
+  local src="$1"
+  local title_idx="$2"
+  local scan_txt res
+  scan_txt="$(run_handbrake -t 0 --scan -i "$src" 2>&1 || true)"
+  res="$(awk -v want="$title_idx" '
+    BEGIN { idx = 0; res = "" }
+    /^\+ title [0-9]+:/ {
+      if (match($0, /title ([0-9]+)/, m)) idx = m[1] + 0; else idx = 0
+    }
+    /^  \+ size: / {
+      if (idx == want) res = $3
+    }
+    END { print res }
+  ' <<< "$scan_txt")"
+  [ -n "$res" ] && printf '%s' "$res" || printf 'unknown'
+}
+
+record_media_inspection() {
+  local src="$1"
+  local note="${2:-}"
+  local name codec dur dur_h res
+  [ "$DRY_RUN" = true ] || return 0
+  name="$(basename "$src")"
+  codec="$(video_codec "$src")"
+  dur="$(video_duration "$src")"
+  dur_h="$(format_duration_hms "$dur")"
+  res="$(video_resolution "$src")"
+  stats_log_append "[$(date -u '+%H:%M:%S')] INSPECT: $name"
+  stats_log_append "  format: $codec | length: $dur_h (${dur}s) | resolution: $res"
+  [ -n "$note" ] && stats_log_append "  note: $note"
+  STATS_INSPECTED=$((STATS_INSPECTED + 1))
+}
+
+record_disk_inspection() {
+  local src="$1"
+  local note="${2:-}"
+  local sel title_idx title_dur res kind dur_h name
+  [ "$DRY_RUN" = true ] || return 0
+  name="$(basename "$src")"
+  if is_iso_file "$src"; then
+    kind="ISO"
+  else
+    kind="Blu-ray"
+  fi
+  sel="$(select_dominant_disk_title "$src")"
+  case "$sel" in
+    SKIP:*)
+      stats_log_append "[$(date -u '+%H:%M:%S')] INSPECT: $name"
+      stats_log_append "  format: disc ($kind) | length: n/a | resolution: n/a"
+      if [ -n "$note" ]; then
+        stats_log_append "  note: $note — ${sel#SKIP:}"
+      else
+        stats_log_append "  note: ${sel#SKIP:}"
+      fi
+      ;;
+    SELECT:*)
+      title_idx="${sel#SELECT:}"
+      title_idx="${title_idx%%:*}"
+      title_dur="${sel##*:}"
+      dur_h="$(format_duration_hms "$title_dur")"
+      res="$(handbrake_title_resolution "$src" "$title_idx")"
+      stats_log_append "[$(date -u '+%H:%M:%S')] INSPECT: $name"
+      stats_log_append "  format: disc ($kind) title $title_idx | length: $dur_h (${title_dur}s) | resolution: $res"
+      [ -n "$note" ] && stats_log_append "  note: $note"
+      ;;
+    *)
+      stats_log_append "[$(date -u '+%H:%M:%S')] INSPECT: $name"
+      stats_log_append "  format: disc ($kind) | length: unknown | resolution: unknown"
+      stats_log_append "  note: title scan failed"
+      ;;
+  esac
+  STATS_INSPECTED=$((STATS_INSPECTED + 1))
+}
+
+is_hevc_codec() {
+  case "$1" in
+    hevc|h265) return 0 ;;
+  esac
+  return 1
+}
+
+has_canonical_output() {
+  local src="$1" dir title
+  dir="$(media_content_dir "$src")"
+  title="$(canonical_title_from_source "$src")"
+  [ -f "$dir/${title}.AV1.mkv" ] && return 0
+  [ -f "$dir/${title}.x265.mkv" ] && return 0
+  return 1
+}
+
+guess_lang_from_path() {
+  local p="$1"
+  case "$p" in
+    *Chinese*|*Cantonese*|*Mandarin*) echo zh ;;
+    *Japanese*) echo ja ;;
+    *Korean*) echo ko ;;
+    *French*) echo fr ;;
+    *German*) echo de ;;
+    *Spanish*) echo es ;;
+    *English*) echo en ;;
+    *) echo en ;;
+  esac
+}
+
+detect_subtitle_lang() {
+  local sub="$1"
+  local context_path="$2"
+  local base="${sub##*/}"
+  local stem="${base%.*}"
+  local   ext="$(to_lower "${base##*.}")"
+
+  if [[ "$base" =~ \.(en|eng)\. ]]; then echo eng; return; fi
+  if [[ "$base" =~ \.(zh|zho|chi|chs|cht)\. ]]; then echo chi; return; fi
+  if [[ "$base" =~ \.(ja|jpn)\. ]]; then echo jpn; return; fi
+  if [[ "$base" =~ \.(ko|kor)\. ]]; then echo kor; return; fi
+  if [[ "$base" =~ \.(fr|fre)\. ]]; then echo fre; return; fi
+  if [[ "$base" =~ \.(de|ger)\. ]]; then echo ger; return; fi
+  if [[ "$base" =~ \.(es|spa)\. ]]; then echo spa; return; fi
+  if [[ "$base" =~ \.(it|ita)\. ]]; then echo ita; return; fi
+  if [[ "$base" =~ \.(pt|por)\. ]]; then echo por; return; fi
+  if [[ "$base" =~ \.(ru|rus)\. ]]; then echo rus; return; fi
+
+  if [[ "$stem" =~ \.(en|eng)$ ]]; then echo eng; return; fi
+  if [[ "$stem" =~ \.(zh|chi|zho)$ ]]; then echo chi; return; fi
+  if [[ "$stem" =~ \.(ja|jpn)$ ]]; then echo jpn; return; fi
+  if [[ "$stem" =~ \.(ko|kor)$ ]]; then echo kor; return; fi
+
+  case "$stem" in
+    *english*|*English*) echo eng ;;
+    *chinese*|*Chinese*|*mandarin*) echo chi ;;
+    *japanese*|*Japanese*) echo jpn ;;
+    *korean*|*Korean*) echo kor ;;
+    *) lang_iso3_from_guess "$(guess_lang_from_path "$context_path")" ;;
+  esac
+}
+
+lang_iso3_from_guess() {
+  case "$1" in
+    en) echo eng ;;
+    zh) echo chi ;;
+    ja) echo jpn ;;
+    ko) echo kor ;;
+    fr) echo fre ;;
+    de) echo ger ;;
+    es) echo spa ;;
+    *) echo eng ;;
+  esac
+}
+
+lang_iso3_normalize() {
+  local code
+  code="$(to_lower "$1")"
+  case "$code" in
+    en|eng|english) echo eng ;;
+    zh|zho|chi|chs|cht|chinese|mandarin|cantonese) echo chi ;;
+    ja|jpn|japanese) echo jpn ;;
+    ko|kor|korean) echo kor ;;
+    fr|fre|french) echo fre ;;
+    de|ger|german) echo ger ;;
+    es|spa|spanish) echo spa ;;
+    it|ita|italian) echo ita ;;
+    pt|por|portuguese) echo por ;;
+    ru|rus|russian) echo rus ;;
+    und|"") echo "" ;;
+    *) echo "$code" ;;
+  esac
+}
+
+lang_display_name() {
+  local code
+  code="$(lang_iso3_normalize "$1")"
+  case "$code" in
+    eng) echo English ;;
+    chi) echo Chinese ;;
+    jpn) echo Japanese ;;
+    kor) echo Korean ;;
+    fre) echo French ;;
+    ger) echo German ;;
+    spa) echo Spanish ;;
+    ita) echo Italian ;;
+    por) echo Portuguese ;;
+    rus) echo Russian ;;
+    *) [ -n "$code" ] && echo "$code" || echo Unknown ;;
+  esac
+}
+
+subtitle_matches_video() {
+  local sub="$1"
+  local video="$2"
+  local title stem
+  title="$(canonical_title_from_source "$video")"
+  stem="$(movie_title_from_file "$sub")"
+  stem="${stem%.*}"
+  [[ "$stem" == "$title"* ]] || [[ "$title" == *"$stem"* ]] || [[ "$stem" == "$(canonical_title_from_source "$video")"* ]]
+}
+
+collect_external_subtitles() {
+  local src="$1"
+  local dir item
+  dir="$(media_content_dir "$src")"
+  shell_nullglob_on
+  for item in "$dir"/*; do
+    [ -f "$item" ] || continue
+    is_subtitle_file "$item" || continue
+    subtitle_matches_video "$item" "$src" && printf '%s\n' "$item"
+  done
+  shell_nullglob_off
+}
+
+handbrake_append_external_srts() {
+  local -n _args="$1"
+  local src="$2"
+  local -a subs=() langs=() codesets=()
+  local sub lang
+
+  while IFS= read -r sub; do
+    [ -n "$sub" ] || continue
+    case "${sub##*.}" in
+      srt|SRT) ;;
+      *) continue ;;
+    esac
+    subs+=("$sub")
+    lang="$(detect_subtitle_lang "$sub" "$src")"
+    langs+=("$lang")
+    codesets+=(UTF-8)
+  done < <(collect_external_subtitles "$src")
+
+  [ "${#subs[@]}" -eq 0 ] && return 0
+
+  local joined_subs joined_langs joined_codesets
+  joined_subs="$(IFS=,; printf '%s' "${subs[*]}")"
+  joined_langs="$(IFS=,; printf '%s' "${langs[*]}")"
+  joined_codesets="$(IFS=,; printf '%s' "${codesets[*]}")"
+  _args+=(--srt-file "$joined_subs" --srt-lang "$joined_langs" --srt-codeset "$joined_codesets")
+  log "External subtitles: ${subs[*]}"
+}
+
+label_mkv_tracks() {
+  local mkv="$1"
+  local src="$2"
+  local title="${3:-$(canonical_title_from_file "$src")}"
+
+  if [ "$DRY_RUN" = true ]; then
+    log "[dry-run] label audio/subtitle tracks + title on $mkv"
+    return 0
+  fi
+  [ -f "$mkv" ] || return 0
+
+  CONVERT_MKVMERGE="${MKVMERGE_CMD[*]}"
+  CONVERT_MKVPROPEDIT="${MKVPROPEDIT_CMD[*]}"
+  export CONVERT_MKVMERGE CONVERT_MKVPROPEDIT
+
+  python3 - "$mkv" "$src" "$title" <<'PY'
+import json, os, subprocess, sys
+
+mkv, src, title = sys.argv[1:4]
+mkvmerge = os.environ.get("CONVERT_MKVMERGE", "mkvmerge").split()
+mkvpropedit = os.environ.get("CONVERT_MKVPROPEDIT", "mkvpropedit").split()
+
+LANG_NAMES = {
+    "eng": "English", "chi": "Chinese", "jpn": "Japanese", "kor": "Korean",
+    "fre": "French", "ger": "German", "spa": "Spanish", "ita": "Italian",
+    "por": "Portuguese", "rus": "Russian",
+}
+
+def norm(code):
+    if not code:
+        return ""
+    c = code.lower().strip()
+    aliases = {
+        "en": "eng", "zh": "chi", "zho": "chi", "chi": "chi", "chs": "chi", "cht": "chi",
+        "ja": "jpn", "jpn": "jpn", "ko": "kor", "kor": "kor", "fr": "fre", "fre": "fre",
+        "de": "ger", "ger": "ger", "es": "spa", "spa": "spa", "it": "ita", "ita": "ita",
+        "pt": "por", "por": "por", "ru": "rus", "rus": "rus",
+    }
+    return aliases.get(c, c if len(c) == 3 else "")
+
+def guess_from_path(path):
+    p = path.lower()
+    for key, code in (
+        ("chinese", "chi"), ("cantonese", "chi"), ("mandarin", "chi"),
+        ("japanese", "jpn"), ("korean", "kor"), ("french", "fre"),
+        ("german", "ger"), ("spanish", "spa"), ("english", "eng"),
+    ):
+        if key in p:
+            return code
+    return "eng"
+
+def detect_from_filename(path):
+    name = path.rsplit("/", 1)[-1].lower()
+    markers = (
+        (".en.", "eng"), (".eng.", "eng"), (".zh.", "chi"), (".chi.", "chi"),
+        (".ja.", "jpn"), (".jpn.", "jpn"), (".ko.", "kor"), (".kor.", "kor"),
+        (".fr.", "fre"), (".de.", "ger"), (".es.", "spa"),
+    )
+    for m, code in markers:
+        if m in name:
+            return code
+    return ""
+
+try:
+    data = json.loads(subprocess.check_output([*mkvmerge, "-J", mkv], text=True))
+except Exception:
+    sys.exit(0)
+
+fallback = guess_from_path(src)
+args = [*mkvpropedit, mkv, "-e", "info", "--set", f"title={title}"]
+
+for track in data.get("tracks", []):
+    if track.get("type") not in ("audio", "subtitles"):
+        continue
+    tid = track["id"]
+    props = track.get("properties", {})
+    lang = norm(props.get("language_ietf") or props.get("language") or "")
+    if not lang:
+        lang = detect_from_filename(src) or fallback
+    name = props.get("track_name") or ""
+    if not name or name.lower() in {"und", "unknown", "track"}:
+        name = LANG_NAMES.get(lang, lang.upper() if lang else "Unknown")
+    args.extend(["--edit", f"track:{tid}", "--set", f"name={name}"])
+    if lang:
+        args.extend(["--set", f"language={lang}"])
+
+subprocess.run(args, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+PY
+}
+
+finalize_mkv_output() {
+  local mkv="$1"
+  local src="$2"
+  local title="${3:-$(canonical_title_from_file "$src")}"
+  label_mkv_tracks "$mkv" "$src" "$title"
+}
+
+subtitle_target_name() {
+  local sub="$1"
+  local movie_file="$2"
+  local lang ext
+  lang="$(detect_subtitle_lang "$sub" "$movie_file")"
+  ext="$(to_lower "${sub##*.}")"
+  printf '%s.%s' "$lang" "$ext"
+}
+# Loose movie not yet in Title/Title.ext under a movie library parent.
+# TV episodes and TV show folders are never reorganized into per-episode folders.
+needs_flat_organize() {
+  local video="$1"
+  local parent dirbase raw_title canon_title
+
+  parent="$(dirname "$video")"
+  raw_title="$(movie_title_from_file "$video")"
+  canon_title="$(canonical_organize_title "$raw_title")"
+  dirbase="$(basename "$parent")"
+
+  if is_tv_episode "$video"; then
+    return 1
+  fi
+  if is_tv_show_directory "$parent"; then
+    return 1
+  fi
+
+  # Right folder, filename needs year parenthesized (or other canon fix).
+  if [ "$dirbase" = "$canon_title" ] && [ "$raw_title" != "$canon_title" ]; then
+    return 0
+  fi
+
+  # Already correct: .../Title (YYYY)/Title (YYYY).ext
+  if [ "$dirbase" = "$canon_title" ] && [ "$raw_title" = "$canon_title" ]; then
+    return 1
+  fi
+
+  is_movie_organize_parent "$parent" || return 1
+
+  # Loose file in library/shelf parent — needs subfolder.
+  return 0
+}
+
+organize_movie_entry() {
+  local video="$1"
+  local parent raw_title canon_title ext dest_dir dest_video dirbase
+
+  parent="$(dirname "$video")"
+  raw_title="$(movie_title_from_file "$video")"
+  canon_title="$(canonical_organize_title "$raw_title")"
+  ext="${video##*.}"
+  dirbase="$(basename "$parent")"
+
+  if [ "$dirbase" = "$canon_title" ]; then
+    dest_dir="$parent"
+    dest_video="$dest_dir/$canon_title.$ext"
+  else
+    dest_dir="$parent/$canon_title"
+    dest_video="$dest_dir/$canon_title.$ext"
+  fi
+
+  log "Organize: $video -> $dest_video"
+  if [ "$DRY_RUN" = true ]; then
+    return 0
+  fi
+
+  mkdir -p "$dest_dir"
+  if [ "$video" != "$dest_video" ]; then
+    mv -n -- "$video" "$dest_video"
+    video="$dest_video"
+  fi
+
+  local item target
+  for item in "$parent"/*; do
+    [ -e "$item" ] || continue
+    [ "$item" = "$dest_dir" ] && continue
+    if is_subtitle_file "$item"; then
+      if subtitle_matches_organize_title "$item" "$raw_title" "$canon_title"; then
+        target="$dest_dir/$(subtitle_target_name "$item" "$video")"
+        log "  subtitle: $item -> $target"
+        mv -n -- "$item" "$target"
+      fi
+    fi
+  done
+}
+
+organize_library() {
+  local -a loose=() roots=() shard shard_idx=0 shard_total=0 f
+
+  get_scan_roots roots
+  shard_total="${#roots[@]}"
+
+  if [ "$NO_SHARD" = false ] && [ "$shard_total" -gt 1 ]; then
+    log "Organize: sharded scan (depth=$SHARD_DEPTH, $shard_total shard(s))"
+  fi
+
+  for shard in "${roots[@]}"; do
+    shard_idx=$((shard_idx + 1))
+    if [ "$NO_SHARD" = false ] && [ "$shard_total" -gt 1 ]; then
+      log "Organize shard $shard_idx/$shard_total: $shard"
+    fi
+    while IFS= read -r f; do
+      loose+=("$f")
+    done < <(find_videos_under "$shard")
+  done
+
+  if [ "$NO_SHARD" = false ] && [ "$shard_total" -gt 1 ]; then
+    while IFS= read -r f; do
+      loose+=("$f")
+    done < <(find_videos_at_root "$SEARCH_PATH")
+  fi
+
+  sort_paths_by_size_desc loose
+  log "Organize queue: ${#loose[@]} files (largest first)"
+
+  local f
+  for f in "${loose[@]}"; do
+    is_derived_output "$f" && continue
+    if needs_flat_organize "$f"; then
+      organize_movie_entry "$f"
+    fi
+  done
+}
+
+set_mkv_title() {
+  local mkv="$1"
+  local title="$2"
+  finalize_mkv_output "$mkv" "$mkv" "$title"
+}
+
+validate_mkv_output() {
+  local src="$1"
+  local dst="$2"
+  local src_dur_override="${3:-}"
+  local errf dur_src dur_dst diff pct
+
+  if [ ! -s "$dst" ]; then
+    warn "Validation failed: empty output $dst"
+    return 1
+  fi
+
+  if ! run_mkvmerge --identify "$dst" >/dev/null 2>&1; then
+    warn "Validation failed: mkvmerge cannot identify $dst"
+    return 1
+  fi
+
+  if [ -n "$src_dur_override" ]; then
+    dur_src="$src_dur_override"
+  else
+    dur_src="$(video_duration "$src")"
+  fi
+  dur_dst="$(video_duration "$dst")"
+  if awk -v a="$dur_src" -v b="$dur_dst" 'BEGIN { exit !(a>0 && b>0) }'; then
+    diff="$(awk -v a="$dur_src" -v b="$dur_dst" 'BEGIN { printf "%.6f", (a>b)?a-b:b-a }')"
+    pct="$(awk -v d="$diff" -v a="$dur_src" 'BEGIN { if (a<=0) print 100; else print (d/a)*100 }')"
+    if awk -v p="$pct" 'BEGIN { exit !(p>3.0) }'; then
+      warn "Validation failed: duration drift ${pct}% (src=${dur_src}s dst=${dur_dst}s)"
+      return 1
+    fi
+  fi
+
+  errf="$(mktemp)"
+  if ! run_ffmpeg -v error -i "$dst" -map 0:v:0 -f null - 2>"$errf"; then
+    warn "Validation failed: decode error in $dst"
+    cat "$errf" >&2
+    rm -f "$errf"
+    return 1
+  fi
+  if grep -qiE 'corrupt|invalid|error' "$errf" 2>/dev/null; then
+    warn "Validation failed: ffmpeg reported issues in $dst"
+    cat "$errf" >&2
+    rm -f "$errf"
+    return 1
+  fi
+  rm -f "$errf"
+  return 0
+}
+
+size_keep_policy_av1() {
+  local orig_sz="$1"
+  local new_sz="$2"
+  local pct
+  if [ "$new_sz" -le "$orig_sz" ]; then
+    echo keep
+    return 0
+  fi
+  pct="$(awk -v o="$orig_sz" -v n="$new_sz" 'BEGIN { if (o<=0) print 100; else print ((n-o)/o)*100 }')"
+  if awk -v p="$pct" -v lim="$AV1_MAX_OVERSHOOT_PCT" 'BEGIN { exit !(p>lim) }'; then
+    echo reject
+  else
+    echo keep
+  fi
+}
+
+size_keep_policy() {
+  local orig_sz="$1"
+  local new_sz="$2"
+  if [ "$new_sz" -le "$orig_sz" ]; then
+    echo keep
+    return 0
+  fi
+  local pct
+  pct="$(awk -v o="$orig_sz" -v n="$new_sz" 'BEGIN { if (o<=0) print 100; else print ((n-o)/o)*100 }')"
+  if awk -v p="$pct" -v lim="$SIZE_OVERSHOOT_PCT" 'BEGIN { exit !(p>lim) }'; then
+    echo reject
+  else
+    echo keep
+  fi
+}
+
+encoder_ssim_score() {
+  local reference="$1"
+  local encoded="$2"
+  local out score
+  if [ ! -s "$encoded" ]; then
+    echo 0
+    return
+  fi
+  out="$(run_ffmpeg -nostdin -i "$reference" -i "$encoded" -lavfi ssim -f null - 2>&1 || true)"
+  score="$(awk '/SSIM Y:/{ print $3; exit }' <<<"$out" | tr -d '()')"
+  if [ -z "$score" ] || [ "$score" = "N/A" ]; then
+    score="$(awk '/All:/{ print $2; exit }' <<<"$out" | tr -d '()')"
+  fi
+  printf '%s' "${score:-0}"
+}
+
+# Per-encoder video/audio tuning. Sets EP_* globals via load_encoder_profile.
+# Pass optional src path to select anime vs movie profiles.
+load_encoder_profile() {
+  local encoder="$1"
+  local src="${2:-}"
+  local anime=false
+  EP_PRESET=""
+  EP_QUALITY=""
+  EP_ENCOPTS=""
+  EP_AUDIO_CODEC=""
+  EP_AUDIO_BITRATE=""
+  EP_HW_DECODE=false
+  EP_VIDEO_FILTERS=()
+  EP_PROFILE_NAME=movie
+
+  if [ -n "$src" ] && uses_anime_profile "$src"; then
+    anime=true
+    EP_PROFILE_NAME=anime
+  fi
+
+  if [ "$anime" = true ]; then
+    case "$encoder" in
+      svt_av1_10bit)
+        EP_PRESET=5
+        EP_QUALITY=35
+        EP_ENCOPTS='enable-qm=1:film-grain-denoise=1:film-grain=12:qm-min=0:scd=1:enable-tf=0:keyint=15s:aq-mode=2:enable-variance-boost=1:variance-boost-strength=3:variance-octile=4:enable-overlays=1'
+        EP_VIDEO_FILTERS=(--lapsharp=light)
+        EP_AUDIO_CODEC=opus
+        EP_AUDIO_BITRATE=$OPUS_BITRATE
+        EP_HW_DECODE=auto
+        ;;
+      nvenc_av1)
+        EP_PRESET=medium
+        EP_QUALITY=32
+        EP_ENCOPTS='spatial-aq=1:temporal-aq=1:rc-lookahead=32:multipass=2'
+        EP_VIDEO_FILTERS=(--lapsharp=light)
+        EP_AUDIO_CODEC=opus
+        EP_AUDIO_BITRATE=$OPUS_BITRATE
+        EP_HW_DECODE=true
+        ;;
+      x265)
+        EP_PRESET=medium
+        EP_QUALITY=26
+        EP_ENCOPTS='tune=animation:keyint=240:min-keyint=24:bframes=8:ref=4:rc-lookahead=30:aq-mode=2:psy-rd=1.5:psy-rdoq=0.8'
+        EP_VIDEO_FILTERS=(--lapsharp=light)
+        EP_AUDIO_CODEC=aac
+        EP_AUDIO_BITRATE=$AAC_BITRATE
+        EP_HW_DECODE=false
+        ;;
+      nvenc_h265)
+        EP_PRESET=medium
+        EP_QUALITY=26
+        EP_ENCOPTS='spatial-aq=1:temporal-aq=1:rc-lookahead=32:multipass=fullres'
+        EP_VIDEO_FILTERS=(--lapsharp=light)
+        EP_AUDIO_CODEC=aac
+        EP_AUDIO_BITRATE=$AAC_BITRATE
+        EP_HW_DECODE=true
+        ;;
+      *)
+        err "Unknown encoder profile: $encoder"
+        return 1
+        ;;
+    esac
+    return 0
+  fi
+
+  case "$encoder" in
+    svt_av1_10bit)
+      EP_PRESET=8
+      EP_QUALITY=26
+      EP_ENCOPTS='enable-qm=1:qm-min=0:keyint=15s:scd=1:aq-mode=2'
+      EP_AUDIO_CODEC=opus
+      EP_AUDIO_BITRATE=$OPUS_BITRATE
+      EP_HW_DECODE=auto
+      ;;
+    nvenc_av1)
+      EP_PRESET=medium
+      EP_QUALITY=26
+      EP_ENCOPTS='spatial-aq=1:temporal-aq=1:rc-lookahead=32:multipass=2'
+      EP_AUDIO_CODEC=opus
+      EP_AUDIO_BITRATE=$OPUS_BITRATE
+      EP_HW_DECODE=true
+      ;;
+    x265)
+      EP_PRESET=medium
+      EP_QUALITY=22
+      EP_ENCOPTS='keyint=240:min-keyint=24:bframes=8:ref=5:rc-lookahead=40:aq-mode=3:psy-rd=2.0:psy-rdoq=1.0:deblock=-1,-1'
+      EP_AUDIO_CODEC=aac
+      EP_AUDIO_BITRATE=$AAC_BITRATE
+      EP_HW_DECODE=false
+      ;;
+    nvenc_h265)
+      EP_PRESET=medium
+      EP_QUALITY=24
+      EP_ENCOPTS='spatial-aq=1:temporal-aq=1:rc-lookahead=32:multipass=fullres'
+      EP_AUDIO_CODEC=aac
+      EP_AUDIO_BITRATE=$AAC_BITRATE
+      EP_HW_DECODE=true
+      ;;
+    *)
+      err "Unknown encoder profile: $encoder"
+      return 1
+      ;;
+  esac
+}
+
+handbrake_append_audio_args() {
+  local -n _args="$1"
+  local codec="$2"
+  local bitrate="$3"
+  _args+=(--all-audio --aencoder "$codec" -B "$bitrate" -D "$AUDIO_DRC" --gain "$AUDIO_GAIN")
+}
+
+handbrake_append_hw_decode() {
+  local -n _args="$1"
+  local encoder="$2"
+  local mode="$3"
+  case "$mode" in
+    false|'') return 0 ;;
+  esac
+  [ "$HAS_HW_DECODE" = true ] || return 0
+  [ -n "$HW_DECODE_NAME" ] || return 0
+  case "$mode" in
+    true)
+      _args+=(--enable-hw-decoding "$HW_DECODE_NAME")
+      ;;
+    auto)
+      if [ "$encoder" = "svt_av1_10bit" ] || [ "$PLATFORM" = macos ]; then
+        _args+=(--enable-hw-decoding "$HW_DECODE_NAME")
+      fi
+      ;;
+  esac
+}
+
+build_handbrake_args() {
+  local src="$1"
+  local dst="$2"
+  local encoder="$3"
+  local -n _out="$4"
+  local hb_title="${5:-}"
+  local h
+
+  load_encoder_profile "$encoder" "$src" || return 1
+  if is_disk_source "$src"; then
+    h=0
+  else
+    h="$(video_height "$src")"
+  fi
+
+  if [ "$EP_PROFILE_NAME" = anime ]; then
+    log "Encoder profile: anime ($encoder)"
+  fi
+
+  _out=(
+    -i "$src" -o "$dst" -f mkv -m -O
+    -e "$encoder" -q "$EP_QUALITY" --encoder-preset "$EP_PRESET"
+    --all-subtitles --keep-subname
+    --subtitle-burned=none --subtitle-default=none
+  )
+
+  if [ -n "$hb_title" ]; then
+    _out+=(-t "$hb_title")
+  fi
+
+  if [ "${#EP_VIDEO_FILTERS[@]}" -gt 0 ]; then
+    _out+=("${EP_VIDEO_FILTERS[@]}")
+  fi
+
+  handbrake_append_audio_args _out "$EP_AUDIO_CODEC" "$EP_AUDIO_BITRATE"
+  handbrake_append_external_srts _out "$src"
+
+  if [ -n "$EP_ENCOPTS" ]; then
+    _out+=(--encopts "$EP_ENCOPTS")
+  fi
+
+  if [ "$h" -gt 0 ] && [ "$h" -lt 720 ]; then
+    _out+=(-w 1920 -l 1080 --custom-anamorphic none)
+    log "Upscale target 1920x1080 (source height ${h}px)"
+  fi
+
+  handbrake_append_hw_decode _out "$encoder" "$EP_HW_DECODE"
+}
+
+pick_av1_encoder() {
+  local sample_src="$1"
+  local hb_title="${2:-}"
+  local hb_dur="${3:-}"
+  local tmp clip nvenc_out svt_out ss_nv ss_svt start dur end
+  tmp="$(mktemp -d)"
+  clip="$tmp/clip.mkv"
+  nvenc_out="$tmp/nvenc.mkv"
+  svt_out="$tmp/svt.mkv"
+
+  if [ -n "$hb_title" ]; then
+    dur="$hb_dur"
+    start="$(sample_start_middle "$dur")"
+    end="$(awk -v s="$start" -v n="$SAMPLE_SECONDS" 'BEGIN { printf "%.0f", s + n }')"
+    log "Bake-off (disc title $hb_title): ${SAMPLE_SECONDS}s sample from middle (start=${start}s of ${dur}s)"
+    load_encoder_profile svt_av1_10bit "$sample_src"
+    run_handbrake -i "$sample_src" -t "$hb_title" -o "$svt_out" -f mkv \
+      --start-at "duration:$start" --stop-at "duration:$end" \
+      -e svt_av1_10bit -q "$EP_QUALITY" --encoder-preset "$EP_PRESET" \
+      --encopts "$EP_ENCOPTS" --all-audio --aencoder "$EP_AUDIO_CODEC" -B "$EP_AUDIO_BITRATE" \
+      -D "$AUDIO_DRC" --gain "$AUDIO_GAIN" \
+      "${EP_VIDEO_FILTERS[@]}" \
+      2>/dev/null
+  else
+    dur="$(video_duration "$sample_src")"
+    start="$(sample_start_middle "$dur")"
+    log "Bake-off: ${SAMPLE_SECONDS}s sample from middle (start=${start}s of ${dur}s)"
+    run_ffmpeg -y -nostdin -ss "$start" -t "$SAMPLE_SECONDS" -i "$sample_src" -map 0 -c copy "$clip" >/dev/null 2>&1
+    load_encoder_profile svt_av1_10bit "$sample_src"
+    run_handbrake -i "$clip" -o "$svt_out" -f mkv \
+      -e svt_av1_10bit -q "$EP_QUALITY" --encoder-preset "$EP_PRESET" \
+      --encopts "$EP_ENCOPTS" --all-audio --aencoder "$EP_AUDIO_CODEC" -B "$EP_AUDIO_BITRATE" \
+      -D "$AUDIO_DRC" --gain "$AUDIO_GAIN" \
+      "${EP_VIDEO_FILTERS[@]}" \
+      2>/dev/null
+  fi
+
+  if [ "$HAS_NVIDIA" = true ]; then
+    load_encoder_profile nvenc_av1 "$sample_src"
+    if [ -n "$hb_title" ]; then
+      CUDA_VISIBLE_DEVICES="$GPU_AV1" run_handbrake -i "$sample_src" -t "$hb_title" -o "$nvenc_out" -f mkv \
+        --start-at "duration:$start" --stop-at "duration:$end" \
+        -e nvenc_av1 -q "$EP_QUALITY" --encoder-preset "$EP_PRESET" \
+        --encopts "$EP_ENCOPTS" --enable-hw-decoding "${HW_DECODE_NAME:-nvdec}" \
+        --all-audio --aencoder "$EP_AUDIO_CODEC" -B "$EP_AUDIO_BITRATE" \
+        -D "$AUDIO_DRC" --gain "$AUDIO_GAIN" \
+        "${EP_VIDEO_FILTERS[@]}" \
+        2>/dev/null
+    else
+      CUDA_VISIBLE_DEVICES="$GPU_AV1" run_handbrake -i "$clip" -o "$nvenc_out" -f mkv \
+        -e nvenc_av1 -q "$EP_QUALITY" --encoder-preset "$EP_PRESET" \
+        --encopts "$EP_ENCOPTS" --enable-hw-decoding "${HW_DECODE_NAME:-nvdec}" \
+        --all-audio --aencoder "$EP_AUDIO_CODEC" -B "$EP_AUDIO_BITRATE" \
+        -D "$AUDIO_DRC" --gain "$AUDIO_GAIN" \
+        "${EP_VIDEO_FILTERS[@]}" \
+        2>/dev/null
+    fi
+
+    ss_nv=0; ss_svt=0
+    if [ -s "$nvenc_out" ]; then
+      ss_nv="$(encoder_ssim_score "$clip" "$nvenc_out")"
+    fi
+    if [ -s "$svt_out" ]; then
+      ss_svt="$(encoder_ssim_score "$clip" "$svt_out")"
+    fi
+
+    log "Bake-off SSIM — nvenc_av1: ${ss_nv:-0} | svt_av1_10bit: ${ss_svt:-0}"
+
+    if awk -v a="${ss_svt:-0}" -v b="${ss_nv:-0}" 'BEGIN { exit !(a>=b) }'; then
+      AV1_ENCODER="svt_av1_10bit"
+    else
+      AV1_ENCODER="nvenc_av1"
+    fi
+    log "Selected AV1 encoder: $AV1_ENCODER (GPU $GPU_AV1 for nvenc)"
+  else
+    AV1_ENCODER="svt_av1_10bit"
+    log "Selected AV1 encoder: $AV1_ENCODER (software — no NVIDIA GPU)"
+  fi
+
+  rm -rf "$tmp"
+  BAKEOFF_DONE=true
+}
+
+encode_sample_x265() {
+  local src="$1"
+  local dst="$2"
+  local hb_title="${3:-}"
+  local encoder gpu
+  local -a hb_args=()
+
+  if [ "$HAS_NVIDIA" = true ]; then
+    encoder="nvenc_h265"
+    gpu="$GPU_HEVC_PRIMARY"
+  else
+    encoder="x265"
+    gpu=""
+  fi
+
+  build_handbrake_args "$src" "$dst" "$encoder" hb_args "$hb_title" || return 1
+
+  if [ -n "$gpu" ]; then
+    CUDA_VISIBLE_DEVICES="$gpu" run_handbrake "${hb_args[@]}" 2>/dev/null
+  else
+    run_handbrake "${hb_args[@]}" 2>/dev/null
+  fi
+}
+
+# Compare middle sample sizes: true when x265 sample is smaller than AV1 sample.
+x265_sample_smaller_than_av1() {
+  local src="$1"
+  local tmp clip x265_out av1_sz x265_sz start dur gb
+  tmp="$(mktemp -d)"
+  clip="$tmp/clip.mkv"
+  x265_out="$tmp/x265.mkv"
+
+  if [ "$DRY_RUN" = true ]; then
+    gb="$(awk -v s="$(file_size_bytes "$src")" 'BEGIN { printf "%.2f", s/1024/1024/1024 }')"
+    log "[dry-run] Would sample ${SAMPLE_SECONDS}s at mid-file to compare AV1 (${gb} GB) vs x265 compression"
+    rm -rf "$tmp"
+    return 1
+  fi
+
+  dur="$(video_duration "$src")"
+  start="$(sample_start_middle "$dur")"
+
+  run_ffmpeg -y -nostdin -ss "$start" -t "$SAMPLE_SECONDS" -i "$src" -map 0 -c copy "$clip" >/dev/null 2>&1
+  [ -s "$clip" ] || { rm -rf "$tmp"; return 1; }
+
+  av1_sz="$(file_size_bytes "$clip")"
+  encode_sample_x265 "$clip" "$x265_out"
+  [ -s "$x265_out" ] || { rm -rf "$tmp"; return 1; }
+
+  x265_sz="$(file_size_bytes "$x265_out")"
+  log "Oversized AV1 sample (${SAMPLE_SECONDS}s @ ${start}s): AV1=${av1_sz} bytes, x265=${x265_sz} bytes"
+
+  rm -rf "$tmp"
+  [ "$x265_sz" -lt "$av1_sz" ]
+}
+
+handbrake_encode() {
+  local src="$1"
+  local dst="$2"
+  local encoder="$3"
+  local gpu="${4:-}"
+  local hb_title="${5:-}"
+  local -a hb_args=()
+
+  load_encoder_profile "$encoder" "$src" || return 1
+
+  if [ "$DRY_RUN" = true ]; then
+    local title_arg=""
+    [ -n "$hb_title" ] && title_arg="-t $hb_title "
+    log "[dry-run] $HANDBRAKE_DISPLAY -e $encoder profile=$EP_PROFILE_NAME -q $EP_QUALITY --encoder-preset $EP_PRESET --encopts '$EP_ENCOPTS' --aencoder $EP_AUDIO_CODEC -B $EP_AUDIO_BITRATE -D $AUDIO_DRC --gain $AUDIO_GAIN ${title_arg}-i '$src' -o '$dst'"
+    return 0
+  fi
+
+  build_handbrake_args "$src" "$dst" "$encoder" hb_args "$hb_title" || return 1
+
+  if [ -n "$gpu" ] && [ "$HAS_NVIDIA" = true ]; then
+    CUDA_VISIBLE_DEVICES="$gpu" run_handbrake "${hb_args[@]}"
+  else
+    run_handbrake "${hb_args[@]}"
+  fi
+}
+
+remux_copy_to_mkv() {
+  local src="$1"
+  local dst="$2"
+  if [ "$DRY_RUN" = true ]; then
+    log "[dry-run] remux $src -> $dst"
+    return 0
+  fi
+  run_ffmpeg -y -nostdin -i "$src" -map 0 -c copy "$dst"
+  finalize_mkv_output "$dst" "$src"
+}
+
+remove_output_only() {
+  local f="$1"
+  [ -e "$f" ] || return 0
+  warn "Removing rejected output (original kept): $f"
+  if [ "$DRY_RUN" = true ]; then
+    return 0
+  fi
+  rm -f -- "$f"
+}
+
+process_existing_av1() {
+  local src="$1"
+  local dir title ext out x265_out sz gb
+  dir="$(dirname "$src")"
+  title="$(movie_title_from_file "$src")"
+  ext="$(to_lower "${src##*.}")"
+  x265_out="$(x265_output_path "$src")"
+
+  if [ "$ext" != "mkv" ]; then
+    out="$(av1_output_path "$src")"
+    log "AV1 remux to MKV: $src -> $out"
+    remux_copy_to_mkv "$src" "$out"
+    validate_mkv_output "$src" "$out" || { remove_output_only "$out"; return 1; }
+    finalize_mkv_output "$out" "$src" "$title"
+    record_conversion_result "$src" "$out"
+    return 0
+  fi
+
+  if is_oversized_av1 "$src"; then
+    sz="$(file_size_bytes "$src")"
+    pct="$(av1_overshoot_pct_vs_original "$src")"
+    if [ -f "$x265_out" ]; then
+      log "AV1 output ${pct}% vs original — x265 replacement already exists: $x265_out"
+      finalize_mkv_output "$src" "$src" "$title"
+      record_skip "$src" "x265 replacement exists"
+      return 0
+    fi
+    log "AV1 output ${pct}% larger than original ($(human_size_bytes "$sz")) — testing whether x265 compresses better: $src"
+    if x265_sample_smaller_than_av1 "$src"; then
+      warn "x265 sample was smaller — re-encoding bloated AV1 to x265"
+      try_x265_convert "$src"
+      return $?
+    fi
+    log "x265 sample was not smaller — keeping AV1 (${pct}% vs original)"
+    finalize_mkv_output "$src" "$src" "$title"
+    record_conversion_result "$src" ""
+    return 0
+  fi
+
+  log "AV1 in MKV — metadata only: $src"
+  finalize_mkv_output "$src" "$src" "$title"
+  record_conversion_result "$src" ""
+}
+
+try_av1_convert() {
+  local src="$1"
+  local hb_title="${2:-}"
+  local hb_dur="${3:-}"
+  local dir title out gpu policy
+  dir="$(media_content_dir "$src")"
+  title="$(canonical_title_from_source "$src")"
+  out="$(av1_output_path "$src")"
+
+  if [ -f "$out" ]; then
+    log "Skip — already exists: $out"
+    record_skip "$src" "output exists"
+    return 0
+  fi
+
+  if [ "$BAKEOFF_DONE" = false ]; then
+    pick_av1_encoder "$src" "$hb_title" "$hb_dur"
+  fi
+
+  gpu="$GPU_AV1"
+  if [ "$AV1_ENCODER" = "svt_av1_10bit" ] || [ "$HAS_NVIDIA" = false ]; then
+    gpu=""
+  fi
+
+  log "AV1 transcode ($AV1_ENCODER): $src"
+  handbrake_encode "$src" "$out" "$AV1_ENCODER" "$gpu" "$hb_title" || {
+    remove_output_only "$out"
+    warn "AV1 encode failed — trying x265 fallback"
+    try_x265_convert "$src" "$hb_title" "$hb_dur"
+    return $?
+  }
+
+  if [ "$DRY_RUN" = true ]; then
+    return 0
+  fi
+
+  validate_mkv_output "$src" "$out" "$hb_dur" || {
+    remove_output_only "$out"
+    warn "AV1 validation failed — trying x265 fallback"
+    try_x265_convert "$src" "$hb_title" "$hb_dur"
+    return $?
+  }
+
+  local orig_sz new_sz
+  if is_disk_source "$src"; then
+    orig_sz="$(disc_source_size_bytes "$src")"
+  else
+    orig_sz="$(file_size_bytes "$src")"
+  fi
+  new_sz="$(file_size_bytes "$out")"
+  policy="$(size_keep_policy_av1 "$orig_sz" "$new_sz")"
+
+  if [ "$policy" = keep ]; then
+    finalize_mkv_output "$out" "$src" "$title"
+    log "Kept AV1 ($(awk -v o="$orig_sz" -v n="$new_sz" 'BEGIN { printf "%.1f%% of original", (n/o)*100 }')): $out"
+    record_conversion_result "$src" "$out"
+    return 0
+  fi
+
+  warn "AV1 output >${AV1_MAX_OVERSHOOT_PCT}% larger than original ($(awk -v o="$orig_sz" -v n="$new_sz" 'BEGIN { printf "%.1f%%", (n/o)*100 }')) — trying x265 fallback"
+  remove_output_only "$out"
+  try_x265_convert "$src" "$hb_title" "$hb_dur"
+}
+
+try_x265_convert() {
+  local src="$1"
+  local hb_title="${2:-}"
+  local hb_dur="${3:-}"
+  local dir title out gpu encoder codec ext src_codec policy
+  dir="$(media_content_dir "$src")"
+  title="$(canonical_title_from_source "$src")"
+  out="$(x265_output_path "$src")"
+  codec="$(video_codec "$src")"
+  src_codec="$codec"
+  ext="$(to_lower "${src##*.}")"
+
+  if [ -f "$out" ]; then
+    log "Skip — already exists: $out"
+    record_skip "$src" "output exists"
+    return 0
+  fi
+
+  if [ "$ext" = "mkv" ] && is_hevc_codec "$codec" && [ -z "$hb_title" ]; then
+    log "x265 remux (HEVC stream copy to MKV): $src -> $out"
+    remux_copy_to_mkv "$src" "$out"
+    if [ "$DRY_RUN" = true ]; then
+      return 0
+    fi
+    validate_mkv_output "$src" "$out" "$hb_dur" || { remove_output_only "$out"; return 1; }
+    finalize_mkv_output "$out" "$src" "$title"
+    log "Kept x265 remux ($(awk -v o="$(file_size_bytes "$src")" -v n="$(file_size_bytes "$out")" 'BEGIN { printf "%.1f%% of original", (n/o)*100 }')): $out"
+    record_conversion_result "$src" "$out"
+    return 0
+  fi
+
+  if [ "$HAS_NVIDIA" = true ]; then
+    encoder="nvenc_h265"
+    gpu="$GPU_HEVC_PRIMARY"
+    log "x265 transcode (nvenc_h265, GPU $gpu): $src"
+    handbrake_encode "$src" "$out" "$encoder" "$gpu" "$hb_title" || {
+      if [ "$NVIDIA_GPU_COUNT" -gt 1 ]; then
+        warn "Primary GPU HEVC failed; trying GPU $GPU_HEVC_FALLBACK"
+        handbrake_encode "$src" "$out" "$encoder" "$GPU_HEVC_FALLBACK" "$hb_title" || { remove_output_only "$out"; return 1; }
+      else
+        remove_output_only "$out"
+        return 1
+      fi
+    }
+  else
+    encoder="x265"
+    log "x265 transcode (software x265): $src"
+    handbrake_encode "$src" "$out" "$encoder" "" "$hb_title" || { remove_output_only "$out"; return 1; }
+  fi
+
+  if [ "$DRY_RUN" = true ]; then
+    return 0
+  fi
+
+  validate_mkv_output "$src" "$out" "$hb_dur" || { remove_output_only "$out"; return 1; }
+
+  local orig_sz new_sz
+  if is_disk_source "$src"; then
+    orig_sz="$(disc_source_size_bytes "$src")"
+  else
+    orig_sz="$(file_size_bytes "$src")"
+  fi
+  new_sz="$(file_size_bytes "$out")"
+  if [ "$src_codec" = "av1" ]; then
+    policy="$(size_keep_policy_av1 "$orig_sz" "$new_sz")"
+  else
+    policy="$(size_keep_policy "$orig_sz" "$new_sz")"
+  fi
+
+  if [ "$policy" = keep ]; then
+    finalize_mkv_output "$out" "$src" "$title"
+    log "Kept x265 ($(awk -v o="$orig_sz" -v n="$new_sz" 'BEGIN { printf "%.1f%% of original", (n/o)*100 }')): $out"
+    record_conversion_result "$src" "$out"
+    return 0
+  fi
+
+  if [ "$src_codec" = "av1" ]; then
+    warn "x265 output not smaller than oversized AV1 — rejected"
+  else
+    warn "x265 output >${SIZE_OVERSHOOT_PCT}% larger — rejected"
+  fi
+  remove_output_only "$out"
+  return 1
+}
+
+process_disk() {
+  local src="$1"
+  local sel title_idx title_dur kind
+
+  if is_iso_file "$src"; then
+    kind="ISO disc"
+  else
+    kind="Blu-ray disc"
+  fi
+
+  log "Scanning titles ($kind): $src"
+  sel="$(select_dominant_disk_title "$src")"
+  case "$sel" in
+    SKIP:*)
+      warn "Skipping $kind: ${sel#SKIP:}"
+      record_skip "$src" "${sel#SKIP:}"
+      return 0
+      ;;
+    SELECT:*)
+      title_idx="${sel#SELECT:}"
+      title_idx="${title_idx%%:*}"
+      title_dur="${sel##*:}"
+      ;;
+    *)
+      warn "Skipping $kind: title scan failed"
+      record_skip "$src" "title scan failed"
+      return 0
+      ;;
+  esac
+
+  log "Processing ($kind title $title_idx, ${title_dur}s): $src"
+  try_av1_convert "$src" "$title_idx" "$title_dur"
+}
+
+process_video() {
+  local src="$1"
+  local codec kind ext
+  codec="$(video_codec "$src")"
+  ext="$(to_lower "${src##*.}")"
+  if is_tv_episode "$src"; then
+    kind="TV episode"
+  else
+    kind="movie"
+  fi
+
+  if uses_anime_profile "$src"; then
+    kind="anime ${kind}"
+  fi
+
+  log "Processing ($kind): $src (codec=$codec container=$ext)"
+  if [ "$codec" = "av1" ]; then
+    process_existing_av1 "$src"
+    return 0
+  fi
+  try_av1_convert "$src"
+}
+
+inspect_library() {
+  local -a videos=() disks=() roots=()
+  local f shard shard_idx=0 shard_total=0
+
+  get_scan_roots roots
+  shard_total="${#roots[@]}"
+
+  if [ "$NO_SHARD" = false ] && [ "$shard_total" -gt 1 ]; then
+    log "Inspect: sharded scan (depth=$SHARD_DEPTH, $shard_total shard(s))"
+  fi
+
+  for shard in "${roots[@]}"; do
+    shard_idx=$((shard_idx + 1))
+    if [ "$NO_SHARD" = false ] && [ "$shard_total" -gt 1 ]; then
+      log "Inspect shard $shard_idx/$shard_total: $shard"
+    fi
+    while IFS= read -r f; do
+      videos+=("$f")
+    done < <(find_convert_videos_under "$shard")
+  done
+
+  if [ "$NO_SHARD" = false ] && [ "$shard_total" -gt 1 ]; then
+    while IFS= read -r f; do
+      videos+=("$f")
+    done < <(find "$SEARCH_PATH" -maxdepth 1 -type f \( \
+      -iname '*.avi' -o -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.ts' \) 2>/dev/null)
+  fi
+
+  discover_disk_sources disks
+
+  log "Inspect: ${#videos[@]} video(s), ${#disks[@]} disc source(s)"
+  stats_log_append "--- media inspection (dry-run) ---"
+  for f in "${videos[@]}"; do
+    is_derived_output "$f" && continue
+    is_video_file "$f" || continue
+    record_media_inspection "$f"
+  done
+  for f in "${disks[@]}"; do
+    record_disk_inspection "$f"
+  done
+  stats_log_append "--- end inspection ---"
+  stats_log_append ""
+}
+
+convert_library() {
+  local -a videos=() disks=() queue=() roots=()
+  local f shard shard_idx=0 shard_total=0
+
+  get_scan_roots roots
+  shard_total="${#roots[@]}"
+
+  if [ "$NO_SHARD" = false ] && [ "$shard_total" -gt 1 ]; then
+    log "Convert: sharded scan (depth=$SHARD_DEPTH, $shard_total shard(s))"
+  fi
+
+  for shard in "${roots[@]}"; do
+    shard_idx=$((shard_idx + 1))
+    if [ "$NO_SHARD" = false ] && [ "$shard_total" -gt 1 ]; then
+      log "Convert shard $shard_idx/$shard_total: $shard"
+    fi
+    while IFS= read -r f; do
+      videos+=("$f")
+    done < <(find_convert_videos_under "$shard")
+  done
+
+  if [ "$NO_SHARD" = false ] && [ "$shard_total" -gt 1 ]; then
+    while IFS= read -r f; do
+      videos+=("$f")
+    done < <(find "$SEARCH_PATH" -maxdepth 1 -type f \( \
+      -iname '*.avi' -o -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.ts' \) 2>/dev/null)
+  fi
+
+  discover_disk_sources disks
+
+  for f in "${videos[@]}"; do
+    if is_derived_output "$f"; then
+      needs_oversized_av1_recheck "$f" || continue
+    else
+      is_video_file "$f" || continue
+      has_canonical_output "$f" && continue
+    fi
+    queue+=("$f")
+  done
+
+  for f in "${disks[@]}"; do
+    has_canonical_output "$f" && continue
+    queue+=("$f")
+  done
+
+  sort_paths_by_size_desc queue
+  log "Convert queue: ${#queue[@]} items (largest first; includes ${#disks[@]} disc source(s))"
+
+  for f in "${queue[@]}"; do
+    if is_disk_source "$f"; then
+      process_disk "$f"
+    else
+      process_video "$f"
+    fi
+  done
+}
+
+main() {
+  detect_hw_environment
+  init_stats_log
+  assert_script_name_matches_version
+  log "$SCRIPT_NAME v$VERSION"
+  log "Path: $SEARCH_PATH (platform=$PLATFORM shell=$(shell_name) dry_run=$DRY_RUN organize=$DO_ORGANIZE convert=$DO_CONVERT shard_depth=$SHARD_DEPTH no_shard=$NO_SHARD nvidia=$HAS_NVIDIA hw_decode=${HW_DECODE_NAME:-none})"
+  log "Stats log: $SEARCH_PATH/convert-v4.log"
+
+  if [ "$DRY_RUN" = true ]; then
+    log "Phase 0: media inspection (name, format, length, resolution — no conversion)"
+    inspect_library
+  fi
+
+  if [ "$DO_ORGANIZE" = true ]; then
+    log "Phase 1: organize per-movie folders (all languages; years parenthesized)"
+    organize_library
+  fi
+
+  if [ "$DO_CONVERT" = true ]; then
+    log "Phase 2: transcode / remux to MKV (largest first; AV1 preferred when smaller, else x265)"
+    convert_library
+  fi
+
+  finalize_stats_log
+  log "Done. Original files were not deleted."
+}
+
+main "$@"
