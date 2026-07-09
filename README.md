@@ -4,6 +4,17 @@ Portable Bash library organizer and batch transcoder for large home-media trees.
 
 **Current release:** `convert-v4.0.6.sh` (v4.0.6)
 
+## Version progression
+
+Each release is a **new file** — prior scripts stay in the repo for reference:
+
+| File | Version | Notes |
+|------|---------|--------|
+| `convert-v4.0.5.sh` | 4.0.5 | Initial v4 release; 8 GB AV1 oversized threshold |
+| `convert-v4.0.6.sh` | 4.0.6 | **Current** — 20% vs-original AV1 policy; `SCRIPT_NAME` check |
+
+When bumping version: copy the latest script to `convert-v{NEW}.sh`, update `VERSION` and `SCRIPT_NAME`, keep all older files. Do not rename or overwrite.
+
 ## Genesis
 
 This project evolved from three small batch encoders in [`genesis/`](genesis/):
