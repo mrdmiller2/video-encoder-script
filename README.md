@@ -51,34 +51,202 @@ This project evolved from three small batch encoders in [`genesis/`](genesis/):
 
 Those scripts scanned the current directory and wrote `{title}-av1.mkv`. v4 keeps the anime encoder profile and GPU paths, and adds organization rules, TV detection, disc title selection, NVENC bake-off, validation, and sharded finds. See [`genesis/README.md`](genesis/README.md) for the full lineage table.
 
-## Requirements
+## Environment requirements
 
-- **bash 4+** (Linux, WSL, Cygwin) or **zsh** (macOS — re-exec’d automatically)
-- **ffmpeg**, **ffprobe**, **HandBrakeCLI**, **mkvpropedit**, **mkvmerge**
-- Optional: NVIDIA GPUs for nvenc/nvdec; Flatpak HandBrake on Linux (`fr.handbrake.ghb`)
+The script runs on **Linux**, **WSL2**, **Cygwin/MSYS2/Git Bash**, and **macOS**. It does **not** run in plain Windows PowerShell or CMD.
 
-Install example (Fedora):
+### Tools (all platforms)
+
+| Tool | Used for |
+|------|----------|
+| **ffmpeg** / **ffprobe** | Probing, remux, validation decode windows, NVENC tune probe |
+| **HandBrakeCLI** | Transcode (AV1, HEVC, disc scan), hardware decode when available |
+| **mkvmerge** / **mkvpropedit** | Subtitles, metadata, output validation |
+
+Override paths with `CONVERT_FFMPEG`, `CONVERT_HANDBRAKE`, etc., or `--ffmpeg`, `--handbrake`, …
+
+On startup the script prints the binaries it picked — that line is the source of truth for your machine.
+
+### Minimum versions (feature support)
+
+| Component | Minimum | Enables |
+|-----------|---------|---------|
+| **bash** | 4.0+ | Script runs (Linux, WSL, Cygwin) |
+| **zsh** | any recent | macOS — script re-execs under zsh automatically (system bash 3.2 is too old) |
+| **HandBrake** | **1.7.0+** | `nvenc_av1_10bit` (GPU AV1 encode) |
+| **HandBrake** | **1.6.0+** | `nvenc_h265`, `svt_av1_10bit`, disc/ISO scan |
+| **ffmpeg** | **4.4+** | Basic probe/remux; **5.0+** recommended for AV1/HDR validation paths |
+| **MKVToolNix** | **60+** | Reliable merge/propedit on modern MKV/HDR outputs |
+| **NVIDIA driver** | **525+** (Linux/WSL) / current Studio or Game Ready (Windows host) | NVENC/NVDEC via HandBrake |
+| **NVIDIA GPU + NVENC 13+** | RTX 40-series or newer (Ada+) for AV1 encode; most GTX 10-series+ for HEVC NVENC | GPU AV1 (`nvenc_av1_10bit`); script auto-falls back to `tune=hq` if `tune=uhq` is unsupported |
+
+Verify HandBrake encoders:
+
+```bash
+HandBrakeCLI --help 2>&1 | grep -E 'nvenc_av1|nvenc_h265|svt_av1'
+```
+
+Without a supported GPU, the script uses **software** encoders (`svt_av1_10bit`, `x265`) — correct but much slower.
+
+---
+
+### Linux (native)
+
+**Shell:** bash 4+
+
+**Install example (Fedora):**
 
 ```bash
 sudo dnf install ffmpeg mkvtoolnix HandBrake-cli
 ```
 
+**Install example (Debian/Ubuntu):**
+
+```bash
+sudo apt install ffmpeg mkvtoolnix handbrake-cli
+```
+
+**Optional:** Flatpak HandBrake (`fr.handbrake.ghb`) — auto-detected if distro packages are missing.
+
+**NVIDIA GPU:** Install proprietary drivers so `nvidia-smi` works. No separate CUDA Toolkit is required for NVENC.
+
+**Typical `--path`:** local mount (`/mnt/BigMomma/...`, `/media/...`) or NFS mount configured in `/etc/fstab`.
+
+---
+
+### Windows (WSL2 — recommended)
+
+**Shell:** bash 4+ inside a WSL2 distro (Ubuntu, Fedora, etc.). The script sets `PLATFORM=wsl`.
+
+**GPU:** Install current NVIDIA drivers on the **Windows host**. `nvidia-smi` must work **inside WSL**. WSL1 is not supported for this workflow.
+
+**Linux vs Windows binaries:** The script does **not** prefer one or the other. It uses, in order:
+
+1. `CONVERT_*` / CLI overrides  
+2. First match on WSL `PATH` (`which ffmpeg`, etc.)  
+3. Linux paths (`/usr/bin`, `/usr/local/bin`, `~/.local/bin`)  
+4. Flatpak HandBrake (Linux/WSL only)
+
+It does **not** auto-search `C:\Program Files\...` on WSL. To use Windows HandBrake or ffmpeg, set paths explicitly:
+
+```bash
+export CONVERT_HANDBRAKE='/mnt/c/Program Files/HandBrake/HandBrakeCLI.exe'
+```
+
+**Recommendation:** Use one consistent toolchain — usually **Linux packages inside WSL** (`apt`/`dnf` ffmpeg + mkvtoolnix + handbrake-cli). Mixing Linux ffmpeg with Windows HandBrake works if you set `CONVERT_*` deliberately.
+
+**Mounting media in WSL:**
+
+| How you access library | WSL `--path` example | Notes |
+|------------------------|----------------------|-------|
+| NFS (mounted in WSL) | `/mnt/BigMomma/Media/Movies` | Best remote option when the NFS server and network are fast |
+| SMB share mounted in WSL (`cifs`) | `/mnt/movies` | Common; tune `vers=3.1.1`, large `rsize`/`wsize`; latency-sensitive |
+| Windows drive letter | `/mnt/c/Users/...` | Fine for local NTFS; **slow** for huge trees (drvfs metadata) |
+| `\\server\share` only on Windows | Mount into WSL first — avoid encoding through `/mnt/c/...` to a redirected network drive |
+
+---
+
+### Windows (Cygwin / MSYS2 / Git Bash)
+
+**Shell:** bash 4+; script sets `PLATFORM=windows`.
+
+**Tools:** Install Windows builds of ffmpeg, MKVToolNix, and HandBrakeCLI, or point `CONVERT_*` at `C:\Program Files\...` (script also checks `/cygdrive/c/Program Files/...`).
+
+**GPU:** `nvidia-smi.exe` must be on `PATH` (typically `C:\Windows\System32`).
+
+Less tested than WSL2; prefer WSL2 for large library jobs.
+
+---
+
+### macOS
+
+**Shell:** zsh (automatic re-exec from bash 3.2).
+
+**Tools:**
+
+```bash
+brew install ffmpeg mkvtoolnix handbrake
+```
+
+HandBrake is also searched under `/Applications/HandBrake.app/Contents/MacOS/HandBrakeCLI`.
+
+**GPU:** No NVIDIA NVENC path on Apple Silicon / Intel Macs in this script. Hardware **decode** uses **VideoToolbox** when HandBrake supports it; **encode** is **software** (`svt_av1_10bit`, `x265`). Expect longer runtimes than a Linux/WSL NVIDIA box.
+
+**Mounting media:**
+
+| How you access library | Typical `--path` | Notes |
+|------------------------|------------------|-------|
+| Local APFS volume | `/Volumes/Media/Movies` | Fastest |
+| NFS (`mount -t nfs`) | `/Volumes/nfs-media/...` or mount point you chose | Good on gigabit LAN; same latency caveats as Linux NFS |
+| SMB (`mount_smbfs`) | `/Volumes/share-name/...` | Very common on Mac; fine for reads, watch write speed during encode |
+| External USB | `/Volumes/MyDrive/...` | USB 3.x+ recommended; USB 2.0 can stall fast encodes waiting on disk |
+
+---
+
+## Storage, mounts, and performance
+
+The script is **I/O-heavy**: sharded `find` over thousands of folders, ffprobe per file, full source read during encode, and **simultaneous write** of a new `.AV1.mkv` / `.x265.mkv` beside the original. Storage choice affects **wall-clock time** and stability more than it changes compression quality.
+
+### What is affected by slow storage
+
+| Phase | Sensitive to slow/latency-heavy storage? | Why |
+|-------|------------------------------------------|-----|
+| **Dry-run / inspect** | **High** | Many small metadata reads and ffprobe opens |
+| **Organize** | **Medium** | Renames/moves across directories; painful on high-latency mounts |
+| **Sharded find** | **High** | Thousands of directory walks |
+| **Encode (GPU)** | **Medium–High** | GPU is fast; slow **read** or **write** can leave the GPU idle between buffers |
+| **Encode (CPU / Mac)** | **Lower** | CPU encode is slower; storage is less often the bottleneck |
+| **Resume / validation** | **Medium** | Extra read passes on outputs |
+
+### Mount types (rough guidance)
+
+| Storage | Typical throughput | Latency | Impact on encoding |
+|---------|-------------------|---------|-------------------|
+| **Local NVMe / SATA SSD** | Excellent | Low | **Best** — use when possible |
+| **Local HDD** | Good sequential, weaker random | Low | Fine for overnight batch jobs; sharded finds take longer |
+| **NFS (gigabit+ LAN)** | Good sequential if server is strong | Medium | **Works well** for large libraries (author uses NFS). Ensure stable mount, enough server RAM/disk, and `soft` vs `hard` mount timeout policy you are comfortable with |
+| **SMB/CIFS** | Variable | Often higher than NFS | **Usable**; tune mount options; avoid Wi‑Fi or congested links for multi‑TB writes |
+| **USB 3.x external** | Moderate | Low–medium | OK for small batches; large 4K outputs may **throttle** GPU encodes |
+| **USB 2.0** | Poor | Medium | **Not recommended** for transcode output |
+| **WSL `/mnt/c/` on network redirector** | Poor for metadata | High | **Avoid** for `--path` on huge trees — copy or NFS-mount into WSL instead |
+
+### Practical recommendations
+
+1. **Point `--path` at the fastest mount that holds the library** — same path you would use for Plex/Jellyfin (e.g. `/mnt/BigMomma/Media/Movies/Chinese` on NFS).
+2. **Outputs are written next to sources** — you need **free space on that same mount** and enough write bandwidth for files often **larger than the source** during encode.
+3. **Do not delete originals** — plan capacity for source + output concurrently.
+4. **Remote jobs:** Run the script on the machine with the **GPU**, reading media over NFS/SMB from a NAS, only if the link sustains **hundreds of Mb/s** sustained; otherwise copy a shard locally first.
+5. **Wi‑Fi:** Fine for dry-run; risky for long GPU encode sessions writing tens of gigabytes.
+
+### Quick storage sanity check
+
+```bash
+# Latency + metadata (matters for huge libraries)
+time find "$YOUR_PATH" -maxdepth 2 -type f | head -100
+
+# Sequential read (rough proxy for source throughput)
+dd if="$YOUR_PATH/some-large-file.mkv" of=/dev/null bs=1M count=1024 status=progress
+
+# Confirm what the script will use
+./convert-v4.0.18.sh -p "$YOUR_PATH" --dry-run 2>&1 | head -8
+```
+
 ## Quick start
 
 ```bash
-chmod +x convert-v4.0.9.sh
+chmod +x convert-v4.0.18.sh
 
 # Dry-run on a large movies root (sharded by language folder)
-./convert-v4.0.9.sh -p /mnt/BigMomma/Media/Movies --dry-run
+./convert-v4.0.18.sh -p /mnt/BigMomma/Media/Movies --dry-run
 
 # Transcode only — one English letter shelf
-./convert-v4.0.9.sh -p /mnt/BigMomma/Media/Movies/English/D --convert-only --no-shard
+./convert-v4.0.18.sh -p /mnt/BigMomma/Media/Movies/English/D --convert-only --no-shard
 
 # Skip files already in AV1 or HEVC (e.g. only process h264 sources)
-./convert-v4.0.9.sh -p /mnt/BigMomma/Media/Movies --skip-av1 --skip-x265
+./convert-v4.0.18.sh -p /mnt/BigMomma/Media/Movies --skip-av1 --skip-x265
 
 # Television — preview one region first
-./convert-v4.0.9.sh -p /mnt/BabyBear/Media/Television/Thai --dry-run
+./convert-v4.0.18.sh -p /mnt/BabyBear/Media/Television/Thai --dry-run
 ```
 
 ## What it does
@@ -112,13 +280,13 @@ Default `--shard-depth 1` discovers top-level subdirectories under `--path` and 
 
 ```bash
 # Movies — shard by language (default)
-./convert-v4.0.9.sh -p /mnt/BigMomma/Media/Movies
+./convert-v4.0.18.sh -p /mnt/BigMomma/Media/Movies
 
 # English only — shard by letter bucket (A, B, C, …)
-./convert-v4.0.9.sh -p /mnt/BigMomma/Media/Movies/English --shard-depth 2
+./convert-v4.0.18.sh -p /mnt/BigMomma/Media/Movies/English --shard-depth 2
 
 # Small tree — single find
-./convert-v4.0.9.sh -p /mnt/BigMomma/Media/Movies/English/D --no-shard
+./convert-v4.0.18.sh -p /mnt/BigMomma/Media/Movies/English/D --no-shard
 ```
 
 ## Common options
