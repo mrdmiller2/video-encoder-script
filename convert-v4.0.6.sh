@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# convert-v4.0.5.sh — Organize movie folders, transcode TV/movies to AV1/x265 MKV.
+# convert-v4.0.6.sh — Organize movie folders, transcode TV/movies to AV1/x265 MKV.
 # Version: 4.0.6
+# Naming: SCRIPT_NAME must match VERSION (convert-v{VERSION}.sh) — rename file on every bump.
 #
 # Portable: Linux/WSL/Cygwin (bash 4+), macOS (auto re-exec under zsh — default Terminal shell).
 # Tool paths: CONVERT_* env vars or --ffmpeg/--handbrake/etc. CLI overrides.
@@ -14,12 +15,12 @@
 #   -> Sakura (1992)/Sakura (1992).mkv). English libraries also use A–Z + 0 buckets.
 # TV shows: S01E01 / EP01 / -01 patterns, or folders under Television/Anime — episodes stay put.
 # Encoders: NVENC when NVIDIA GPUs are present; otherwise svt_av1_10bit + x265 (software).
-#   ./convert-v4.0.5.sh --path /mnt/BigMomma/Media/Movies/Chinese
-#   ./convert-v4.0.5.sh -p /mnt/BigMomma/Media/Movies/English/D --dry-run
-#   ./convert-v4.0.5.sh -p /path --organize-only
-#   ./convert-v4.0.5.sh -p /path --convert-only
-#   ./convert-v4.0.5.sh -p /mnt/Movies --shard-depth 1   # per top-level subdir find (default)
-#   ./convert-v4.0.5.sh -p /mnt/Movies --no-shard          # monolithic find (large trees)
+#   ./convert-v4.0.6.sh --path /mnt/BigMomma/Media/Movies/Chinese
+#   ./convert-v4.0.6.sh -p /mnt/BigMomma/Media/Movies/English/D --dry-run
+#   ./convert-v4.0.6.sh -p /path --organize-only
+#   ./convert-v4.0.6.sh -p /path --convert-only
+#   ./convert-v4.0.6.sh -p /mnt/Movies --shard-depth 1   # per top-level subdir find (default)
+#   ./convert-v4.0.6.sh -p /mnt/Movies --no-shard          # monolithic find (large trees)
 #
 # Disks: .iso files and Blu-ray folders (BDMV) are HandBrake "disc" sources.
 #   Auto-converts the dominant title when it is >40% longer than every other title;
@@ -42,6 +43,7 @@ fi
 set -euo pipefail
 
 VERSION="4.0.6"
+SCRIPT_NAME="convert-v${VERSION}.sh"
 SEARCH_PATH="."
 DRY_RUN=false
 DO_ORGANIZE=true
@@ -443,6 +445,16 @@ if [ ! -d "$SEARCH_PATH" ]; then
 fi
 
 discover_tools || exit 1
+
+assert_script_name_matches_version() {
+  local base
+  base="$(basename "$0")"
+  if [ "$base" != "$SCRIPT_NAME" ]; then
+    err "Version $VERSION requires script filename $SCRIPT_NAME (found: $base)"
+    err "Rename the file when bumping VERSION."
+    exit 1
+  fi
+}
 
 is_video_file() {
   local f="$1" ext
@@ -1005,7 +1017,7 @@ init_stats_log() {
   ts="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
   {
     echo ""
-    echo "=== convert-v4.0.5.sh v$VERSION — $ts ==="
+    echo "=== $SCRIPT_NAME v$VERSION — $ts ==="
     echo "path: $SEARCH_PATH"
     echo "dry_run: $DRY_RUN | organize: $DO_ORGANIZE | convert: $DO_CONVERT | nvidia: $HAS_NVIDIA"
     echo "order: largest to smallest"
@@ -2260,7 +2272,8 @@ convert_library() {
 main() {
   detect_hw_environment
   init_stats_log
-  log "convert-v4.0.5.sh v$VERSION"
+  assert_script_name_matches_version
+  log "$SCRIPT_NAME v$VERSION"
   log "Path: $SEARCH_PATH (platform=$PLATFORM shell=$(shell_name) dry_run=$DRY_RUN organize=$DO_ORGANIZE convert=$DO_CONVERT shard_depth=$SHARD_DEPTH no_shard=$NO_SHARD nvidia=$HAS_NVIDIA hw_decode=${HW_DECODE_NAME:-none})"
   log "Stats log: $SEARCH_PATH/convert-v4.log"
 

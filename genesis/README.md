@@ -1,6 +1,6 @@
 # Genesis scripts
 
-These are the earlier single-purpose encoders that `convert-v4.0.5.sh` grew from.
+These are the earlier single-purpose encoders that `convert-v4.0.6.sh` grew from.
 
 ## `convert-v1.sh` (original)
 
@@ -32,4 +32,4 @@ This was the first general movie/TV batch encoder. The anime-specific variants b
 | Flatpak + nvdec | NVIDIA path with `CUDA_VISIBLE_DEVICES` |
 | Simple find loop | Sharded find, largest-first queue, TV/movie/disk rules |
 
-The monolithic `convert-v4.0.5.sh` adds library organization, x265 fallback, size policy, ISO/BDMV discs, sharding, and multi-platform support (Linux, WSL, Cygwin, macOS).
+The monolithic `convert-v4.0.6.sh` adds library organization, x265 fallback, size policy, ISO/BDMV discs, sharding, and multi-platform support (Linux, WSL, Cygwin, macOS).
