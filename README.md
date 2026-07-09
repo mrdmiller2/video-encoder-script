@@ -8,7 +8,7 @@ This script is portable (because I often have my windows laptop, mac, and linux 
 
 Bash library organizer and batch transcoder for large home-media trees. Targets **MKV + AV1** (kept when not more than **20% larger** than the source) with **x265** fallback, optional **ISO/Blu-ray** disc handling, and **sharded** directory scans for multi-thousand-file libraries.
 
-**Current release:** `convert-v4.0.18.sh` (v4.0.18)
+**Current release:** `convert-v4.0.25.sh` (v4.0.25)
 
 ## About this project
 
@@ -37,7 +37,14 @@ Each release is a **new file** — prior scripts stay in the repo for reference:
 | `convert-v4.0.15.sh` | 4.0.15 | Auto-detect NVENC `tune=uhq` vs `tune=hq` |
 | `convert-v4.0.16.sh` | 4.0.16 | Validate existing outputs on restart before skip |
 | `convert-v4.0.17.sh` | 4.0.17 | First/last 30s decode validation (faster, catches aborts) |
-| `convert-v4.0.18.sh` | 4.0.18 | **Current** — master log at `--path`; shard logs merged/cleaned at end |
+| `convert-v4.0.18.sh` | 4.0.18 | Master log at `--path`; shard logs merged/cleaned at end |
+| `convert-v4.0.19.sh` | 4.0.19 | WSL/HandBrake NVENC fallback when nvidia-smi missing |
+| `convert-v4.0.20.sh` | 4.0.20 | WSL auto-picks Windows HandBrake (NVENC) + Linux ffmpeg/mkv |
+| `convert-v4.0.21.sh` | 4.0.21 | Skip NVENC probe on `--dry-run`/WSL `.exe`; safer logging |
+| `convert-v4.0.22.sh` | 4.0.22 | `sudo` + NFS: root writes mount, HandBrake as `$SUDO_USER` |
+| `convert-v4.0.23.sh` | 4.0.23 | Read-only NFS: log/resume in `~/.cache/convert-v4/` |
+| `convert-v4.0.24.sh` | 4.0.24 | `grep` required (not `rg`); fixes WSL without ripgrep |
+| `convert-v4.0.25.sh` | 4.0.25 | **Current** — prefers `rg`, falls back to `grep` |
 
 When bumping version: copy the latest script to `convert-v{NEW}.sh`, update `VERSION` and `SCRIPT_NAME`, keep all older files. Do not rename or overwrite.
 
@@ -62,8 +69,17 @@ The script runs on **Linux**, **WSL2**, **Cygwin/MSYS2/Git Bash**, and **macOS**
 | **ffmpeg** / **ffprobe** | Probing, remux, validation decode windows, NVENC tune probe |
 | **HandBrakeCLI** | Transcode (AV1, HEVC, disc scan), hardware decode when available |
 | **mkvmerge** / **mkvpropedit** | Subtitles, metadata, output validation |
+| **grep** or **ripgrep (`rg`)** | Dolby Vision / HDR detection, encoder probes (prefers `rg`, falls back to `grep`) |
 
 Override paths with `CONVERT_FFMPEG`, `CONVERT_HANDBRAKE`, etc., or `--ffmpeg`, `--handbrake`, …
+
+**Text search:** v4.0.25+ uses **ripgrep (`rg`) when installed**, otherwise **GNU `grep`**. At least one must be on `PATH`. Startup logs `search=rg` or `search=grep`.
+
+```bash
+# Optional (faster on large ffprobe/HandBrake output):
+sudo dnf install ripgrep    # Fedora
+sudo apt install ripgrep    # Debian/Ubuntu/WSL
+```
 
 On startup the script prints the binaries it picked — that line is the source of truth for your machine.
 
@@ -110,6 +126,16 @@ sudo apt install ffmpeg mkvtoolnix handbrake-cli
 
 **NVIDIA GPU:** Install proprietary drivers so `nvidia-smi` works. No separate CUDA Toolkit is required for NVENC.
 
+On **WSL2 laptops**, GPU detection tries, in order: `nvidia-smi` (including `/mnt/c/Windows/System32/nvidia-smi.exe`), then **HandBrake's NVENC/NVDEC probe**. Override with `CONVERT_FORCE_NVIDIA=1` if needed.
+
+**WSL hybrid toolchain (common on gaming laptops):** Install **ffmpeg + mkvtoolnix + handbrake-cli** inside WSL (Linux packages). Install **HandBrake for Windows** on the host for NVENC. v4.0.20+ auto-detects `HandBrakeCLI.exe` under `/mnt/c/Program Files/HandBrake/` when it reports NVENC, while ffmpeg/ffprobe/mkvmerge stay on Linux PATH. File paths passed to the Windows `.exe` are translated via `wslpath -w`. Override only HandBrake if needed:
+
+```bash
+export CONVERT_HANDBRAKE='/mnt/c/Program Files/HandBrake/HandBrakeCLI.exe'
+# or
+export CONVERT_HANDBRAKE_WIN='/mnt/c/Program Files/HandBrake/HandBrakeCLI.exe'
+```
+
 **Typical `--path`:** local mount (`/mnt/BigMomma/...`, `/media/...`) or NFS mount configured in `/etc/fstab`.
 
 ---
@@ -118,31 +144,80 @@ sudo apt install ffmpeg mkvtoolnix handbrake-cli
 
 **Shell:** bash 4+ inside a WSL2 distro (Ubuntu, Fedora, etc.). The script sets `PLATFORM=wsl`.
 
-**GPU:** Install current NVIDIA drivers on the **Windows host**. `nvidia-smi` must work **inside WSL**. WSL1 is not supported for this workflow.
-
-**Linux vs Windows binaries:** The script does **not** prefer one or the other. It uses, in order:
-
-1. `CONVERT_*` / CLI overrides  
-2. First match on WSL `PATH` (`which ffmpeg`, etc.)  
-3. Linux paths (`/usr/bin`, `/usr/local/bin`, `~/.local/bin`)  
-4. Flatpak HandBrake (Linux/WSL only)
-
-It does **not** auto-search `C:\Program Files\...` on WSL. To use Windows HandBrake or ffmpeg, set paths explicitly:
+**NFS / read-only mounts:** If the library mount is read-only for your WSL user (NFS `root_squash`, or SMB mounted without `file_mode`/`noperm`), v4.0.23+ puts **logs and resume state** under `~/.cache/convert-v4/jobs/<path-slug>/` so dry-runs still work. Fix SMB permissions with the mount options under **Mounting media in WSL** when possible so organize/convert can run **without `sudo`**. Use `sudo` only when the share truly requires root for writes; v4.0.22+ runs Windows HandBrake as `$SUDO_USER` in that case.
 
 ```bash
+# Dry-run / inspect (no sudo needed — log goes to ~/.cache/convert-v4/...)
+./convert-v4.0.23.sh -p /mnt/BabyBear/Media/Television/American \
+  --handbrake '/mnt/c/Program Files/HandBrake/HandBrakeCLI.exe' --dry-run
+
+# Organize / convert (sudo for NFS writes; HandBrake runs as your user)
+sudo ./convert-v4.0.23.sh -p /mnt/BabyBear/Media/Television/American \
+  --handbrake '/mnt/c/Program Files/HandBrake/HandBrakeCLI.exe'
+```
+
+Use quotes around the HandBrake path. Invoke as `sudo ./script.sh` (not `sudo bash script.sh`) so `$SUDO_USER` is set.
+
+**GPU:** Install current NVIDIA drivers on the **Windows host**. `nvidia-smi` must work **inside WSL**. WSL1 is not supported for this workflow.
+
+**Linux vs Windows binaries:** ffmpeg, ffprobe, mkvmerge, and mkvpropedit are resolved from **Linux WSL PATH** only. HandBrake is special on WSL2 laptops — discovery order:
+
+1. `CONVERT_HANDBRAKE` / `--handbrake` override  
+2. Linux `HandBrakeCLI` on PATH (if it reports NVENC)  
+3. **Windows** `HandBrakeCLI.exe` at `/mnt/c/Program Files/HandBrake/` (or `CONVERT_HANDBRAKE_WIN`) when it reports NVENC  
+4. Linux HandBrake on PATH (software encoders)  
+5. Flatpak HandBrake (Linux/WSL only)
+
+When the Windows `.exe` is selected, input/output paths are translated with `wslpath -w` so Linux media paths still work.
+
+```bash
+# Only needed if HandBrake is not in the default Program Files location:
 export CONVERT_HANDBRAKE='/mnt/c/Program Files/HandBrake/HandBrakeCLI.exe'
 ```
 
-**Recommendation:** Use one consistent toolchain — usually **Linux packages inside WSL** (`apt`/`dnf` ffmpeg + mkvtoolnix + handbrake-cli). Mixing Linux ffmpeg with Windows HandBrake works if you set `CONVERT_*` deliberately.
+**Recommendation:** **Linux packages inside WSL** for ffmpeg + mkvtoolnix; let v4.0.20+ auto-pick Windows HandBrake for NVENC.
 
 **Mounting media in WSL:**
 
 | How you access library | WSL `--path` example | Notes |
 |------------------------|----------------------|-------|
 | NFS (mounted in WSL) | `/mnt/BigMomma/Media/Movies` | Best remote option when the NFS server and network are fast |
-| SMB share mounted in WSL (`cifs`) | `/mnt/movies` | Common; tune `vers=3.1.1`, large `rsize`/`wsize`; latency-sensitive |
+| SMB share mounted in WSL (`cifs`) | `/mnt/BabyBear/Media/...` | Mount inside WSL with permissive modes (see below); tune `vers=3.1.1`, large `rsize`/`wsize` |
 | Windows drive letter | `/mnt/c/Users/...` | Fine for local NTFS; **slow** for huge trees (drvfs metadata) |
 | `\\server\share` only on Windows | Mount into WSL first — avoid encoding through `/mnt/c/...` to a redirected network drive |
+
+**SMB/CIFS in WSL (recommended mount options):** Default SMB mounts often appear read-only to your WSL user (permission mapping / `root_squash`-like behavior). Mount with explicit modes so the script can write logs and outputs **without `sudo`**:
+
+```bash
+sudo mkdir -p /mnt/BabyBear
+sudo mount -t cifs -o rw,username=YOUR_SMB_USER,password=YOUR_PASSWORD,file_mode=0777,dir_mode=0777,noperm \
+  //SERVER_IP/SHARE_NAME /mnt/BabyBear
+```
+
+- `file_mode=0777,dir_mode=0777` — WSL user can read/write on the share  
+- `noperm` — do not enforce remote ACLs locally (common fix for “Permission denied” in WSL)  
+- Optional performance tuning: add `vers=3.1.1,rsize=1048576,wsize=1048576,cache=strict`
+
+**Safer credentials (avoid password on the command line):**
+
+```bash
+# /etc/samba/babybear.credentials  (chmod 600, root-owned)
+#   username=YOUR_SMB_USER
+#   password=YOUR_PASSWORD
+
+sudo mount -t cifs -o rw,credentials=/etc/samba/babybear.credentials,file_mode=0777,dir_mode=0777,noperm \
+  //SERVER_IP/SHARE_NAME /mnt/BabyBear
+```
+
+**Persistent mount (`/etc/fstab`):**
+
+```
+//SERVER_IP/SHARE_NAME  /mnt/BabyBear  cifs  credentials=/etc/samba/babybear.credentials,rw,file_mode=0777,dir_mode=0777,noperm,vers=3.1.1,_netdev,nofail,x-systemd.automount  0  0
+```
+
+Then: `sudo mount /mnt/BabyBear` (or reboot). Point the script at e.g. `-p /mnt/BabyBear/Media/Television/American`.
+
+If the share is still read-only, v4.0.23+ falls back to `~/.cache/convert-v4/` for logs/resume; use `sudo` only when you must write MKVs on a root-only NFS mount.
 
 ---
 
@@ -205,7 +280,7 @@ The script is **I/O-heavy**: sharded `find` over thousands of folders, ffprobe p
 | **Local NVMe / SATA SSD** | Excellent | Low | **Best** — use when possible |
 | **Local HDD** | Good sequential, weaker random | Low | Fine for overnight batch jobs; sharded finds take longer |
 | **NFS (gigabit+ LAN)** | Good sequential if server is strong | Medium | **Works well** for large libraries (author uses NFS). Ensure stable mount, enough server RAM/disk, and `soft` vs `hard` mount timeout policy you are comfortable with |
-| **SMB/CIFS** | Variable | Often higher than NFS | **Usable**; tune mount options; avoid Wi‑Fi or congested links for multi‑TB writes |
+| **SMB/CIFS** | Variable | Often higher than NFS | **Usable**; in WSL use `file_mode=0777,dir_mode=0777,noperm` on mount; tune `vers=3.1.1`, `rsize`/`wsize`; avoid Wi‑Fi for multi‑TB writes |
 | **USB 3.x external** | Moderate | Low–medium | OK for small batches; large 4K outputs may **throttle** GPU encodes |
 | **USB 2.0** | Poor | Medium | **Not recommended** for transcode output |
 | **WSL `/mnt/c/` on network redirector** | Poor for metadata | High | **Avoid** for `--path` on huge trees — copy or NFS-mount into WSL instead |
@@ -276,7 +351,11 @@ Before organize/convert phases, the script probes each video and disc source wit
 
 ## Large paths and sharding
 
-Default `--shard-depth 1` discovers top-level subdirectories under `--path` and runs `find` per shard (e.g. `English`, `Chinese`, `Japanese` under `Movies`, or `American`, `Thai` under `Television`).
+Default `--shard-depth 1` discovers top-level subdirectories under `--path` and runs `find` per shard.
+
+- **Movies** under `Movies/English/` → shards are letter buckets (`A`, `B`, …) — sharding helps
+- **TV region** under `Television/American/` → shards are **show folders** (~1,000+) — use `--no-shard` instead
+- **TV root** under `Television/` → shards are regions (`American`, `Thai`, …) — default is fine
 
 ```bash
 # Movies — shard by language (default)
@@ -287,6 +366,9 @@ Default `--shard-depth 1` discovers top-level subdirectories under `--path` and 
 
 # Small tree — single find
 ./convert-v4.0.18.sh -p /mnt/BigMomma/Media/Movies/English/D --no-shard
+
+# TV region with ~1,000 show folders — single find (do not use default sharding)
+./convert-v4.0.23.sh -p /mnt/BabyBear/Media/Television/American --convert-only --no-shard
 ```
 
 ## Common options
@@ -300,6 +382,7 @@ Default `--shard-depth 1` discovers top-level subdirectories under `--path` and 
 | `--organize-only` | Phase 1 only |
 | `--convert-only` | Phase 2 only |
 | `--shard-depth N` | Shard find at depth N (default: 1) |
+| `--no-shard` | Single `find` over entire `--path` (recommended for `Television/American`-scale trees) |
 | `--no-resume` | Ignore saved resume state and process the full pending queue |
 | `--ffmpeg`, `--handbrake`, … | Tool path overrides |
 | `--help` | Full usage |
@@ -310,11 +393,45 @@ Environment overrides: `CONVERT_FFMPEG`, `CONVERT_HANDBRAKE`, etc.
 
 Under paths like `/mnt/BabyBear/Media/Television`:
 
-- **Organize:** skipped for normal `Show Name/S01E01 …` layouts
-- **Convert:** every episode without a canonical output is transcoded (same AV1/x265 rules as movies)
-- **Sharding:** depth 1 → one shard per region (`American`, `Thai`, …)
+- **Organize:** skipped for normal `Show Name/S01E01 …` layouts (episodes stay in show folders)
+- **Convert:** every episode without a canonical `.AV1.mkv` / `.x265.mkv` output is transcoded (same rules as movies)
+- **Sharding:** depends on what you pass as `--path` (see below)
 
-Run dry-run per region before converting an entire Television tree.
+### Sharding and large TV regions
+
+| `--path` | Default `--shard-depth 1` means | ~shards on BabyBear |
+|----------|----------------------------------|---------------------|
+| `/mnt/.../Television` | One shard per **region** (`American`, `Thai`, …) | Few (good default) |
+| `/mnt/.../Television/American` | One shard per **show** (`30 Rock`, `Abbott Elementary`, …) | **~1,000+** (slow startup) |
+
+`American` has on the order of **1,000 show folders** and **40k+ episode files**. Default sharding at that path runs **one `find` per show** (plus per-shard logging and shard snapshot work) before the first encode — often slower than a single tree walk on SMB/NFS.
+
+**Fastest ways to start on a big TV region:**
+
+```bash
+# 1) Full region — one find, skip organize (TV doesn't need it), start encoding
+./convert-v4.0.23.sh -p /mnt/BabyBear/Media/Television/American \
+  --convert-only --no-shard \
+  --handbrake '/mnt/c/Program Files/HandBrake/HandBrakeCLI.exe'
+
+# 2) One show — quick dry-run or convert (~100–200 episodes, seconds to enumerate)
+./convert-v4.0.23.sh -p "/mnt/BabyBear/Media/Television/American/30 Rock" \
+  --convert-only --no-shard --dry-run
+
+# 3) Work region-by-region from Television/ (few shards — default depth 1 is fine)
+./convert-v4.0.23.sh -p /mnt/BabyBear/Media/Television/American \
+  --convert-only --no-shard   # still use --no-shard when path IS American
+```
+
+**Avoid full-tree `--dry-run` on `American`** unless you want to wait a long time: Phase 0 runs **ffprobe on every file** (~40k probes). Use dry-run on a single show, or skip dry-run and let convert skip episodes that already have complete outputs.
+
+**Other tips:**
+
+- `--skip-av1` / `--skip-x265` — skip sources already in those codecs (still scans the tree; inspection still ffprobes when `--dry-run` is set)
+- Resume (`convert-v4.state` in the job sidecar dir) continues the queue after interrupt; the tree is still rescanned on each launch
+- First encode per profile runs a short bake-off sample; after that, encoding proceeds one file at a time
+
+Run dry-run on **one show** before converting an entire region.
 
 ## Discs (ISO / Blu-ray)
 
