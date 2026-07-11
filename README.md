@@ -8,7 +8,7 @@ This script is portable (because I often have my windows laptop, mac, and linux 
 
 Bash library organizer and batch transcoder for large home-media trees. Targets **MKV + AV1** (kept when not more than **20% larger** than the source) with **x265** fallback, optional **ISO/Blu-ray** disc handling, and **sharded** directory scans for multi-thousand-file libraries.
 
-**Current release:** `convert-v4.0.26.sh` (v4.0.26)
+**Current release:** `convert-v4.0.36.sh` (v4.0.36)
 
 ## About this project
 
@@ -45,7 +45,17 @@ Each release is a **new file** — prior scripts stay in the repo for reference:
 | `convert-v4.0.23.sh` | 4.0.23 | Read-only NFS: log/resume in `~/.cache/convert-v4/` |
 | `convert-v4.0.24.sh` | 4.0.24 | `grep` required (not `rg`); fixes WSL without ripgrep |
 | `convert-v4.0.25.sh` | 4.0.25 | Prefers `rg`, falls back to `grep` |
-| `convert-v4.0.26.sh` | 4.0.26 | **Current** — 5-way HW matrix: NVIDIA / QSV / AMD VCE / VideoToolbox / software |
+| `convert-v4.0.26.sh` | 4.0.26 | 5-way HW matrix: NVIDIA / QSV / AMD VCE / VideoToolbox / software |
+| `convert-v4.0.27.sh` | 4.0.27 | `sudo` sidecar logs use invoking user's home (`$SUDO_USER`), not `/root` |
+| `convert-v4.0.28.sh` | 4.0.28 | Auto pipeline: inspect waves of 5 while encoding; `--largest-first` / `--pipeline` / `--encode-batch` |
+| `convert-v4.0.29.sh` | 4.0.29 | CIFS/SMB mount helper (`file_mode=0777`); `--mount-share` / credentials env |
+| `convert-v4.0.30.sh` | 4.0.30 | `--skip-bakeoff`; auto-skip bake-off on CIFS + software encode |
+| `convert-v4.0.31.sh` | 4.0.31 | NVENC AV1 `tune=uhq` probe on WSL; `--nvenc-av1-tune` / `CONVERT_NVENC_AV1_TUNE` |
+| `convert-v4.0.32.sh` | 4.0.32 | macOS re-exec under Homebrew bash 4+ (not zsh); VideoToolbox only if `vt_h265` present |
+| `convert-v4.0.33.sh` | 4.0.33 | Skip bake-off in software-only mode; AV1 sources sample-tested vs x265 before re-encode |
+| `convert-v4.0.34.sh` | 4.0.34 | macOS BSD-awk-safe HandBrake progress parser (fixes false encode failures); numeric job totals |
+| `convert-v4.0.35.sh` | 4.0.35 | Ignore benign ffmpeg DTS “invalid” warnings during output validation |
+| `convert-v4.0.36.sh` | 4.0.36 | **Current** — per-title `{Title}.convert-v4.IN_PROGRESS` flag for interrupted/partial outputs |
 
 When bumping version: copy the latest script to `convert-v{NEW}.sh`, update `VERSION` and `SCRIPT_NAME`, keep all older files. Do not rename or overwrite.
 
@@ -114,7 +124,7 @@ sudo apt install ripgrep    # Debian/Ubuntu/WSL
 
 ### Baseline OS utilities (no separate install on full distros)
 
-The script also expects standard Unix tools that ship with Linux, macOS, WSL, and Cygwin/Git Bash: `bash` 4+ (or `zsh` on macOS), `find`, `sort`, `awk`, `sed`, `stat`, `date`, `mktemp`, `mkdir`, `mv`, `rm`, `basename`, `dirname`, `cut`, `tr`, and on WSL **`wslpath`** (for Windows HandBrake path translation). Minimal container or embedded images may need `coreutils`, `findutils`, and `grep` in addition to the prerequisites above.
+The script also expects standard Unix tools that ship with Linux, macOS, WSL, and Cygwin/Git Bash: `bash` 4+ (macOS: Homebrew bash via auto re-exec), `find`, `sort`, `awk`, `sed`, `stat`, `date`, `mktemp`, `mkdir`, `mv`, `rm`, `basename`, `dirname`, `cut`, `tr`, and on WSL **`wslpath`** (for Windows HandBrake path translation). Minimal container or embedded images may need `coreutils`, `findutils`, and `grep` in addition to the prerequisites above.
 
 Override tool paths with `CONVERT_FFMPEG`, `CONVERT_HANDBRAKE`, etc., or `--ffmpeg`, `--handbrake`, …
 
@@ -341,16 +351,16 @@ Less tested than WSL2; prefer WSL2 for large library jobs.
 
 ### macOS
 
-**Shell:** zsh (automatic re-exec from bash 3.2).
+**Shell:** Homebrew **bash 4+** (v4.0.32+ auto re-execs from system bash 3.2). Install with `brew install bash`. Do **not** run the script via shebang directly from an SMB share (`/Volumes/...`) — macOS blocks that; copy the script to `~/` or invoke `/usr/local/bin/bash /path/to/convert-v4.0.36.sh ...`.
 
-**Install:** see **Prerequisites** above (`brew install ffmpeg mkvtoolnix handbrake python3`).
+**Install:** see **Prerequisites** above (`brew install bash ffmpeg mkvtoolnix handbrake python3`).
 
 HandBrake is also searched under `/Applications/HandBrake.app/Contents/MacOS/HandBrakeCLI`.
 
-**GPU / hardware encode:** macOS uses **VideoToolbox** (`vt_h265`) when HandBrake reports it — not NVIDIA or Intel Quick Sync. AV1 uses CPU (`svt_av1_10bit`) with VideoToolbox hardware **decode** when available. If VideoToolbox is missing, both paths fall back to software (`svt_av1_10bit`, `x265`).
+**GPU / hardware encode:** macOS uses **VideoToolbox** only when HandBrake reports **`vt_h265`** (v4.0.32+). Builds that only expose `vt_h264` fall back to software (`svt_av1_10bit`, `x265`). AV1 always uses CPU (`svt_av1_10bit`).
 
 ```bash
-# Verify VideoToolbox encoders
+# Verify VideoToolbox HEVC encoder (required for HW path)
 HandBrakeCLI --help 2>&1 | grep -iE 'vt_h265|videotoolbox'
 ```
 
@@ -360,7 +370,7 @@ HandBrakeCLI --help 2>&1 | grep -iE 'vt_h265|videotoolbox'
 |------------------------|------------------|-------|
 | Local APFS volume | `/Volumes/Media/Movies` | Fastest |
 | NFS (`mount -t nfs`) | `/Volumes/nfs-media/...` or mount point you chose | Good on gigabit LAN; same latency caveats as Linux NFS |
-| SMB (`mount_smbfs`) | `/Volumes/share-name/...` | Very common on Mac; fine for reads, watch write speed during encode |
+| SMB (`mount_smbfs`) | `/Volumes/share-name/...` | Very common on Mac; fine for reads, watch write speed during encode. Keep the **script** on local disk. |
 | External USB | `/Volumes/MyDrive/...` | USB 3.x+ recommended; USB 2.0 can stall fast encodes waiting on disk |
 
 ---
