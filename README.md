@@ -8,7 +8,7 @@ This script is portable (because I often have my windows laptop, mac, and linux 
 
 Bash library organizer and batch transcoder for large home-media trees. Targets **MKV + AV1** (kept when not more than **20% larger** than the source) with **x265** fallback, optional **ISO/Blu-ray** disc handling, and **sharded** directory scans for multi-thousand-file libraries.
 
-**Current release:** `convert-v4.0.46.sh` (v4.0.46)
+**Current release:** `convert-v4.0.48.sh` (v4.0.48)
 
 ## About this project
 
@@ -65,7 +65,9 @@ Each release is a **new file** — prior scripts stay in the repo for reference:
 | `convert-v4.0.43.sh` | 4.0.43 | Fix QSV encode probe (check output size before deleting temp dir) |
 | `convert-v4.0.44.sh` | 4.0.44 | Discover tools in `$HOME/.local/bin` (macOS/Linux user installs) |
 | `convert-v4.0.45.sh` | 4.0.45 | AMD VCN via ffmpeg `hevc_vaapi` when HandBrake lacks vce/vcn (Fedora/mesa) |
-| `convert-v4.0.46.sh` | 4.0.46 | **Current** — legacy containers (`m2ts`/`mpg`/`wmv`/…); stream-duration fallback |
+| `convert-v4.0.46.sh` | 4.0.46 | Legacy containers (`m2ts`/`mpg`/`wmv`/…); stream-duration fallback |
+| `convert-v4.0.47.sh` | 4.0.47 | Fix AV1 sample “unknown decision” (sample logs on stderr) |
+| `convert-v4.0.48.sh` | 4.0.48 | **Current** — remux-repair source MKV structure errors before encode; else `bad_sources.txt` |
 
 When bumping version: copy the latest script to `convert-v{NEW}.sh`, update `VERSION` and `SCRIPT_NAME`, keep all older files. Do not rename or overwrite.
 
