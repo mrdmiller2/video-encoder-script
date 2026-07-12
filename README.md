@@ -8,7 +8,7 @@ This script is portable (because I often have my windows laptop, mac, and linux 
 
 Bash library organizer and batch transcoder for large home-media trees. Targets **MKV + AV1** (kept when not more than **20% larger** than the source) with **x265** fallback, optional **ISO/Blu-ray** disc handling, and **sharded** directory scans for multi-thousand-file libraries.
 
-**Current release:** `convert-v4.0.36.sh` (v4.0.36)
+**Current release:** `convert-v4.0.46.sh` (v4.0.46)
 
 ## About this project
 
@@ -55,7 +55,17 @@ Each release is a **new file** — prior scripts stay in the repo for reference:
 | `convert-v4.0.33.sh` | 4.0.33 | Skip bake-off in software-only mode; AV1 sources sample-tested vs x265 before re-encode |
 | `convert-v4.0.34.sh` | 4.0.34 | macOS BSD-awk-safe HandBrake progress parser (fixes false encode failures); numeric job totals |
 | `convert-v4.0.35.sh` | 4.0.35 | Ignore benign ffmpeg DTS “invalid” warnings during output validation |
-| `convert-v4.0.36.sh` | 4.0.36 | **Current** — per-title `{Title}.convert-v4.IN_PROGRESS` flag for interrupted/partial outputs |
+| `convert-v4.0.36.sh` | 4.0.36 | Per-title `{Title}.convert-v4.IN_PROGRESS` flag for interrupted/partial outputs |
+| `convert-v4.0.37.sh` | 4.0.37 | Fix resume offset capture (`log_err`); require numeric resume skip |
+| `convert-v4.0.38.sh` | 4.0.38 | Probe HandBrake `--keep-subname`; treat empty success outputs as failure |
+| `convert-v4.0.39.sh` | 4.0.39 | Matroska EBML/segment bounds + optional `mkvalidator`; `corrupt_files.txt` |
+| `convert-v4.0.40.sh` | 4.0.40 | Stricter output metadata gate (duration + video stream) before structure/decode |
+| `convert-v4.0.41.sh` | 4.0.41 | `--check-tools` + OS install help; bad processed delete+reconvert; `bad_sources.txt` |
+| `convert-v4.0.42.sh` | 4.0.42 | Clearer mkvalidator install guidance (optional; EBML still runs) |
+| `convert-v4.0.43.sh` | 4.0.43 | Fix QSV encode probe (check output size before deleting temp dir) |
+| `convert-v4.0.44.sh` | 4.0.44 | Discover tools in `$HOME/.local/bin` (macOS/Linux user installs) |
+| `convert-v4.0.45.sh` | 4.0.45 | AMD VCN via ffmpeg `hevc_vaapi` when HandBrake lacks vce/vcn (Fedora/mesa) |
+| `convert-v4.0.46.sh` | 4.0.46 | **Current** — legacy containers (`m2ts`/`mpg`/`wmv`/…); stream-duration fallback |
 
 When bumping version: copy the latest script to `convert-v{NEW}.sh`, update `VERSION` and `SCRIPT_NAME`, keep all older files. Do not rename or overwrite.
 
