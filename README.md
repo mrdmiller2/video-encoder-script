@@ -8,7 +8,7 @@ This script is portable (because I often have my windows laptop, mac, and linux 
 
 Bash library organizer and batch transcoder for large home-media trees. Targets **MKV + AV1** (kept when not more than **20% larger** than the source) with **x265** fallback, optional **ISO/Blu-ray** disc handling, and **sharded** directory scans for multi-thousand-file libraries.
 
-**Current release:** `convert-v4.0.50.sh` (v4.0.50)
+**Current release:** `convert-v4.0.52.sh` (v4.0.52)
 
 ## About this project
 
@@ -69,7 +69,9 @@ Each release is a **new file** — prior scripts stay in the repo for reference:
 | `convert-v4.0.47.sh` | 4.0.47 | Fix AV1 sample “unknown decision” (sample logs on stderr) |
 | `convert-v4.0.48.sh` | 4.0.48 | Remux-repair source MKV structure errors before encode; else `bad_sources.txt` |
 | `convert-v4.0.49.sh` | 4.0.49 | Waive unlimited size-reject on 1080p upscale path |
-| `convert-v4.0.50.sh` | 4.0.50 | **Current** — upscale keeps only if ≤50% larger than source; else revert to original |
+| `convert-v4.0.50.sh` | 4.0.50 | Upscale keeps only if ≤50% larger than source; else revert to original |
+| `convert-v4.0.51.sh` | 4.0.51 | Fix mkvpropedit off-by-one that mangled audio/subtitle language tags |
+| `convert-v4.0.52.sh` | 4.0.52 | **Current** — `--name-glob` / path trailing glob to filter large shelves (e.g. `American/A*`) |
 
 When bumping version: copy the latest script to `convert-v{NEW}.sh`, update `VERSION` and `SCRIPT_NAME`, keep all older files. Do not rename or overwrite.
 
