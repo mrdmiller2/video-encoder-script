@@ -8,7 +8,7 @@ This script is portable (because I often have my windows laptop, mac, and linux 
 
 Bash library organizer and batch transcoder for large home-media trees. Targets **MKV + AV1** (kept when not more than **20% larger** than the source) with **x265** fallback, optional **ISO/Blu-ray** disc handling, and **sharded** directory scans for multi-thousand-file libraries.
 
-**Current release:** `convert-v5.0.7.sh` (v5.0.7) — see [What's new in v5](#whats-new-in-v5)
+**Current release:** `convert-v5.0.8.sh` (v5.0.8) — see [What's new in v5](#whats-new-in-v5)
 
 ## About this project
 
@@ -65,7 +65,7 @@ lacks libvmaf, use a [BtbN static build](https://github.com/BtbN/FFmpeg-Builds/r
 ## Version progression
 
 Each release is a **new file** — prior scripts stay in the repo for reference.
-The repo root holds the **current release** (`convert-v5.0.7.sh`) and the **last v4
+The repo root holds the **current release** (`convert-v5.0.8.sh`) and the **last v4
 release** (`convert-v4.0.52.sh`); all earlier versions live in [`Old Versions/`](Old%20Versions/):
 
 | File | Version | Notes |
@@ -125,7 +125,8 @@ release** (`convert-v4.0.52.sh`); all earlier versions live in [`Old Versions/`]
 | `convert-v5.0.4.sh` | 5.0.4 | fixes softness (dropped a stray SVT-AV1 tune=0) and restores v4's dialogue-clarity audio boost (dynaudnorm+gain) in the ffmpeg engine |
 | `convert-v5.0.5.sh` | 5.0.5 | `--prefer-hw` NVENC AV1 now uses the probed `uhq` tune (matching v4) instead of a hardcoded `hq` |
 | `convert-v5.0.6.sh` | 5.0.6 | fixes a Dolby Vision source silently keeping its DoVi tagging when falling back to x265 via the HEVC remux shortcut |
-| `convert-v5.0.7.sh` | 5.0.7 | **Current** — streaming-optimized MKV output, `--clean-junk`, per-directory file-list cache, per-folder done/in-progress semaphores (fixes multi-hour restart enumeration on large TV libraries) |
+| `convert-v5.0.7.sh` | 5.0.7 | streaming-optimized MKV output, `--clean-junk`, per-directory file-list cache, per-folder done/in-progress semaphores (fixes multi-hour restart enumeration on large TV libraries) |
+| `convert-v5.0.8.sh` | 5.0.8 | **Current** — fixes 1080p-upscale trigger catching near-720p (letterboxed/cropped) sources it shouldn't; new threshold 700 |
 
 When bumping version: copy the latest script to `convert-v{NEW}.sh`, update `VERSION` and `SCRIPT_NAME`, keep all older files (moving the superseded one into `Old Versions/`). Do not overwrite.
 
