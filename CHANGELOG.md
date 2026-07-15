@@ -1,6 +1,6 @@
 # Changelog
 
-Detailed record of every bug found and fixed during the v5.0.9 → v5.0.16 hardening
+Detailed record of every bug found and fixed during the v5.0.9 → v5.0.17 hardening
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
@@ -113,6 +113,34 @@ turned out to be non-issues on inspection, and are not listed here.
   routed to `unknown` instead of trusting the tag) — fixed before shipping.
 
   *(v5.0.16)*
+
+- **Final output and cache files were silently ending up mode `0600` instead
+  of a normal, umask-derived mode, on NFS shares.** Reported directly by the
+  user, who noticed a just-finished Clueless (1995) `.AV1.mkv` sitting at
+  `-rw-------` next to everything else in its folder at `644`/`777`.
+
+  Root cause: GNU `mktemp` intentionally creates its temp file at `0600`
+  regardless of the process umask (it's the same "close the symlink-race
+  window" rationale already used for the CIFS credentials temp file). Four
+  places in the script use an atomic "write to a `mktemp`'d temp file, then
+  `mv -f` it directly over the real path" pattern to avoid a predictable-name
+  TOCTOU race — but none of them restored a normal mode afterward, so `mv`
+  (which preserves the source file's mode) carried the `0600` straight
+  through onto the file it replaced:
+  - `optimize_mkv_for_streaming` — the **final `.mkv` output itself**, after
+    its streaming-optimization remux pass. This is the one that actually hit
+    the user's media library.
+  - `mkv_structure_cache_invalidate` and `mkv_structure_cache_store` — the
+    MKV-structure-check cache file.
+  - `filecache_put` — the per-directory file-list cache.
+
+  Fix: added `_restore_default_file_mode()` (`chmod` to `0666 & ~umask`,
+  i.e. exactly what a normal `>`-created file would have gotten) and called
+  it immediately after each of the four successful `mv -f` swaps. The
+  `mktemp` usage itself — and the symlink-race protection it provides — is
+  unchanged; only the final permission bits are restored.
+
+  *(v5.0.17)*
 
 ## Source-file safety
 
