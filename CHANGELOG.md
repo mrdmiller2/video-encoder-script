@@ -1,6 +1,6 @@
 # Changelog
 
-Detailed record of every bug found and fixed during the v5.0.9 → v5.0.14 hardening
+Detailed record of every bug found and fixed during the v5.0.9 → v5.0.15 hardening
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
@@ -9,6 +9,38 @@ reviewers at high reasoning effort, each re-run after
 every round of fixes. Every finding from every reviewer was independently verified
 against the actual code before any fix was applied — several proposed findings
 turned out to be non-issues on inspection, and are not listed here.
+
+## Picture quality / correctness
+
+- **Dolby Vision Profile 5 sources produced a visible green/red color tint.**
+  Found via a real user report on a live encode of *Godzilla (2014)* (a genuine
+  Profile 5 source: DoVi RPU present, no HDR10 base layer), and confirmed by
+  extracting matching frames from the actual affected file before and after the
+  fix — the buggy output is visibly green-tinted throughout, the fixed output
+  shows correct natural greys and whites.
+
+  Two compounding bugs, both in `ffmpeg_encode()`/`build_ffmpeg_video_args()`:
+
+  1. The `hdr` flag that gates *all* Dolby Vision handling was only ever set from
+     `source_is_hdr_transfer()`, which checks the container's `color_transfer`
+     tag. A genuine Profile 5 source has no standard PQ/HLG tag at the container
+     level by design — its tone curve lives entirely in the proprietary RPU, not
+     in a container-level flag. `hdr` stayed `false`, so the entire
+     DoVi-detection/libplacebo-conversion branch was silently skipped and the raw
+     Dolby Vision base layer was encoded as-is, with no RPU-based color
+     reconstruction. Fixed by also setting `hdr=true` whenever
+     `source_has_dolby_vision()` is true, regardless of the container's
+     `color_transfer` tag.
+
+  2. Even when the DoVi branch *did* run (Profile 5 with `hdr=true`), the
+     libplacebo filter string used `color_trc=pq` — not a valid option value in
+     this ffmpeg build (confirmed via `ffmpeg -h filter=libplacebo`; the correct
+     enum name is `smpte2084`). This means the Profile-5-to-HDR10 conversion path
+     had never actually worked correctly since it was introduced — it just never
+     got a chance to fail loudly, because bug (1) was skipping the branch
+     entirely. Fixed the filter option value.
+
+  *(v5.0.15)*
 
 ## Source-file safety
 
