@@ -184,7 +184,7 @@ set -euo pipefail
 
 _CONVERT_V4_SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
 
-VERSION="5.0.13"
+VERSION="5.0.14"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 SEARCH_PATH="."
 DRY_RUN=false
@@ -2936,7 +2936,14 @@ sample_start_middle() {
 file_size_bytes() {
   case "$PLATFORM" in
     macos) stat -f%z "$1" 2>/dev/null || echo 0 ;;
-    *) stat -c%s "$1" 2>/dev/null || echo 0 ;;
+    linux|wsl) stat -c%s "$1" 2>/dev/null || echo 0 ;;
+    # Any other/unrecognized platform (a plain BSD box, not macOS): GNU
+    # stat's -c flag isn't guaranteed there. python3's portable os.stat is
+    # the same fallback mkv_structure_stat_key already relies on.
+    *)
+      stat -c%s "$1" 2>/dev/null && return 0
+      python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_size)' "$1" 2>/dev/null || echo 0
+      ;;
   esac
 }
 
@@ -3400,6 +3407,7 @@ resume_check_shard_changes() {
   local prev_shards="$RESUME_SHARDS_FILE.prev"
   local changes
   [ -f "$RESUME_SHARDS_FILE" ] || return 0
+  _neutralize_symlink_sidecar_path "$prev_shards"
   cp -f "$RESUME_SHARDS_FILE" "$prev_shards"
   build_shard_snapshot "$RESUME_SHARDS_FILE"
   changes="$(compare_shard_snapshots "$prev_shards" "$RESUME_SHARDS_FILE")"
@@ -3673,6 +3681,7 @@ begin_shard_log() {
     SHARD_LOG_FILE="$JOB_SIDECAR_DIR/shard-$(basename "$shard").log"
   fi
   SHARD_LOG_ACTIVE=true
+  _neutralize_symlink_sidecar_path "$SHARD_LOG_FILE"
   {
     echo ""
     echo "=== shard log — $(date -u '+%Y-%m-%d %H:%M:%S UTC') ==="
@@ -4415,8 +4424,14 @@ PY
 optimize_mkv_for_streaming() {
   local mkv="$1" tmp
   [ "$DRY_RUN" = true ] && return 0
-  tmp="${mkv%.mkv}.streamopt.tmp.mkv"
-  rm -f "$tmp"
+  # A static ".streamopt.tmp.mkv" name is predictable, and rm-then-create
+  # leaves a TOCTOU window for another process to plant a symlink there
+  # before mkvmerge -o opens it. mktemp creates the file atomically and
+  # exclusively, closing both the predictability and the race window.
+  # BSD/macOS mktemp requires the X's to be the template's trailing
+  # characters -- no suffix after them (unlike GNU, which tolerates one).
+  # mkvmerge doesn't care about the temp file's extension, so just drop it.
+  tmp="$(mktemp "${mkv%.mkv}.streamopt.XXXXXX")" || return 0
   if run_mkvmerge -o "$tmp" --quiet "$mkv" >/dev/null 2>&1 && [ -s "$tmp" ]; then
     mv -f "$tmp" "$mkv"
   else
@@ -6618,6 +6633,14 @@ ensure_multipart_merge() {
       return 0
     fi
     log_err "Multi-part source changed since last merge — re-merging: $title"
+  elif [ -f "$merged" ] && [ ! -f "$state" ]; then
+    # A regular file already sits at this exact name, but we have no record
+    # (.state) of having created it ourselves. "Title.merged.mkv" is an
+    # unusual enough pattern that this is unlikely by coincidence, but
+    # mkvmerge -o would silently overwrite it either way -- refuse rather
+    # than guess.
+    warn "Multi-part merge target already exists with no record of us creating it — leaving as-is for human review: $merged"
+    return 1
   fi
 
   if ! multipart_parts_compatible "${parts[@]}"; then
@@ -6631,6 +6654,12 @@ ensure_multipart_merge() {
     log_err "[dry-run] Would merge: ${parts[*]}"
     return 1
   fi
+
+  # $merged is a predictable name (Title.merged.mkv) beside real source
+  # parts. mkvmerge -o follows a symlink there and overwrites whatever it
+  # points to, which need not be related to this title at all.
+  _neutralize_symlink_sidecar_path "$merged"
+  _neutralize_symlink_sidecar_path "$state"
 
   local -a mm_args=(-o "$merged" --quiet)
   local i
@@ -7226,6 +7255,31 @@ process_existing_av1() {
 
   if [ "$ext" != "mkv" ]; then
     out="$(av1_output_path "$src")"
+    # Same reasoning as the guard in try_av1_convert/try_x265_convert: a
+    # legitimate output is always a plain file we create ourselves. This
+    # branch calls remux_copy_to_mkv (ffmpeg -y) directly and was never
+    # covered by that guard, since it's a separate call path.
+    if [ -L "$out" ]; then
+      err "Refusing to remux — output path is a symlink, not our own plain file: $out"
+      flag_bad_source_for_human "$src" "computed output path is an unexpected symlink — needs manual review before encoding"
+      return 1
+    fi
+    # This branch is only reached because the scan phase decided $src still
+    # needs converting -- but if $out already exists as a real regular file
+    # (not caught above, and not already ruled out during scan for whatever
+    # reason), ffmpeg -y would silently clobber it without ever checking
+    # whether it's actually ours. Same provenance checks used before any
+    # other deletion/overwrite of a "*.AV1.mkv"-named path.
+    if [ -e "$out" ]; then
+      local out_mt src_mt
+      out_mt="$(mkv_structure_stat_key "$out" 2>/dev/null)"; out_mt="${out_mt##*|}"
+      src_mt="$(mkv_structure_stat_key "$src" 2>/dev/null)"; src_mt="${src_mt##*|}"
+      if { [[ "$out_mt" =~ ^[0-9]+$ ]] && [[ "$src_mt" =~ ^[0-9]+$ ]] && [ "$out_mt" -lt "$src_mt" ]; } \
+         || ! derived_output_codec_claim_matches "$out"; then
+        flag_bad_source_for_human "$src" "computed output path already exists and doesn't look like our own prior output — needs manual review before overwriting"
+        return 1
+      fi
+    fi
     log "AV1 remux to MKV: $src -> $out"
     remux_copy_to_mkv "$src" "$out"
     validate_mkv_output "$src" "$out" || { remove_output_only "$out"; return 1; }
