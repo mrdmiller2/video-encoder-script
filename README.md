@@ -8,7 +8,7 @@ This script is portable (because I often have my windows laptop, mac, and linux 
 
 Bash library organizer and batch transcoder for large home-media trees. Targets **MKV + AV1** (kept when not more than **20% larger** than the source) with **x265** fallback, optional **ISO/Blu-ray** disc handling, and **sharded** directory scans for multi-thousand-file libraries.
 
-**Current release:** `convert-v5.0.10.sh` (v5.0.10) — see [What's new in v5](#whats-new-in-v5)
+**Current release:** `convert-v5.0.11.sh` (v5.0.11) — see [What's new in v5](#whats-new-in-v5)
 
 ## Logic flow
 
@@ -71,7 +71,7 @@ lacks libvmaf, use a [BtbN static build](https://github.com/BtbN/FFmpeg-Builds/r
 ## Version progression
 
 Each release is a **new file** — prior scripts stay in the repo for reference.
-The repo root holds the **current release** (`convert-v5.0.10.sh`) and the **last v4
+The repo root holds the **current release** (`convert-v5.0.11.sh`) and the **last v4
 release** (`convert-v4.0.52.sh`); all earlier versions live in [`Old Versions/`](Old%20Versions/):
 
 | File | Version | Notes |
@@ -134,7 +134,8 @@ release** (`convert-v4.0.52.sh`); all earlier versions live in [`Old Versions/`]
 | `convert-v5.0.7.sh` | 5.0.7 | streaming-optimized MKV output, `--clean-junk`, per-directory file-list cache, per-folder done/in-progress semaphores (fixes multi-hour restart enumeration on large TV libraries) |
 | `convert-v5.0.8.sh` | 5.0.8 | fixes 1080p-upscale trigger catching near-720p (letterboxed/cropped) sources it shouldn't; new threshold 700 |
 | `convert-v5.0.9.sh` | 5.0.9 | `discover_binary()` now prefers a user-built `~/.local/bin` copy (e.g. a libvmaf-enabled ffmpeg) over the system PATH binary; fixes non-interactive SSH runs silently falling back to a libvmaf-less ffmpeg and losing VMAF targeting |
-| `convert-v5.0.10.sh` | 5.0.10 | **Current** — external review fixes: portable awk `match()` (macOS/BSD awk), portable disc-size (no `du -b`), silent `mv -n` organize collisions now warn instead of losing files, O(n²) pipeline queue reads (persistent fd), pipeline job-count never propagating out of its background scan process, file-list cache/folder-done flags now key on max mtime across the whole subtree (fixes permanently-stale TV libraries — new episodes in a Season folder were invisible forever), multipart merging now excludes TV show/season directories entirely (was merging two-part episodes into one file), merge detection no longer runs during the fast pre-scan count, and `--clean-junk-apply` no longer deletes a `.merged.mkv` just because its raw parts were cleaned up (data-loss fix) |
+| `convert-v5.0.10.sh` | 5.0.10 | external review fixes: portable awk `match()` (macOS/BSD awk), portable disc-size (no `du -b`), silent `mv -n` organize collisions now warn instead of losing files, O(n²) pipeline queue reads (persistent fd), pipeline job-count never propagating out of its background scan process, file-list cache/folder-done flags now key on max mtime across the whole subtree (fixes permanently-stale TV libraries — new episodes in a Season folder were invisible forever), multipart merging now excludes TV show/season directories entirely (was merging two-part episodes into one file), merge detection no longer runs during the fast pre-scan count, and `--clean-junk-apply` no longer deletes a `.merged.mkv` just because its raw parts were cleaned up (data-loss fix) |
+| `convert-v5.0.11.sh` | 5.0.11 | **Current** — high-effort cross-platform audit (a full independent review pass, verified before applying): done-log fast-resume was silently dead from a call-order bug (init order swapped); file-list cache writes are now atomic (temp+rename, was corruptible mid-write); WSL_INTEROP now forwarded through `sudo` so Windows HandBrakeCLI.exe/nvidia-smi.exe probes don't break when running as root; macOS mount audit no longer breaks on mount points containing spaces; `dir_subtree_max_mtime` now one `python3` call instead of one per subdirectory; external subtitle paths are translated before comma-joining instead of after (was corrupting filenames containing literal commas, e.g. "Movie, The"); replaced non-essential `seq` dependency; and fleet machines sharing the same NFS/SMB library now atomically claim a title before encoding it, instead of racing to write the same output file (also fixed a real staleness-detection bug this surfaced: a confirmed-dead same-host process was still treated as "not stale" for 2 hours) |
 
 When bumping version: copy the latest script to `convert-v{NEW}.sh`, update `VERSION` and `SCRIPT_NAME`, keep all older files (moving the superseded one into `Old Versions/`). Do not overwrite.
 

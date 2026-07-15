@@ -184,7 +184,7 @@ set -euo pipefail
 
 _CONVERT_V4_SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
 
-VERSION="5.0.10"
+VERSION="5.0.11"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 SEARCH_PATH="."
 DRY_RUN=false
@@ -1307,11 +1307,28 @@ discover_binary() {
   return 1
 }
 
+# sudo clears almost the entire environment by default, including
+# WSL_INTEROP -- the socket path WSL2's Linux userspace needs to invoke a
+# Windows .exe host binary at all. Running as root/sudo and dropping to a
+# real user (sudo -u "$SUDO_USER") to call Windows HandBrakeCLI.exe/
+# nvidia-smi.exe therefore fails with "cannot execute binary file" purely
+# because of the stripped env var, not a real capability gap -- silently
+# forcing software-only fallback. Forward it through explicitly.
+sudo_drop_user() {
+  local user="$1"
+  shift
+  if [ "$PLATFORM" = wsl ] && [ -n "${WSL_INTEROP:-}" ]; then
+    sudo WSL_INTEROP="$WSL_INTEROP" -u "$user" -H -- "$@"
+  else
+    sudo -u "$user" -H -- "$@"
+  fi
+}
+
 _handbrake_reports_nvenc() {
   local candidate="$1"
   [ -n "$candidate" ] || return 1
   if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$PLATFORM" = wsl ] && [[ "$candidate" == *.exe ]]; then
-    sudo -u "$SUDO_USER" -H -- "$candidate" --help 2>&1 | search_cie 'nvenc: version [0-9]|nvenc_av1_10bit|nvenc_h265'
+    sudo_drop_user "$SUDO_USER" "$candidate" --help 2>&1 | search_cie 'nvenc: version [0-9]|nvenc_av1_10bit|nvenc_h265'
   else
     "$candidate" --help 2>&1 | search_cie 'nvenc: version [0-9]|nvenc_av1_10bit|nvenc_h265'
   fi
@@ -1421,7 +1438,7 @@ _handbrake_reports_qsv() {
   local hb_help
   [ -n "$candidate" ] || return 1
   if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$PLATFORM" = wsl ] && [[ "$candidate" == *.exe ]]; then
-    hb_help="$(sudo -u "$SUDO_USER" -H -- "$candidate" --help 2>&1)" || return 1
+    hb_help="$(sudo_drop_user "$SUDO_USER" "$candidate" --help 2>&1)" || return 1
   else
     hb_help="$("$candidate" --help 2>&1)" || return 1
   fi
@@ -1432,7 +1449,7 @@ _handbrake_reports_amd_vce() {
   local candidate="$1"
   [ -n "$candidate" ] || return 1
   if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$PLATFORM" = wsl ] && [[ "$candidate" == *.exe ]]; then
-    sudo -u "$SUDO_USER" -H -- "$candidate" --help 2>&1 | search_cie 'vce_h265|vce_h264|vcn_h265|vcn_h264'
+    sudo_drop_user "$SUDO_USER" "$candidate" --help 2>&1 | search_cie 'vce_h265|vce_h264|vcn_h265|vcn_h264'
   else
     "$candidate" --help 2>&1 | search_cie 'vce_h265|vce_h264|vcn_h265|vcn_h264'
   fi
@@ -1469,29 +1486,20 @@ handbrake_path_for_exe() {
 
 _handbrake_translate_argv() {
   local -n _args="$1"
-  local -a out=() arg mode="" part translated
+  local -a out=() arg mode=""
   for arg in "${_args[@]}"; do
     case "$arg" in
       -i|-o)
         out+=("$arg")
         mode=path
         ;;
-      --srt-file)
-        out+=("$arg")
-        mode=srt
-        ;;
       *)
+        # --srt-file's comma-joined value is pre-translated at the point it's
+        # built (handbrake_append_external_srts) -- re-splitting a joined
+        # string on ',' here is unsafe for any subtitle path that itself
+        # contains a literal comma.
         if [ "$mode" = path ]; then
           out+=("$(handbrake_path_for_exe "$arg")")
-          mode=""
-        elif [ "$mode" = srt ]; then
-          translated=""
-          IFS=',' read -ra parts <<<"$arg"
-          for part in "${parts[@]}"; do
-            [ -n "$translated" ] && translated+=","
-            translated+="$(handbrake_path_for_exe "$part")"
-          done
-          out+=("$translated")
           mode=""
         else
           out+=("$arg")
@@ -1680,7 +1688,7 @@ detect_handbrake_cli_capabilities() {
 
 _handbrake_exec() {
   if [ -n "$HANDBRAKE_DROP_TO_USER" ]; then
-    sudo -u "$HANDBRAKE_DROP_TO_USER" -H -- "$@"
+    sudo_drop_user "$HANDBRAKE_DROP_TO_USER" "$@"
   else
     "$@"
   fi
@@ -1777,15 +1785,43 @@ in_progress_flag_path() {
 
 # Place a visible per-file semaphore beside the source while encode/remux is underway.
 # Left behind on interrupt/crash so humans know that title's .AV1.mkv / .x265.mkv may be partial.
+#
+# Also claims a same-named ".lock" sibling directory via mkdir, which is
+# atomic even on NFS/CIFS -- unlike the informational flag file above (a
+# plain `cat >` write), two fleet machines scanning the same shared library
+# can otherwise both decide a title needs encoding and race to write the
+# same output path. The lock dir is a pure implementation detail (never
+# inspected by clean_junk_scan/junk_flag_is_stale) so the human-visible
+# .IN_PROGRESS file's format and behavior are unchanged. Returns 1 if
+# another live process (this host or another fleet machine) already holds
+# the claim -- callers must skip the job in that case.
 place_in_progress_flag() {
   local src="$1"
   local idx="${2:-}"
-  local flag dir title
+  local flag lockdir dir title this_host
   [ "$DRY_RUN" = true ] && return 0
   dir="$(media_content_dir "$src")"
   title="$(canonical_title_from_source "$src")"
   flag="$(in_progress_flag_path "$src")"
+  lockdir="${flag}.lock"
+  this_host="$(hostname 2>/dev/null || echo unknown)"
   mkdir -p -- "$dir" 2>/dev/null || true
+
+  if ! mkdir -- "$lockdir" 2>/dev/null; then
+    if junk_flag_is_stale "$flag" 2>/dev/null; then
+      rmdir -- "$lockdir" 2>/dev/null
+      if ! mkdir -- "$lockdir" 2>/dev/null; then
+        warn "Title claimed by another process just now — skipping: $title"
+        return 1
+      fi
+    else
+      local holder
+      holder="$(awk -F= '/^host=/{h=$2} /^pid=/{p=$2} END{print h" pid "p}' "$flag" 2>/dev/null)"
+      warn "Title already being encoded elsewhere (${holder:-unknown host/pid}) — skipping: $title"
+      return 1
+    fi
+  fi
+
   if [ -f "$flag" ]; then
     warn "Found leftover ${title}.${IN_PROGRESS_FLAG_SUFFIX} — prior run may have left partial .AV1.mkv/.x265.mkv for this title"
   fi
@@ -1793,7 +1829,7 @@ place_in_progress_flag() {
 convert-v4 IN PROGRESS
 version=$VERSION
 pid=$$
-host=$(hostname 2>/dev/null || echo unknown)
+host=$this_host
 started_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 job_index=${idx:-}
 title=$title
@@ -1803,6 +1839,7 @@ If you see this file, the convert job for this title was interrupted or is still
 Delete ${title}.AV1.mkv and/or ${title}.x265.mkv here (not the original) before trusting
 or re-running convert for this title.
 EOF
+  return 0
 }
 
 clear_in_progress_flag() {
@@ -1810,6 +1847,7 @@ clear_in_progress_flag() {
   local flag
   [ "$DRY_RUN" = true ] && return 0
   flag="$(in_progress_flag_path "$src")"
+  rmdir -- "${flag}.lock" 2>/dev/null || true
   [ -f "$flag" ] || return 0
   rm -f -- "$flag"
 }
@@ -1833,7 +1871,9 @@ begin_convert_job() {
   if [[ "$total" =~ ^[0-9]+$ ]]; then
     CONVERT_JOB_TOTAL="$total"
   fi
-  place_in_progress_flag "$src" "$idx"
+  if ! place_in_progress_flag "$src" "$idx"; then
+    return 1
+  fi
   resume_persist_state "started"
   echo ""
   log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -2263,15 +2303,24 @@ detect_nvenc_av1_tune() {
     _handbrake_translate_argv hb_args
   fi
 
+  # timeout execs an external command directly -- it can't wrap a shell
+  # function (sudo_drop_user), so the WSL_INTEROP forwarding is inlined here
+  # as a plain sudo argument instead (sudo VAR=val -u user is a supported
+  # invocation form independent of env_reset).
+  local -a sudo_env=()
+  if [ "$PLATFORM" = wsl ] && [ -n "${WSL_INTEROP:-}" ]; then
+    sudo_env=(WSL_INTEROP="$WSL_INTEROP")
+  fi
+
   set +e
   if command -v timeout >/dev/null 2>&1; then
     if [ -n "$HANDBRAKE_DROP_TO_USER" ]; then
-      timeout 120 sudo -u "$HANDBRAKE_DROP_TO_USER" -H -- "${HANDBRAKE_CMD[@]}" "${hb_args[@]}" >"$probe_log" 2>&1
+      timeout 120 sudo "${sudo_env[@]}" -u "$HANDBRAKE_DROP_TO_USER" -H -- "${HANDBRAKE_CMD[@]}" "${hb_args[@]}" >"$probe_log" 2>&1
     else
       timeout 120 "${HANDBRAKE_CMD[@]}" "${hb_args[@]}" >"$probe_log" 2>&1
     fi
   elif [ -n "$HANDBRAKE_DROP_TO_USER" ]; then
-    sudo -u "$HANDBRAKE_DROP_TO_USER" -H -- "${HANDBRAKE_CMD[@]}" "${hb_args[@]}" >"$probe_log" 2>&1
+    sudo "${sudo_env[@]}" -u "$HANDBRAKE_DROP_TO_USER" -H -- "${HANDBRAKE_CMD[@]}" "${hb_args[@]}" >"$probe_log" 2>&1
   else
     _handbrake_exec "${HANDBRAKE_CMD[@]}" "${hb_args[@]}" >"$probe_log" 2>&1
   fi
@@ -3244,8 +3293,14 @@ resume_check_shard_changes() {
 }
 
 resume_prepare_convert() {
-  done_log_load
+  # resume_init_paths sets RESUME_DONE_LOG to the real sidecar path -- it was
+  # previously called AFTER done_log_load, so done_log_load always saw the
+  # empty top-level default and silently never loaded convert-v5.done. That
+  # disabled the entire done-log fast-skip resume path (every restart fully
+  # re-validated every file via ffprobe/mkvalidator instead of fast-skipping
+  # already-finished ones) without any visible error.
   resume_init_paths
+  done_log_load
   if [ "$NO_RESUME" = true ]; then
     log "Resume disabled (--no-resume) — starting fresh"
     resume_clear_state
@@ -4094,8 +4149,20 @@ handbrake_append_external_srts() {
 
   [ "${#subs[@]}" -eq 0 ] && return 0
 
+  # Translate each path individually BEFORE comma-joining. A path containing
+  # a literal comma (e.g. "Movie, The (2020).en.srt") would otherwise get
+  # blindly re-split on ',' later (in _handbrake_translate_argv, which only
+  # sees the joined string) into two bogus fragments, each wrongly
+  # translated. handbrake_path_for_exe() is a no-op outside WSL win-path
+  # mode, so this is safe to always apply here.
+  local -a subs_out=()
+  local sub_i
+  for sub_i in "${subs[@]}"; do
+    subs_out+=("$(handbrake_path_for_exe "$sub_i")")
+  done
+
   local joined_subs joined_langs joined_codesets
-  joined_subs="$(IFS=,; printf '%s' "${subs[*]}")"
+  joined_subs="$(IFS=,; printf '%s' "${subs_out[*]}")"
   joined_langs="$(IFS=,; printf '%s' "${langs[*]}")"
   joined_codesets="$(IFS=,; printf '%s' "${codesets[*]}")"
   _args+=(--srt-file "$joined_subs" --srt-lang "$joined_langs" --srt-codeset "$joined_codesets")
@@ -5739,8 +5806,15 @@ mount_audit_for_path() {
   local p="$1" src fstype opts rec=()
   case "$PLATFORM" in
     macos)
-      local line
-      line="$(/sbin/mount | grep -F " on $(df "$p" 2>/dev/null | awk 'NR==2 {print $NF}') (" | head -1)"
+      local line mnt=""
+      # `awk '{print $NF}'` on df's output breaks the moment the mount point
+      # itself contains a space (e.g. "/Volumes/Media Mount") -- $NF grabs
+      # only the last word. The Capacity column ("NN%") never legitimately
+      # appears inside a real path, so stripping through it with sed is a
+      # robust way to keep the full mount point (spaces included) intact.
+      mnt="$(df -P "$p" 2>/dev/null | tail -1 | sed -E 's/^.*[0-9]+% *//')"
+      [ -n "$mnt" ] || mnt="$(df "$p" 2>/dev/null | tail -1 | awk '{print $NF}')"
+      line="$(/sbin/mount | grep -F " on $mnt (" | head -1)"
       case "$line" in
         *"(nfs"*) [ "${line#*read-only}" != "$line" ] && warn "mount audit: $p is mounted READ-ONLY" ;;
         *"(smbfs"*) warn "mount audit: $p is SMB on macOS — NFS usually performs better for encode I/O" ;;
@@ -5956,7 +6030,7 @@ vmaf_crf_search_internal() {  # src codec target model
     nsamples=$(( nsamples - 1 ))
   done
 
-  for i in $(seq 1 "$nsamples"); do
+  for ((i = 1; i <= nsamples; i++)); do
     start=$(( dur * (i * 2 - 1) / (nsamples * 2) ))
     clip="$work/clip$i.mkv"
     run_ffmpeg -y -v error -ss "$start" -t "$VMAF_SAMPLE_SECS" -i "$src" \
@@ -6527,12 +6601,28 @@ _filecache_key() {
 # avoid re-stating on every restart), so this keeps the original performance
 # win while actually detecting changes anywhere in the subtree.
 dir_subtree_max_mtime() {
-  local dir="$1" d mt max=0
-  while IFS= read -r d; do
-    mt="$(mkv_structure_stat_key "$d" 2>/dev/null)"; mt="${mt##*|}"
-    [[ "$mt" =~ ^[0-9]+$ ]] && [ "$mt" -gt "$max" ] && max="$mt"
-  done < <(find "$dir" -type d 2>/dev/null)
-  printf '%s' "$max"
+  local dir="$1"
+  # One python3 process walking the whole subtree, not one process PER
+  # subdirectory (a season-heavy show folder over NFS previously spawned a
+  # python3 + its own stat() round trip for every season dir on every call).
+  python3 - "$dir" <<'PY' 2>/dev/null
+import os, sys
+root = sys.argv[1]
+best = 0
+try:
+    best = int(os.stat(root).st_mtime)
+except OSError:
+    pass
+for cur, dirs, _ in os.walk(root):
+    for d in dirs:
+        try:
+            mt = int(os.stat(os.path.join(cur, d)).st_mtime)
+        except OSError:
+            continue
+        if mt > best:
+            best = mt
+print(best)
+PY
 }
 
 filecache_get() {  # dir -> file list on stdout; returns 1 on cache miss
@@ -6557,7 +6647,16 @@ filecache_put() {  # dir, nameref file-list array
   mtime="$(dir_subtree_max_mtime "$dir")"
   [ -n "$mtime" ] || return 0
   cache="$FILECACHE_DIR/$(_filecache_key "$dir").list"
-  { printf '%s\n' "$mtime"; printf '%s\n' "${_files_ref[@]}"; } >"$cache" 2>/dev/null
+  # Write to a per-process temp file and rename into place atomically -- a
+  # direct `>"$cache"` write that's interrupted (crash, NFS hiccup, another
+  # fleet machine reading mid-write) can leave just the mtime header on
+  # disk. filecache_get() would then read that as a valid cache hit with an
+  # empty file list, silently treating every video in the folder as gone
+  # until the directory's mtime changes again.
+  local cache_tmp="${cache}.tmp.$$"
+  { printf '%s\n' "$mtime"; printf '%s\n' "${_files_ref[@]}"; } >"$cache_tmp" 2>/dev/null \
+    && mv -f "$cache_tmp" "$cache" 2>/dev/null \
+    || rm -f "$cache_tmp" 2>/dev/null
 }
 
 # Cache-accelerated recursive video find. Falls back to a flat find when
@@ -6737,9 +6836,11 @@ junk_flag_is_stale() {  # flag path -> 0 if safe to remove
   host="$(awk -F= '/^host=/{print $2; exit}' "$flag" 2>/dev/null)"
   if [ -n "$pid" ] && [ "$host" = "$(hostname 2>/dev/null)" ]; then
     kill -0 "$pid" 2>/dev/null && return 1   # still running here — not stale
+    return 0   # same host, pid confirmed dead — definitely stale, no need to wait
   fi
-  # Different host, or process gone: stale if older than 2 hours (avoid
-  # racing a run that just started and hasn't written progress yet).
+  # Different host, or no pid/host recorded at all: stale if older than 2
+  # hours (avoid racing a run that just started and hasn't written progress
+  # yet, and give a remote machine's own liveness signal time to show up).
   local mtime now age
   mtime="$(mkv_structure_stat_key "$flag" 2>/dev/null)"; mtime="${mtime##*|}"
   now="$(date +%s)"
@@ -7623,7 +7724,9 @@ convert_run_encode_job() {
   local total_label="$3"
 
   CONVERT_JOB_OK=false
-  begin_convert_job "$f" "$idx" "$total_label"
+  if ! begin_convert_job "$f" "$idx" "$total_label"; then
+    return 0
+  fi
   if is_disk_source "$f"; then
     process_disk "$f" && CONVERT_JOB_OK=true || warn "Job failed — continuing queue: $f"
   else
@@ -7811,7 +7914,9 @@ convert_library_batch() {
   for f in "${queue[@]}"; do
     CONVERT_JOB_INDEX=$((CONVERT_JOB_INDEX + 1))
     CONVERT_JOB_OK=false
-    begin_convert_job "$f" "$CONVERT_JOB_INDEX" "$CONVERT_JOB_TOTAL"
+    if ! begin_convert_job "$f" "$CONVERT_JOB_INDEX" "$CONVERT_JOB_TOTAL"; then
+      continue
+    fi
     if is_disk_source "$f"; then
       process_disk "$f" && CONVERT_JOB_OK=true || warn "Job failed — continuing queue: $f"
     else
