@@ -8,7 +8,7 @@ This script is portable (because I often have my windows laptop, mac, and linux 
 
 Bash library organizer and batch transcoder for large home-media trees. Targets **MKV + AV1** (kept when not more than **20% larger** than the source) with **x265** fallback, optional **ISO/Blu-ray** disc handling, and **sharded** directory scans for multi-thousand-file libraries.
 
-**Current release:** `convert-v4.0.52.sh` (v4.0.52)
+**Current release:** `convert-v5.0.0.sh` (v5.0.0) — see [What's new in v5](#whats-new-in-v5)
 
 ## About this project
 
@@ -17,6 +17,50 @@ I started this project back in 2024 because my video libraries were getting too 
 Hence this little project. It converts, organizes, and strips out old junk metadata. We get things from "places" and don't want Plex or other apps surfacing that, so at the end you have a nice clean AV1 file or an x265 file — whichever works best and gives the best size. It has been my experience that not every conversion yields good results, so I added logic: if the AV1 output is larger than the source, try x265 instead.
 
 The script is portable because I often have my Windows laptop, Mac, and Linux machines working on the same libraries. Over time that meant three or six separate scripts — some for anime, some for Flatpak HandBrake, some for regular movies and TV shows. This script tries to unify them into one uber-script. The original use-case-specific sources live in the [`genesis/`](genesis/) folder.
+
+## What's new in v5
+
+v5 replaces fixed-quality encoding with a **per-title quality floor**: instead of encoding
+everything at one CQ and keeping whatever comes out, each title is sampled, and the encoder
+searches for the **highest CRF that still meets a VMAF target** — so easy content (sitcoms,
+clean digital sources) gets far smaller files, and hard content (grain, action) gets *more*
+bits than v4 gave it. Measured against v4's fixed CQ 26, that setting scored roughly
+VMAF-NEG 92.6 on typical sources; v5's default floor is **94.0** — higher quality *and*
+smaller average size across a library.
+
+- **ffmpeg encode engine** (libsvtav1 / libx265) for files; HandBrake remains for ISO/BDMV
+  disc sources and via `--engine handbrake`.
+- **VMAF-targeted CRF search**, three-tier by machine capability:
+  1. [`ab-av1`](https://github.com/alexheretic/ab-av1) if installed (fastest search)
+  2. internal sample-based search using ffmpeg's `libvmaf`
+  3. fixed CRFs (v4-equivalent) when the ffmpeg build lacks libvmaf
+- **Models per content class**: NEG model (resistant to sharpening/enhancement gaming) for
+  SDR movies/TV and anime; the 4K model for UHD sources (`--vmaf-target-4k`, default 95).
+- **HDR handled conservatively**: VMAF is unreliable on PQ/HLG, so HDR titles use a fixed
+  conservative CRF, and HDR10 static metadata (mastering display, MaxCLL/FALL) is carried
+  into the output.
+- **Dolby Vision is stripped to plain HDR10** (Plex-first compatibility, VLC second):
+  profiles 7/8 keep their HDR10 base layer + static metadata (RPU/EL dropped);
+  profile 5 (no HDR10 base) is converted via `libplacebo`; if libplacebo is missing the
+  file is flagged for human review instead of producing broken colors.
+- **Functional hardware detection**: every candidate encoder (NVENC, QSV, VAAPI, AMF,
+  VideoToolbox) is verified with a 1-second test encode — per-codec, per-GPU. A box with
+  mixed GPUs (e.g. an Ada/Blackwell card plus an older Ampere card) gets AV1 NVENC only
+  where it actually works. `--prefer-hw` opts into hardware encoding (speed over size,
+  fixed quality — no VMAF search).
+- **Mount audit**: at startup the library path's NFS/CIFS mount options are checked and
+  suboptimal settings (e.g. `soft`, small `rsize/wsize`, missing `nconnect`) produce
+  advisory recommendations.
+- Everything else — organize, sharding, resume, validation, track labeling, size-reject
+  safety gates, x265 fallback — carries over from v4.0.52.
+
+New flags: `--engine auto|ffmpeg|handbrake`, `--vmaf-target N`, `--vmaf-target-4k N`,
+`--vmaf-samples N`, `--no-vmaf`, `--prefer-hw`, `--svt-preset N`.
+
+**v5 requirements:** ffmpeg built with `libsvtav1`, `libx265`, and (for VMAF targeting)
+`libvmaf` — Fedora/RPM Fusion and Homebrew builds qualify; Ubuntu/Debian distro ffmpeg
+lacks libvmaf, use a [BtbN static build](https://github.com/BtbN/FFmpeg-Builds/releases).
+`libplacebo` (in the same builds) enables DoVi profile-5 conversion. `ab-av1` is optional.
 
 ## Version progression
 
@@ -71,7 +115,8 @@ Each release is a **new file** — prior scripts stay in the repo for reference:
 | `convert-v4.0.49.sh` | 4.0.49 | Waive unlimited size-reject on 1080p upscale path |
 | `convert-v4.0.50.sh` | 4.0.50 | Upscale keeps only if ≤50% larger than source; else revert to original |
 | `convert-v4.0.51.sh` | 4.0.51 | Fix mkvpropedit off-by-one that mangled audio/subtitle language tags |
-| `convert-v4.0.52.sh` | 4.0.52 | **Current** — `--name-glob` / path trailing glob to filter large shelves (e.g. `American/A*`) |
+| `convert-v4.0.52.sh` | 4.0.52 | `--name-glob` / path trailing glob to filter large shelves (e.g. `American/A*`) |
+| `convert-v5.0.0.sh` | 5.0.0 | **Current** — ffmpeg engine, per-title VMAF-targeted CRF, DoVi→HDR10, functional HW probes, mount audit |
 
 When bumping version: copy the latest script to `convert-v{NEW}.sh`, update `VERSION` and `SCRIPT_NAME`, keep all older files. Do not rename or overwrite.
 
