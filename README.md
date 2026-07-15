@@ -8,7 +8,7 @@ This script is portable (because I often have my windows laptop, mac, and linux 
 
 Bash library organizer and batch transcoder for large home-media trees. Targets **MKV + AV1** (kept when not more than **20% larger** than the source) with **x265** fallback, optional **ISO/Blu-ray** disc handling, and **sharded** directory scans for multi-thousand-file libraries.
 
-**Current release:** `convert-v5.0.5.sh` (v5.0.5) — see [What's new in v5](#whats-new-in-v5)
+**Current release:** `convert-v5.0.6.sh` (v5.0.6) — see [What's new in v5](#whats-new-in-v5)
 
 ## About this project
 
@@ -65,7 +65,7 @@ lacks libvmaf, use a [BtbN static build](https://github.com/BtbN/FFmpeg-Builds/r
 ## Version progression
 
 Each release is a **new file** — prior scripts stay in the repo for reference.
-The repo root holds the **current release** (`convert-v5.0.5.sh`) and the **last v4
+The repo root holds the **current release** (`convert-v5.0.6.sh`) and the **last v4
 release** (`convert-v4.0.52.sh`); all earlier versions live in [`Old Versions/`](Old%20Versions/):
 
 | File | Version | Notes |
@@ -123,7 +123,8 @@ release** (`convert-v4.0.52.sh`); all earlier versions live in [`Old Versions/`]
 | `convert-v5.0.2.sh` | 5.0.2 | `-p` accepts a single file directly (in addition to a directory or directory+trailing-glob) |
 | `convert-v5.0.3.sh` | 5.0.3 | multi-part source merge (Part1/Part2/CD1/CD2/Disc1/Disc2); `.ogm` source support |
 | `convert-v5.0.4.sh` | 5.0.4 | fixes softness (dropped a stray SVT-AV1 tune=0) and restores v4's dialogue-clarity audio boost (dynaudnorm+gain) in the ffmpeg engine |
-| `convert-v5.0.5.sh` | 5.0.5 | **Current** — `--prefer-hw` NVENC AV1 now uses the probed `uhq` tune (matching v4) instead of a hardcoded `hq` |
+| `convert-v5.0.5.sh` | 5.0.5 | `--prefer-hw` NVENC AV1 now uses the probed `uhq` tune (matching v4) instead of a hardcoded `hq` |
+| `convert-v5.0.6.sh` | 5.0.6 | **Current** — fixes a Dolby Vision source silently keeping its DoVi tagging when falling back to x265 via the HEVC remux shortcut |
 
 When bumping version: copy the latest script to `convert-v{NEW}.sh`, update `VERSION` and `SCRIPT_NAME`, keep all older files (moving the superseded one into `Old Versions/`). Do not overwrite.
 
