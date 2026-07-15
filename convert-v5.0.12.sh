@@ -184,7 +184,7 @@ set -euo pipefail
 
 _CONVERT_V4_SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
 
-VERSION="5.0.11"
+VERSION="5.0.12"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 SEARCH_PATH="."
 DRY_RUN=false
@@ -1063,8 +1063,16 @@ _cifs_credentials_file() {
     return 0
   fi
   if [ -n "${CONVERT_SMB_USER:-}" ] && [ -n "${CONVERT_SMB_PASSWORD:-}" ]; then
+    # mktemp respects the process umask -- a permissive umask (022/002)
+    # briefly leaves the file world/group-readable before the later chmod
+    # runs, during which another local process could read the plaintext
+    # password. Force a restrictive umask so it's created 0600 atomically,
+    # with no window at all.
+    local old_umask
+    old_umask="$(umask)"
+    umask 077
     credf="$(mktemp)"
-    chmod 600 "$credf"
+    umask "$old_umask"
     printf 'username=%s\npassword=%s\n' "$CONVERT_SMB_USER" "$CONVERT_SMB_PASSWORD" >"$credf"
     printf '%s' "$credf"
     return 0
@@ -1093,6 +1101,14 @@ _cifs_mount_fresh() {
     return 1
   fi
   [ "${CONVERT_CIFS_CREDENTIALS:-}" != "$credf" ] && temp_cred=true
+  # `mount` can hang indefinitely against an offline/firewalled SMB host; if
+  # the user interrupts (Ctrl-C) while it's hung, nothing after that point
+  # normally runs, orphaning the plaintext credentials file in /tmp. Trap
+  # covers that window specifically.
+  # Guard re-checks temp_cred at fire time (not registration time) -- must
+  # never delete the user's own CONVERT_CIFS_CREDENTIALS file if that's what
+  # $credf ended up pointing at instead of a generated temp file.
+  trap '[ "$temp_cred" = true ] && rm -f -- "$credf" 2>/dev/null' EXIT INT TERM
 
   if [ "$(id -u)" -ne 0 ]; then
     sudo mkdir -p "$dst" 2>/dev/null || mkdir -p "$dst" 2>/dev/null || true
@@ -1231,7 +1247,10 @@ _runtime_home() {
   local home="$HOME"
   if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
     home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)"
-    [ -n "$home" ] || home="$(eval echo "~$SUDO_USER")"
+    # eval on a variable derived from the environment is a code-injection
+    # vector (SUDO_USER='x$(payload)' would execute the payload under eval).
+    # Bash's own tilde expansion on a quoted variable is equivalent and safe.
+    [ -n "$home" ] || home="$(printf '%s' ~"$SUDO_USER" 2>/dev/null)"
   fi
   [ -n "$home" ] || home="$HOME"
   printf '%s' "$home"
@@ -1820,6 +1839,17 @@ place_in_progress_flag() {
       warn "Title already being encoded elsewhere (${holder:-unknown host/pid}) — skipping: $title"
       return 1
     fi
+  fi
+
+  # cat >"$flag" follows a symlink at that path and truncates+writes INTO
+  # whatever it points to. $flag is a predictable name sitting right beside
+  # the source on a shared NFS/CIFS library, so refuse rather than write
+  # through it if it's ever a symlink (planted or accidental) instead of a
+  # plain file.
+  if [ -L "$flag" ]; then
+    warn "Refusing to write in-progress flag — path is a symlink, not a plain file: $flag"
+    rmdir -- "$lockdir" 2>/dev/null
+    return 1
   fi
 
   if [ -f "$flag" ]; then
@@ -2413,6 +2443,14 @@ if [ "$CHECK_TOOLS_ONLY" = true ]; then
 fi
 
 split_path_trailing_glob "$SEARCH_PATH"
+# A path starting with '-' (e.g. `-p -Media`) gets misread as an option by
+# realpath/find/etc regardless of quoting -- quoting only stops the shell
+# from word-splitting it, not a program's own argv parsing from treating a
+# leading dash as a flag. Neutralize it the same way ./ does for any
+# relative path.
+case "$SEARCH_PATH" in
+  -*) SEARCH_PATH="./$SEARCH_PATH" ;;
+esac
 SEARCH_PATH="$(canonical_path "$SEARCH_PATH")"
 JOB_ROOT="$SEARCH_PATH"
 
@@ -2509,6 +2547,25 @@ is_derived_output() {
   [[ "$base" =~ \.(AV1|av1|x265|X265)\.mkv$ ]] && return 0
   [[ "$base" =~ -av1\.mkv$ ]] && return 0
   return 1
+}
+
+# is_derived_output() is a cheap, name-only guess used throughout the broad
+# scan/queueing path -- intentionally never ffprobes there. But before any
+# DESTRUCTIVE action (deleting a file, or mutating one in place) based on
+# "this looks like our own AV1/x265 output", actually confirm the file's
+# real video codec matches what its name claims. A file named "*.AV1.mkv"
+# whose stream isn't actually AV1 (wrong format entirely, or even just a
+# differently-encoded file that happens to share the naming convention) is
+# proof it's NOT something this script produced, regardless of filename.
+derived_output_codec_claim_matches() {
+  local out="$1"
+  local base="${out##*/}"
+  local codec
+  case "$base" in
+    *.[Aa][Vv]1.mkv) codec="$(video_codec "$out" 2>/dev/null)"; [ "$codec" = "av1" ] ;;
+    *.[Xx]265.mkv)   codec="$(video_codec "$out" 2>/dev/null)"; [ "$codec" = "hevc" ] ;;
+    *) return 0 ;;
+  esac
 }
 
 is_multipart_merged_file() {
@@ -4483,11 +4540,33 @@ record_corrupt_mkv() {
 }
 
 # Delete a bad processed .AV1.mkv / .x265.mkv and flag the source for reconversion.
+#
+# $out only gets here because its filename matches our own derived-output
+# naming convention (Title.AV1.mkv / Title.x265.mkv) -- that's a guess, not
+# proof, that we created it. A genuine unrelated file a user already had
+# (e.g. their own native-AV1 rip of a different edition, sitting beside an
+# unconverted source with a matching canonical title) would look identical
+# to a broken conversion output once it fails validation against $src. An
+# encode we actually produced can only ever exist AFTER its source did, so a
+# candidate that predates $src cannot possibly be something we made from
+# this exact source -- refuse to delete it and flag for human review instead.
 flag_bad_processed_output() {
   local src="$1"
   local out="$2"
   local reason="${3:-invalid processed output}"
   local logf="${RECONVERT_FILES_LOG:-}"
+  local src_mt out_mt
+
+  src_mt="$(mkv_structure_stat_key "$src" 2>/dev/null)"; src_mt="${src_mt##*|}"
+  out_mt="$(mkv_structure_stat_key "$out" 2>/dev/null)"; out_mt="${out_mt##*|}"
+  if [[ "$src_mt" =~ ^[0-9]+$ ]] && [[ "$out_mt" =~ ^[0-9]+$ ]] && [ "$out_mt" -lt "$src_mt" ]; then
+    flag_bad_source_for_human "$out" "matches our derived-output naming but predates its supposed source ($src) — likely an unrelated file, not something we created; not deleting ($reason)"
+    return 0
+  fi
+  if ! derived_output_codec_claim_matches "$out"; then
+    flag_bad_source_for_human "$out" "named as our AV1/x265 output but its actual video codec doesn't match — not something we created; not deleting ($reason)"
+    return 0
+  fi
 
   [ -n "$logf" ] || logf="${JOB_SIDECAR_DIR:-.}/reconvert_files.txt"
   warn "Bad processed output — deleting and flagging for reconversion: $out ($reason)"
@@ -4518,26 +4597,33 @@ flag_bad_source_for_human() {
   record_skip "$src" "bad source — human review: $reason"
 }
 
-# Remux a structurally-bad source MKV/WebM in place (stream copy) so encode can proceed.
-# Prefer mkvmerge when available (rebuilds SeekHead/Cues); ffmpeg -c copy as fallback.
-# On success: replaces $src with the remuxed file. On failure: leaves $src untouched.
-# Returns 0 if the source is healthy after remux; 1 if remux failed or still invalid.
+# Checks whether a structurally-bad source MKV/WebM's content is actually
+# fine (just container-level noise) by remuxing it (stream copy; mkvmerge
+# preferred, ffmpeg -c copy as fallback) into a throwaway mktemp -d, entirely
+# outside the library tree. Never touches or replaces $src -- there is no
+# in-place write, no window where the original is missing/half-written, and
+# no leftover artifact beside the source for a later scan to mistake for a
+# new title. On success prints the repaired copy's path on stdout purely as
+# proof the content is sound (caller removes it immediately, it is never
+# used as the actual encode input); the real encode always runs against the
+# untouched original -- if ffmpeg itself still can't read it, the normal
+# AV1-then-x265-then-fail-safely fallback chain handles that already.
+# Returns 0 if the repair validated clean; 1 otherwise ($src is always
+# untouched either way).
 attempt_source_mkv_structure_remux() {
   local src="$1"
   local reason="${2:-structure errors}"
-  local dir base tmp rc
+  local workdir tmp rc
 
   if [ "$DRY_RUN" = true ]; then
     log "[dry-run] Would remux-repair source MKV ($reason): $src"
-    return 0
+    return 1
   fi
 
-  dir="$(dirname "$src")"
-  base="$(basename "$src")"
-  tmp="${dir}/.${base}.convert-v4.remux-tmp.$$.mkv"
+  workdir="$(mktemp -d)" || return 1
+  tmp="$workdir/repaired.mkv"
 
-  log "Source MKV structure issue ($reason) — attempting remux repair before encode: $src"
-  rm -f -- "$tmp"
+  log "Source MKV structure issue ($reason) — attempting remux repair (repaired copy only, source untouched): $src"
 
   set +e
   if [ "${#MKVMERGE_CMD[@]}" -gt 0 ]; then
@@ -4546,7 +4632,6 @@ attempt_source_mkv_structure_remux() {
     # mkvmerge: 0=ok, 1=warnings (often still usable), >=2=error
     if [ "$rc" -ge 2 ] || [ ! -s "$tmp" ]; then
       warn "mkvmerge remux repair failed (rc=$rc); trying ffmpeg stream copy"
-      rm -f -- "$tmp"
       run_ffmpeg -y -nostdin -loglevel error -fflags +genpts -i "$src" -map 0 -c copy "$tmp"
       rc=$?
     else
@@ -4560,35 +4645,28 @@ attempt_source_mkv_structure_remux() {
 
   if [ "$rc" -ne 0 ] || [ ! -s "$tmp" ]; then
     warn "Remux repair failed for $src"
-    rm -f -- "$tmp"
+    rm -rf -- "$workdir"
     return 1
   fi
 
   if ! ffprobe_metadata_ok "$tmp" true; then
     warn "Remux repair produced unreadable metadata: $tmp"
-    rm -f -- "$tmp"
+    rm -rf -- "$workdir"
     return 1
   fi
   if ! validate_mkv_ebml_bounds "$tmp"; then
     warn "Remux repair still fails EBML/segment bounds: $tmp"
-    rm -f -- "$tmp"
+    rm -rf -- "$workdir"
     return 1
   fi
   if [ "$HAS_MKVALIDATOR" = true ] && ! validate_mkv_mkvalidator "$tmp"; then
     warn "Remux repair still fails mkvalidator: $tmp"
-    rm -f -- "$tmp"
+    rm -rf -- "$workdir"
     return 1
   fi
 
-  if ! mv -f -- "$tmp" "$src"; then
-    warn "Remux repair could not replace source: $src"
-    rm -f -- "$tmp"
-    return 1
-  fi
-
-  mkv_structure_cache_invalidate "$src"
-  mkv_structure_cache_store "$src" || true
-  log "Remux repair succeeded — proceeding with encode: $src"
+  log "Remux repair succeeded — using repaired copy for this encode; source left untouched: $src"
+  printf '%s' "$tmp"
   return 0
 }
 
@@ -4617,9 +4695,18 @@ validate_source_media() {
 
   ext="$(to_lower "${src##*.}")"
   if [ "$ext" = "mkv" ] || [ "$ext" = "webm" ]; then
+    # attempt_source_mkv_structure_remux only ever repairs an isolated,
+    # throwaway copy under mktemp -d -- $src on disk is NEVER modified by
+    # it. Its result here is used purely as a confidence check ("is this
+    # source's content fundamentally sound, just container-level noise?"):
+    # if the repair validates clean, we proceed to encode from the
+    # untouched original as always; if ffmpeg itself still can't read it,
+    # the existing AV1-then-x265-then-fail-safely fallback chain in
+    # try_av1_convert already handles that without ever touching $src.
+    local repaired
     if ! validate_mkv_ebml_bounds "$src"; then
-      if attempt_source_mkv_structure_remux "$src" "EBML/segment bounds invalid"; then
-        :
+      if repaired="$(attempt_source_mkv_structure_remux "$src" "EBML/segment bounds invalid")"; then
+        rm -rf -- "$(dirname "$repaired")"
       else
         flag_bad_source_for_human "$src" "Matroska EBML/segment bounds invalid (remux repair failed)"
         return 1
@@ -4628,8 +4715,8 @@ validate_source_media() {
     # Full mkvalidator on sources at encode time only (when available).
     if [ "$HAS_MKVALIDATOR" = true ]; then
       if ! validate_mkv_mkvalidator "$src"; then
-        if attempt_source_mkv_structure_remux "$src" "mkvalidator structure errors"; then
-          :
+        if repaired="$(attempt_source_mkv_structure_remux "$src" "mkvalidator structure errors")"; then
+          rm -rf -- "$(dirname "$repaired")"
         else
           flag_bad_source_for_human "$src" "mkvalidator structure errors (remux repair failed)"
           return 1
@@ -7087,7 +7174,11 @@ process_existing_av1() {
 
   if ! decision="$(av1_source_reencode_sample_decision "$encode_src" "$ref_sz")"; then
     warn "AV1 sample test failed — metadata only: $src"
-    finalize_mkv_output "$src" "$src" "$title"
+    # finalize_mkv_output remuxes + relabels tracks IN PLACE -- only ever
+    # apply that to a file we already recognize as our own derived output
+    # (named *.AV1.mkv by this script). A genuine original that merely
+    # happens to already be AV1 is left completely untouched.
+    is_derived_output "$src" && finalize_mkv_output "$src" "$src" "$title"
     record_skip "$src" "AV1 sample test failed"
     return 0
   fi
@@ -7103,7 +7194,8 @@ process_existing_av1() {
         record_conversion_result "$src" ""
       else
         log "Skip — sample predicts re-encode would not shrink: $src"
-        finalize_mkv_output "$src" "$src" "$title"
+        # Genuinely non-derived original (not one of our own outputs) --
+        # never remux/relabel it in place, just leave it exactly as-is.
         record_skip "$src" "AV1 re-encode sample predicts no size win"
       fi
       return 0
@@ -7120,7 +7212,7 @@ process_existing_av1() {
       ;;
     *)
       warn "AV1 sample returned unknown decision '$decision' — metadata only: $src"
-      finalize_mkv_output "$src" "$src" "$title"
+      is_derived_output "$src" && finalize_mkv_output "$src" "$src" "$title"
       record_skip "$src" "AV1 sample test failed"
       return 0
       ;;
@@ -7135,6 +7227,21 @@ try_av1_convert() {
   dir="$(media_content_dir "$src")"
   title="$(canonical_title_from_source "$src")"
   out="$(av1_output_path "$src")"
+
+  # Universal last-line-of-defense: whatever chain of naming/codec/queueing
+  # logic got us here, if the computed output path is literally the source
+  # path, ffmpeg -y (or HandBrake) would open $out for writing and truncate
+  # it before it could even finish reading $src as input -- destroying the
+  # original irrecoverably. This can happen for a file named like our own
+  # output convention (e.g. "Movie.AV1.mkv") whose actual codec ISN'T AV1,
+  # which reroutes it into this "fresh source" path instead of the existing-
+  # AV1 recheck path. Refuse outright rather than trying to enumerate every
+  # way this collision could occur upstream.
+  if [ "$(canonical_path "$src" 2>/dev/null || printf '%s' "$src")" = "$(canonical_path "$out" 2>/dev/null || printf '%s' "$out")" ]; then
+    err "Refusing to encode — computed output path is identical to the source, would destroy it: $src"
+    flag_bad_source_for_human "$src" "derived output path collides with source path (name/codec mismatch?) — needs manual rename/review"
+    return 1
+  fi
 
   skip_if_complete_canonical_output "$src" "$hb_dur" && return 0
 
@@ -7212,6 +7319,15 @@ try_x265_convert() {
   codec="$(video_codec "$src")"
   src_codec="$codec"
   ext="$(to_lower "${src##*.}")"
+
+  # See the matching guard in try_av1_convert -- same reasoning: a file named
+  # like our own output convention (e.g. "Movie.x265.mkv") whose actual codec
+  # isn't HEVC would otherwise compute an output path identical to itself.
+  if [ "$(canonical_path "$src" 2>/dev/null || printf '%s' "$src")" = "$(canonical_path "$out" 2>/dev/null || printf '%s' "$out")" ]; then
+    err "Refusing to encode — computed output path is identical to the source, would destroy it: $src"
+    flag_bad_source_for_human "$src" "derived output path collides with source path (name/codec mismatch?) — needs manual rename/review"
+    return 1
+  fi
 
   skip_if_complete_canonical_output "$src" "$hb_dur" && return 0
 
