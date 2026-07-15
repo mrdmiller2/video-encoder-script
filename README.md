@@ -64,7 +64,9 @@ lacks libvmaf, use a [BtbN static build](https://github.com/BtbN/FFmpeg-Builds/r
 
 ## Version progression
 
-Each release is a **new file** — prior scripts stay in the repo for reference:
+Each release is a **new file** — prior scripts stay in the repo for reference.
+The repo root holds the **current release** (`convert-v5.0.0.sh`) and the **last v4
+release** (`convert-v4.0.52.sh`); all earlier versions live in [`Old Versions/`](Old%20Versions/):
 
 | File | Version | Notes |
 |------|---------|--------|
@@ -118,7 +120,7 @@ Each release is a **new file** — prior scripts stay in the repo for reference:
 | `convert-v4.0.52.sh` | 4.0.52 | `--name-glob` / path trailing glob to filter large shelves (e.g. `American/A*`) |
 | `convert-v5.0.0.sh` | 5.0.0 | **Current** — ffmpeg engine, per-title VMAF-targeted CRF, DoVi→HDR10, functional HW probes, mount audit |
 
-When bumping version: copy the latest script to `convert-v{NEW}.sh`, update `VERSION` and `SCRIPT_NAME`, keep all older files. Do not rename or overwrite.
+When bumping version: copy the latest script to `convert-v{NEW}.sh`, update `VERSION` and `SCRIPT_NAME`, keep all older files (moving the superseded one into `Old Versions/`). Do not overwrite.
 
 ## Genesis
 
