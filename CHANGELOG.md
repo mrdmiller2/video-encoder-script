@@ -1,6 +1,6 @@
 # Changelog
 
-Detailed record of every bug found and fixed during the v5.0.9 → v5.0.15 hardening
+Detailed record of every bug found and fixed during the v5.0.9 → v5.0.16 hardening
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
@@ -41,6 +41,78 @@ turned out to be non-issues on inspection, and are not listed here.
      entirely. Fixed the filter option value.
 
   *(v5.0.15)*
+
+- **The v5.0.15 fix was necessary but not the complete permanent solution.**
+  After shipping it, three independent reviewers were each independently
+  asked (given the full current Dolby Vision/HDR code, with no cross-talk between
+  them) whether it was the right permanent fix for *all* Dolby Vision use cases.
+  All three converged on the same four remaining gaps:
+
+  1. **HLG content was unconditionally tagged as PQ.** Every `hdr=true` path
+     emitted `-color_trc smpte2084` / x265 `hdr10=1` regardless of whether the
+     source was actually PQ or HLG (`arib-std-b67`) — including plain HLG
+     content and DoVi profile 8.4 (HLG base layer). A player decoding real HLG
+     data with a PQ transfer curve gets crushed shadows and blown highlights.
+
+  2. **DoVi profile 8 was treated as a single case.** `dv_profile` reports `8`
+     for profile 8.1 (HDR10/PQ base — safe as previously handled), 8.2 (SDR
+     base), and 8.4 (HLG base) alike; it can't tell them apart. Profile
+     8.2/8.4 sources were being forced into an HDR/PQ encode they were never
+     mastered for.
+
+  3. **The exact bug class could recur silently.** If Dolby Vision side-data is
+     present but `source_dovi_profile()` can't parse a profile number (a
+     muxing quirk, or an older ffprobe), the code fell through to blind PQ
+     tagging with zero reconstruction — the identical failure shape that
+     produced the original Profile 5 tint, just triggered a different way.
+
+  4. **Hardware encode paths had no Dolby Vision handling at all.** Neither
+     `--prefer-hw` (NVENC/QSV/VAAPI/VideoToolbox) nor the AMD-specific VAAPI
+     HEVC path had any libplacebo-equivalent reconstruction step, or even any
+     HDR color-tagging. A Profile 5 source encoded via `--prefer-hw` would hit
+     the original tint bug today, on a supposedly-fixed script.
+
+  All three agreed the disc/BDMV HandBrake path's existing "flag for human
+  review" behavior for Profile 5 is fine as-is — Profile 5 is a
+  streaming-only profile that essentially never appears on physical discs,
+  and HandBrake has no equivalent reconstruction filter regardless.
+
+  **Fix:** replaced the ad hoc `hdr`-flag-plus-profile-check logic with a
+  single classifier, `determine_hdr_mode()`, used consistently everywhere an
+  HDR-related encoding or tagging decision is made. It returns one of:
+  - `pq` — plain HDR10, DoVi profile 7, or profile 8 with a PQ base layer.
+  - `pq_reconstruct` — DoVi profile 5 (no compatible base layer; needs
+    libplacebo RPU reconstruction; software-only).
+  - `hlg` — plain HLG, or DoVi profile 8 with an HLG base layer.
+  - `sdr` — no HDR handling needed (includes DoVi profile 8 with an SDR base
+    layer, e.g. 8.2 — an HDR/PQ encode would wash it out).
+  - `unknown` — Dolby Vision side-data present, but neither the profile
+    number nor the base layer's own transfer tag give a confident answer.
+    Never guessed; the caller flags the source for human review instead.
+
+  Profile 8's sub-variant is resolved by falling back to the base layer's own
+  `color_transfer` tag, since `dv_profile` alone can't distinguish 8.1/8.2/8.4.
+  All PQ-specific encoder tagging (SVT-AV1 `mastering-display`/`content-light`,
+  x265 `hdr10=1`/`master-display`/`max-cll`, and the ffmpeg output
+  `-color_trc`) is now conditioned on the resolved mode instead of applied
+  unconditionally to every `hdr=true` source. `--prefer-hw` and the AMD VAAPI
+  path now check the same classifier before dispatching: `pq_reconstruct`/
+  `unknown` sources gracefully fall back to software (which can actually do
+  the reconstruction) instead of silently producing wrong colors, and `pq`/
+  `hlg` sources now get correct output color tagging on the hardware path too
+  (previously: none at all, on any hardware path, HDR or not).
+
+  Verified with 13 classification test cases spanning every profile/
+  transfer-tag combination the reviewers raised (profile 5, 7, 8 with each of
+  PQ/HLG/SDR-implied base layers, unparseable profile with and without a
+  usable transfer tag, plain HDR10/HLG/SDR with no Dolby Vision at all), then
+  re-confirmed against the actual Godzilla (Profile 5 → `pq_reconstruct`) and
+  Clueless (Profile 8.1-style → `pq`) files. Writing the test cases by hand
+  caught a real inconsistency in the first draft of the classifier itself
+  (an unparseable-profile source with a clear PQ transfer tag was being
+  routed to `unknown` instead of trusting the tag) — fixed before shipping.
+
+  *(v5.0.16)*
 
 ## Source-file safety
 
