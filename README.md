@@ -10,6 +10,12 @@ Bash library organizer and batch transcoder for large home-media trees. Targets 
 
 **Current release:** `convert-v5.0.9.sh` (v5.0.9) — see [What's new in v5](#whats-new-in-v5)
 
+## Logic flow
+
+How a single library folder moves through the pipeline — finding, evaluation, encoding, organization:
+
+![convert-v5 signal flow: find, evaluate, encode, organize](docs/convert-v5-signal-flow.png)
+
 ## About this project
 
 I started this project back in 2024 because my video libraries were getting too large — I can't keep buying drives — and I wanted uniformity in file formats. After more than ten years of collecting, I needed a way to convert and let it run. HandBrakeCLI does a great job at conversion, but it takes too long to batch things by hand. And I like my data organized where possible.
