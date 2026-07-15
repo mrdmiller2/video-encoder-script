@@ -966,7 +966,11 @@ maybe_chown_for_media_user() {
   local f
   [ -n "$MEDIA_OWNER_USER" ] || return 0
   for f in "$@"; do
-    [ -n "$f" ] && [ -e "$f" ] && chown "$MEDIA_OWNER_USER:$MEDIA_OWNER_USER" "$f" 2>/dev/null || true
+    # Plain chown follows a symlink and re-owns whatever it points to. This
+    # only ever runs on our own outputs/sidecar files, which should never
+    # legitimately be symlinks -- skip rather than risk handing ownership of
+    # an unrelated real file (root running under sudo) to SUDO_USER.
+    [ -n "$f" ] && [ -e "$f" ] && [ ! -L "$f" ] && chown "$MEDIA_OWNER_USER:$MEDIA_OWNER_USER" "$f" 2>/dev/null || true
   done
 }
 
@@ -1103,12 +1107,31 @@ _cifs_mount_fresh() {
   [ "${CONVERT_CIFS_CREDENTIALS:-}" != "$credf" ] && temp_cred=true
   # `mount` can hang indefinitely against an offline/firewalled SMB host; if
   # the user interrupts (Ctrl-C) while it's hung, nothing after that point
-  # normally runs, orphaning the plaintext credentials file in /tmp. Trap
-  # covers that window specifically.
+  # normally runs, orphaning the plaintext credentials file in /tmp. These
+  # traps cover that window specifically -- but `trap ... SIG` is process-
+  # wide, not function-scoped, so setting it here would otherwise clobber
+  # whatever handler main() (or a caller) already had registered for the
+  # rest of the script's life. Save the prior handlers and restore them via
+  # a RETURN trap, which fires on every return path out of this function
+  # (including the early ones above) without needing to duplicate the
+  # restore call at each one.
+  local _saved_exit_trap _saved_int_trap _saved_term_trap
+  _saved_exit_trap="$(trap -p EXIT)"
+  _saved_int_trap="$(trap -p INT)"
+  _saved_term_trap="$(trap -p TERM)"
+  trap '
+    trap - RETURN
+    [ -n "$_saved_exit_trap" ] && eval "$_saved_exit_trap" || trap - EXIT
+    [ -n "$_saved_int_trap" ] && eval "$_saved_int_trap" || trap - INT
+    [ -n "$_saved_term_trap" ] && eval "$_saved_term_trap" || trap - TERM
+  ' RETURN
   # Guard re-checks temp_cred at fire time (not registration time) -- must
   # never delete the user's own CONVERT_CIFS_CREDENTIALS file if that's what
-  # $credf ended up pointing at instead of a generated temp file.
-  trap '[ "$temp_cred" = true ] && rm -f -- "$credf" 2>/dev/null' EXIT INT TERM
+  # $credf ended up pointing at instead of a generated temp file. INT/TERM
+  # re-exit afterward to preserve the normal "Ctrl-C actually stops the
+  # script" behavior (a custom trap otherwise suppresses that default).
+  trap '[ "$temp_cred" = true ] && rm -f -- "$credf" 2>/dev/null' EXIT
+  trap '[ "$temp_cred" = true ] && rm -f -- "$credf" 2>/dev/null; exit 130' INT TERM
 
   if [ "$(id -u)" -ne 0 ]; then
     sudo mkdir -p "$dst" 2>/dev/null || mkdir -p "$dst" 2>/dev/null || true
@@ -1246,11 +1269,36 @@ _job_root_is_writable() {
 _runtime_home() {
   local home="$HOME"
   if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
-    home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)"
+    # getent is glibc/Linux-only -- not present on macOS/BSD by default.
+    if command -v getent >/dev/null 2>&1; then
+      home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)"
+    fi
     # eval on a variable derived from the environment is a code-injection
     # vector (SUDO_USER='x$(payload)' would execute the payload under eval).
-    # Bash's own tilde expansion on a quoted variable is equivalent and safe.
-    [ -n "$home" ] || home="$(printf '%s' ~"$SUDO_USER" 2>/dev/null)"
+    # Bash tilde expansion (quoted OR unquoted) does NOT substitute a
+    # variable's value into the tilde-prefix position at all -- ~$VAR and
+    # ~"$VAR" both stay a literal, unexpanded "~value" string for ANY
+    # username, resolvable or not. That earlier "fix" was safe but silently
+    # never worked. dscl (macOS) or python3's pwd module do the same
+    # getpwnam-style lookup getent does, without eval and without relying on
+    # tilde expansion doing something it was never going to do.
+    if [ -z "$home" ] && [ "$PLATFORM" = macos ] && command -v dscl >/dev/null 2>&1; then
+      home="$(dscl . -read "/Users/$SUDO_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+    fi
+    if [ -z "$home" ] && command -v python3 >/dev/null 2>&1; then
+      home="$(python3 -c 'import pwd,sys
+try:
+    print(pwd.getpwnam(sys.argv[1]).pw_dir)
+except KeyError:
+    pass' "$SUDO_USER" 2>/dev/null)"
+    fi
+    if [ -z "$home" ]; then
+      if [ -d "/home/$SUDO_USER" ]; then
+        home="/home/$SUDO_USER"
+      elif [ -d "/Users/$SUDO_USER" ]; then
+        home="/Users/$SUDO_USER"
+      fi
+    fi
   fi
   [ -n "$home" ] || home="$HOME"
   printf '%s' "$home"
@@ -2982,6 +3030,24 @@ get_scan_roots() {
   fi
 }
 
+# These sidecar state/log files live at fixed, predictable names -- by
+# default directly inside JOB_ROOT (the media library root itself) unless
+# it's read-only. A symlink planted at one of these exact names (by another
+# fleet machine, another user on a shared NFS/CIFS mount, or by accident)
+# would have every subsequent truncating write in this script go straight
+# through to whatever it points at, e.g. a real source video. Since we own
+# the full lifecycle of these specific files (always created fresh, never
+# meant to pre-exist as anything but our own regular file from a prior run),
+# removing a stray symlink at one of these names is always safe -- rm on a
+# symlink only ever removes the link itself, never its target.
+_neutralize_symlink_sidecar_path() {
+  local p="$1"
+  if [ -L "$p" ]; then
+    warn "Sidecar path is a symlink, not our own regular file — removing the link only (target untouched) before use: $p"
+    rm -f -- "$p"
+  fi
+}
+
 resume_init_paths() {
   [ -n "$JOB_SIDECAR_DIR" ] || JOB_SIDECAR_DIR="$JOB_ROOT"
   RESUME_STATE_FILE="$JOB_SIDECAR_DIR/convert-v4.state"
@@ -2992,6 +3058,12 @@ resume_init_paths() {
   RECONVERT_FILES_LOG="$JOB_SIDECAR_DIR/reconvert_files.txt"
   RESUME_SHARDS_FILE="$JOB_SIDECAR_DIR/convert-v4.shards"
   RESUME_DONE_LOG="$JOB_SIDECAR_DIR/convert-v5.done"
+  local p
+  for p in "$RESUME_STATE_FILE" "$RESUME_QUEUE_FILE" "$MKV_STRUCTURE_CACHE_FILE" \
+           "$CORRUPT_FILES_LOG" "$BAD_SOURCES_LOG" "$RECONVERT_FILES_LOG" \
+           "$RESUME_SHARDS_FILE" "$RESUME_DONE_LOG"; do
+    _neutralize_symlink_sidecar_path "$p"
+  done
   filecache_init
 }
 
@@ -3564,6 +3636,7 @@ select_dominant_disk_title() {
 
 init_stats_log() {
   local ts
+  _neutralize_symlink_sidecar_path "$MASTER_LOG_FILE"
   ts="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
   {
     echo ""
@@ -4237,16 +4310,21 @@ label_mkv_tracks() {
   fi
   [ -f "$mkv" ] || return 0
 
-  CONVERT_MKVMERGE="${MKVMERGE_CMD[*]}"
-  CONVERT_MKVPROPEDIT="${MKVPROPEDIT_CMD[*]}"
+  # Joining with a plain space and re-splitting with Python's default
+  # .split() corrupts any command whose path contains a space (e.g. macOS
+  # "/Applications/MKVToolNix 88.app/.../mkvpropedit") into bogus argv
+  # fragments. \x1f (ASCII unit separator) never legitimately appears in a
+  # real path, so it round-trips exactly regardless of spaces in the path.
+  CONVERT_MKVMERGE="$(IFS=$'\x1f'; printf '%s' "${MKVMERGE_CMD[*]}")"
+  CONVERT_MKVPROPEDIT="$(IFS=$'\x1f'; printf '%s' "${MKVPROPEDIT_CMD[*]}")"
   export CONVERT_MKVMERGE CONVERT_MKVPROPEDIT
 
   python3 - "$mkv" "$src" "$title" <<'PY'
 import json, os, subprocess, sys
 
 mkv, src, title = sys.argv[1:4]
-mkvmerge = os.environ.get("CONVERT_MKVMERGE", "mkvmerge").split()
-mkvpropedit = os.environ.get("CONVERT_MKVPROPEDIT", "mkvpropedit").split()
+mkvmerge = os.environ.get("CONVERT_MKVMERGE", "mkvmerge").split("\x1f")
+mkvpropedit = os.environ.get("CONVERT_MKVPROPEDIT", "mkvpropedit").split("\x1f")
 
 LANG_NAMES = {
     "eng": "English", "chi": "Chinese", "jpn": "Japanese", "kor": "Korean",
@@ -4523,9 +4601,14 @@ validate_mkv_ffmpeg_stderr() {
 mkv_structure_cache_invalidate() {
   local dst="$1"
   local cache="${MKV_STRUCTURE_CACHE_FILE:-}"
+  local tmpf
   [ -n "$cache" ] && [ -f "$cache" ] || return 0
-  awk -F '\t' -v p="$dst" '$2!=p { print }' "$cache" >"${cache}.tmp" 2>/dev/null || true
-  mv -f "${cache}.tmp" "$cache" 2>/dev/null || true
+  # A static ".tmp" suffix is a fully predictable path -- mktemp gives a
+  # randomized name in the same directory, closing the symlink-race window
+  # a fixed name would otherwise leave (see filecache_put's cache_tmp).
+  tmpf="$(mktemp "${cache}.XXXXXX")" || return 0
+  awk -F '\t' -v p="$dst" '$2!=p { print }' "$cache" >"$tmpf" 2>/dev/null || true
+  mv -f "$tmpf" "$cache" 2>/dev/null || rm -f "$tmpf" 2>/dev/null
 }
 
 record_corrupt_mkv() {
@@ -4786,12 +4869,14 @@ mkv_structure_cache_hit() {
 mkv_structure_cache_store() {
   local dst="$1"
   local key cache="${MKV_STRUCTURE_CACHE_FILE:-}"
+  local tmpf
   [ -n "$cache" ] || return 0
   key="$(mkv_structure_stat_key "$dst")" || return 0
   mkdir -p "$(dirname "$cache")" 2>/dev/null || true
   if [ -f "$cache" ]; then
-    awk -F '\t' -v p="$dst" '$2!=p { print }' "$cache" >"${cache}.tmp" 2>/dev/null || true
-    mv -f "${cache}.tmp" "$cache" 2>/dev/null || true
+    tmpf="$(mktemp "${cache}.XXXXXX")" || return 0
+    awk -F '\t' -v p="$dst" '$2!=p { print }' "$cache" >"$tmpf" 2>/dev/null || true
+    mv -f "$tmpf" "$cache" 2>/dev/null || rm -f "$tmpf" 2>/dev/null
   fi
   printf '%s\t%s\n' "$key" "$dst" >>"$cache"
   maybe_chown_for_media_user "$cache"
@@ -6734,13 +6819,16 @@ filecache_put() {  # dir, nameref file-list array
   mtime="$(dir_subtree_max_mtime "$dir")"
   [ -n "$mtime" ] || return 0
   cache="$FILECACHE_DIR/$(_filecache_key "$dir").list"
-  # Write to a per-process temp file and rename into place atomically -- a
-  # direct `>"$cache"` write that's interrupted (crash, NFS hiccup, another
-  # fleet machine reading mid-write) can leave just the mtime header on
-  # disk. filecache_get() would then read that as a valid cache hit with an
-  # empty file list, silently treating every video in the folder as gone
-  # until the directory's mtime changes again.
-  local cache_tmp="${cache}.tmp.$$"
+  # Write to a temp file and rename into place atomically -- a direct
+  # `>"$cache"` write that's interrupted (crash, NFS hiccup, another fleet
+  # machine reading mid-write) can leave just the mtime header on disk.
+  # filecache_get() would then read that as a valid cache hit with an empty
+  # file list, silently treating every video in the folder as gone until the
+  # directory's mtime changes again. mktemp's randomized suffix (not just
+  # the PID) keeps this name unpredictable -- a PID alone is guessable/
+  # enumerable by another local process wanting to race a symlink into place.
+  local cache_tmp
+  cache_tmp="$(mktemp "${cache}.XXXXXX")" || return 0
   { printf '%s\n' "$mtime"; printf '%s\n' "${_files_ref[@]}"; } >"$cache_tmp" 2>/dev/null \
     && mv -f "$cache_tmp" "$cache" 2>/dev/null \
     || rm -f "$cache_tmp" 2>/dev/null
@@ -6839,9 +6927,11 @@ folder_marked_done() {  # dir -> 0 if a valid (non-stale) done-flag exists
 }
 
 mark_folder_inprogress() {
-  local dir="$1"
+  local dir="$1" flag
   [ "$DRY_RUN" = true ] && return 0
-  : >"$(folder_inprogress_flag_path "$dir")" 2>/dev/null || true
+  flag="$(folder_inprogress_flag_path "$dir")"
+  _neutralize_symlink_sidecar_path "$flag"
+  : >"$flag" 2>/dev/null || true
 }
 
 # Called after any per-file result is recorded (success, skip, or reject).
@@ -6889,7 +6979,9 @@ mark_folder_done_if_complete() {
     break
   done
   if [ "$still_pending" = false ]; then
-    : >"$(folder_done_flag_path "$dir")" 2>/dev/null || true
+    local done_flag="$(folder_done_flag_path "$dir")"
+    _neutralize_symlink_sidecar_path "$done_flag"
+    : >"$done_flag" 2>/dev/null || true
     rm -f "$(folder_inprogress_flag_path "$dir")" 2>/dev/null
     log "Folder complete — marked done, will be skipped on future runs: $dir"
   fi
@@ -6910,7 +7002,9 @@ mark_folder_done_if_complete() {
   esac
   if [ "$parent" != "$dir" ] && [ -d "$parent" ] && ! folder_marked_done "$parent"; then
     if _dir_subtree_all_video_files_done "$parent"; then
-      : >"$(folder_done_flag_path "$parent")" 2>/dev/null || true
+      local parent_done_flag="$(folder_done_flag_path "$parent")"
+      _neutralize_symlink_sidecar_path "$parent_done_flag"
+      : >"$parent_done_flag" 2>/dev/null || true
       rm -f "$(folder_inprogress_flag_path "$parent")" 2>/dev/null
       log "Folder complete — marked done, will be skipped on future runs: $parent"
     fi
@@ -7242,6 +7336,16 @@ try_av1_convert() {
     flag_bad_source_for_human "$src" "derived output path collides with source path (name/codec mismatch?) — needs manual rename/review"
     return 1
   fi
+  # A legitimate output from this script is always a plain regular file we
+  # create ourselves. If $out is a symlink -- to $src (already caught above
+  # via canonical_path), or to some OTHER real file entirely -- ffmpeg -y/
+  # HandBrake's -o would follow it and truncate/corrupt whatever it points
+  # to, which need not be related to this title at all.
+  if [ -L "$out" ]; then
+    err "Refusing to encode — output path is a symlink, not our own plain file: $out"
+    flag_bad_source_for_human "$src" "computed output path is an unexpected symlink — needs manual review before encoding"
+    return 1
+  fi
 
   skip_if_complete_canonical_output "$src" "$hb_dur" && return 0
 
@@ -7326,6 +7430,16 @@ try_x265_convert() {
   if [ "$(canonical_path "$src" 2>/dev/null || printf '%s' "$src")" = "$(canonical_path "$out" 2>/dev/null || printf '%s' "$out")" ]; then
     err "Refusing to encode — computed output path is identical to the source, would destroy it: $src"
     flag_bad_source_for_human "$src" "derived output path collides with source path (name/codec mismatch?) — needs manual rename/review"
+    return 1
+  fi
+  # A legitimate output from this script is always a plain regular file we
+  # create ourselves. If $out is a symlink -- to $src (already caught above
+  # via canonical_path), or to some OTHER real file entirely -- ffmpeg -y/
+  # HandBrake's -o would follow it and truncate/corrupt whatever it points
+  # to, which need not be related to this title at all.
+  if [ -L "$out" ]; then
+    err "Refusing to encode — output path is a symlink, not our own plain file: $out"
+    flag_bad_source_for_human "$src" "computed output path is an unexpected symlink — needs manual review before encoding"
     return 1
   fi
 
