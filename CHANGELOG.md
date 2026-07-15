@@ -1,6 +1,6 @@
 # Changelog
 
-Detailed record of every bug found and fixed during the v5.0.9 → v5.0.17 hardening
+Detailed record of every bug found and fixed during the v5.0.9 → v5.0.18 hardening
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
@@ -141,6 +141,66 @@ turned out to be non-issues on inspection, and are not listed here.
   unchanged; only the final permission bits are restored.
 
   *(v5.0.17)*
+
+## Performance
+
+- **Encode output now writes to a RAM-backed staging path instead of the
+  real (often NFS) destination during the encode itself.** Motivated by a
+  direct observation while testing the Plex-server fleet node: a `hard` NFS
+  mount (the correct choice for data-safety reasons) means a network hiccup
+  mid-write can block the writing process indefinitely, putting a live,
+  multi-minute CPU-bound encode at risk of stalling on something outside its
+  own control. Reads already tolerate this fine (retry, and FS-Cache already
+  caches repeat reads locally) — only the write side carried this risk.
+
+  Design, in order of preference:
+  1. **Discover** an already-mounted, sufficiently-sized RAM-backed
+     directory (`/tmp`, `/dev/shm`, `/mnt/ramdisk`, or an explicit
+     `CONVERT_RAMDISK_DIR` override) — true on every Linux/WSL fleet machine
+     surveyed (the primary workstation, WSL-LAPTOP, FEDORA-LAPTOP all already have a
+     suitably-sized tmpfs at `/tmp`).
+  2. **Create** one sized at `CONVERT_RAMDISK_PCT`% (default 40, adjustable)
+     of *available* memory at the moment it's needed — deliberately not a
+     percentage of total installed RAM, since the encoder process itself
+     needs real headroom on top of it (observed ~6GB RSS for a real Dolby
+     Vision `libplacebo` reconstruction encode; naively handing out 50% of
+     total RAM to the ramdisk on a small box could starve the encoder
+     itself). macOS has no built-in tmpfs, so creation there uses a genuine
+     `hdiutil`/`diskutil` RAM disk instead, verified working end-to-end.
+  3. **Fall back to direct-write** (the prior, unchanged behavior) if
+     neither applies, or if a pre-flight size-fit check says the estimated
+     output (source file size + 10% margin — output is almost always
+     smaller, but not reliably enough to skip the margin) wouldn't
+     comfortably fit in whatever candidate was found/created.
+
+  Deliberately does **not** attempt a live mid-encode rescue if a ramdisk
+  fills up unexpectedly (e.g. partially flushing and reassembling a
+  still-growing MKV) — a single actively-written Matroska file can't be
+  safely copied out from under ffmpeg without pausing writes, and the
+  container's seek head/cues aren't necessarily finalized until muxing
+  completes. A true segmented-and-reassembled approach exists (ffmpeg's
+  `segment` muxer + a watcher + `mkvmerge --append`) but multiplies the
+  failure surface considerably (segment ordering, timestamp/chapter/
+  subtitle continuity across the join) for a case the pre-flight check
+  already prevents in the first place. The `.IN_PROGRESS` semaphore and
+  per-folder logs stay on the source path throughout, unaffected — so other
+  fleet machines scanning the same library still see accurate in-progress
+  state regardless of where the actual write is happening.
+
+  Verified with 17 unit tests (tmpfs/RAM-disk detection per platform,
+  discovery ordering, size-fit math including the explicit-override edge
+  cases, staging-decision logic, and the finalize/move step including its
+  failure paths) plus a real end-to-end encode through the actual modified
+  script (not just the isolated helpers) confirming the full
+  stage → encode → finalize-move sequence. Caught one real bug before
+  shipping: the staging decision's own log messages were using `log()`
+  (stdout) instead of `log_err()` (stderr) inside a function whose stdout is
+  captured via command substitution by its caller — exactly the mistake the
+  codebase's own `log_err` comment already warns against — which would have
+  silently corrupted the returned staging path with log text prepended to
+  it. Fixed before shipping.
+
+  *(v5.0.18)*
 
 ## Source-file safety
 
