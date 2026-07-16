@@ -906,6 +906,43 @@ turned out to be non-issues on inspection, and are not listed here.
 
   *(v5.0.29)*
 
+## v5.0.30 — mkvalidator stalls indefinitely on large (20GB+) files
+
+  Running a fleet-wide performance test (6 machines, each encoding a unique
+  large ~20-27GB movie in parallel) surfaced a real bug: four of the six
+  machines (workstation, MAC-HOST, FEDORA-LAPTOP, WSL-LAPTOP — every one that had
+  mkvalidator installed) appeared stuck for 15+ minutes with no encode
+  progress. Investigation found `mkvalidator --quiet --no-warn` in a D-state
+  (uninterruptible I/O wait), reading the source file via extremely small
+  sequential reads — roughly 700 bytes per syscall, ~170KB/s effective
+  throughput observed via `/proc/<pid>/io`. At that rate a 20GB file would
+  take on the order of 35 hours to validate, before any encoding could even
+  start. Machines without mkvalidator installed (LINUX-VM-1, LINUX-VM-2, Plex
+  at the time) were unaffected, since `validate_source_media()`/
+  `validate_mkv_structure()` already fall back to the fast EBML/segment-bounds
+  check alone when the binary is absent — the bug only bites when mkvalidator
+  is present and the file is very large.
+
+  Fixed with a new `MKVALIDATOR_MAX_SIZE_BYTES` threshold (default 5 GiB,
+  `CONVERT_MKVALIDATOR_MAX_SIZE` env-overridable): above the threshold,
+  mkvalidator is skipped entirely and the EBML/segment-bounds check (which
+  already runs first, unconditionally, and is exactly what's relied on when
+  mkvalidator isn't installed) is treated as sufficient — logged clearly
+  rather than silently skipped. Applied at all three call sites that invoke
+  mkvalidator: `validate_source_media()`'s source-encode-time check, the
+  remux-repair verification path in `attempt_source_mkv_structure_remux()`,
+  and `validate_mkv_structure()`'s output-side check. This means mkvalidator
+  can stay installed fleet-wide (the user's stated preference — "mkvalidator
+  should be on all computers in the fleet") without breaking on large movie
+  libraries; TV episodes and anything else under the threshold get exactly
+  the same full structural validation as before.
+
+  Verified with a standalone threshold-logic test (a sparse 1GB file runs
+  mkvalidator normally; a sparse 6GB file is correctly skipped and falls back
+  to EBML-bounds-only) and `bash -n`.
+
+  *(v5.0.30)*
+
 ## Source-file safety
 
 The hard invariant throughout this project: **an original source video file must
