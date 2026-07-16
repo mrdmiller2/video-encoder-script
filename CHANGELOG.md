@@ -1,6 +1,6 @@
 # Changelog
 
-Detailed record of every bug found and fixed during the v5.0.9 → v5.0.24 hardening
+Detailed record of every bug found and fixed during the v5.0.9 → v5.0.25 hardening
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
@@ -658,6 +658,46 @@ turned out to be non-issues on inspection, and are not listed here.
   30-test staging suite (unaffected, still passing).
 
   *(v5.0.24)*
+
+## v5.0.25 — anime SVT-AV1 tuning aligned with community best practice
+
+  Triggered by the Rick and Morty comparison test above: the user provided
+  community-sourced SVT-AV1 best practices for anime (10-bit, preset 4/5,
+  CRF 24-28, `tune=0` for line-art sharpness, large keyframe interval).
+  Checked each against the current anime profile:
+
+  - Pixel format (`yuv420p10le`), preset (5), and keyframe interval
+    (`keyint=15s` + scene-cut detection, already more efficient than the
+    suggested 10s) were already aligned — no change needed.
+  - Confirmed this fleet runs mainline SVT-AV1 (bundled with ffmpeg), not
+    the SVT-AV1-PSY fork — `tune=3` (PSY-specific) isn't a valid option
+    here; only mainline's `tune=0`/`tune=1` apply.
+  - `tune=0` was **not** currently set (anime used SVT-AV1's un-tuned
+    default). This needed care: `tune=0` was already tried fleet-wide in
+    v5.0.0 and reverted in v5.0.4 after real Plex A/B playback testing found
+    it noticeably softer than the default — but that finding was against
+    **live-action TV content**, never re-validated against anime's flat-
+    color/line-art visual character, which the community consensus
+    specifically favors `tune=0` for. Added `tune=0` scoped *only* to the
+    anime SVT-AV1 params (both the primary `build_ffmpeg_video_args()` path
+    and `load_encoder_profile()`'s HandBrake-dispatch path) — movie and tv
+    profiles are untouched, keeping the already-validated live-action
+    behavior exactly as-is.
+  - Tightened the fixed-CRF fallback constants (`SVT_AV1_CQ_ANIME`,
+    `FIXED_CRF_SVT_ANIME`) from 35/32 down to 26, inside the recommended
+    24-28 range. These only affect the HDR/no-libvmaf/`--no-vmaf` fallback
+    path — the primary VMAF-targeted search picks its own CRF regardless
+    and was left alone, since it was already producing good results on
+    genuine hand-drawn anime sources in earlier fleet testing (only Western
+    CG-style content like Rick and Morty showed the poor-compression
+    behavior that motivated the `--profile` override in v5.0.23).
+
+  Verified via `bash -n` and the existing 30-test staging suite (unaffected,
+  still passing). Not yet validated with a real playback A/B test against
+  genuine anime content — recommended before treating `tune=0` as settled
+  for the anime profile the way the movie/tv default already is.
+
+  *(v5.0.25)*
 
 ## Source-file safety
 
