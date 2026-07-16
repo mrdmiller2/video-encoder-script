@@ -1,6 +1,6 @@
 # Changelog
 
-Detailed record of every bug found and fixed during the v5.0.9 → v5.0.23 hardening
+Detailed record of every bug found and fixed during the v5.0.9 → v5.0.24 hardening
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
@@ -616,6 +616,48 @@ turned out to be non-issues on inspection, and are not listed here.
   isolation.
 
   *(v5.0.23)*
+
+## v5.0.24 — sidecar/log files stuck at restrictive permissions
+
+  Reported after the fleet-wide Rick and Morty test: files (encoded outputs
+  and sidecars alike) were coming out with inconsistent, sometimes overly
+  restrictive permissions across the fleet's shared NFS library, where
+  different machines/user accounts write to the same files.
+
+  Two separate root causes, both stemming from the same `mktemp`-then-`mv`
+  atomic-write pattern used throughout the script (writes to a private temp
+  file, then `mv -f`'s it over the real path to close TOCTOU/symlink-race
+  windows established in earlier rounds):
+
+  1. `_restore_default_file_mode()` — the helper that's supposed to undo
+     `mktemp`'s forced `0600` after the swap — computed a *umask-derived*
+     mode (`0666 & ~umask`), typically landing on `644`. On a fleet shared
+     over NFS/CIFS across multiple machines and user accounts with no common
+     identity mapping, `644` still locks a file to whichever UID happened to
+     write it. Changed to unconditionally force `0666` (the most permissive
+     mode meaningful for a non-executable file — matching this project's own
+     CIFS mount policy of `file_mode=0777,dir_mode=0777` used elsewhere).
+
+  2. Several `mktemp`+`mv` call sites never called
+     `_restore_default_file_mode()` at all, so they silently stayed at
+     `mktemp`'s forced `0600` (owner-only) indefinitely: the folder in-
+     progress/done flags (`_safe_touch_empty_flag`), the per-title
+     `.IN_PROGRESS` semaphore, `write_queue_snapshot`/`resume_persist_state`
+     (the resume queue and state files), `build_shard_snapshot`'s output, the
+     multi-part-merge cache state file, and the scan-progress total file.
+     Added the missing restore call to every one. Also added an explicit
+     `chmod 0666` right after each continuously-appended log file's `exec
+     {FD}>>path` fd open (master/done/corrupt/bad-sources/reconvert/shard
+     logs) — these are created via a plain redirect (not `mktemp`), so they
+     were already respecting the umask rather than being stuck at `0600`,
+     but still weren't guaranteed permissive across different machines'
+     umask settings.
+
+  Verified with a direct test confirming `_safe_touch_empty_flag` now
+  produces a `666` file regardless of the process umask, plus the existing
+  30-test staging suite (unaffected, still passing).
+
+  *(v5.0.24)*
 
 ## Source-file safety
 
