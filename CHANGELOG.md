@@ -1,6 +1,6 @@
 # Changelog
 
-Detailed record of every bug found and fixed during the v5.0.9 → v5.0.26 hardening
+Detailed record of every bug found and fixed during the v5.0.9 → v5.0.27 hardening
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
@@ -731,6 +731,51 @@ turned out to be non-issues on inspection, and are not listed here.
   still passing).
 
   *(v5.0.26)*
+
+## v5.0.27 — anime sharpness, and correcting misinformation about tune values
+
+  The user surfaced a second piece of online guidance recommending `tune=2`
+  as an "animation" mode with a claimed "-tune animation" ffmpeg flag, and
+  citing `tune=3` for animation more generally. Checked both claims against
+  the same authoritative source used in v5.0.26 (SVT-AV1's own
+  `Parameters.md`) rather than accepting them:
+
+  - **`tune=2` is SSIM-metric tuning, not an animation mode.** The
+    documented enum is `0=VQ, 1=PSNR, 2=SSIM, 3=IQ (still-image only),
+    4=MS-SSIM, 5=VMAF` — nothing in the official reference describes any
+    value as "retaining flat geometries and high contrast." That claim
+    doesn't match the parameter's actual documented behavior.
+  - **`tune=3`/"animation" is real, but only in the SVT-AV1-PSY fork** —
+    already confirmed this fleet runs mainline SVT-AV1 (v5.0.25/26), where
+    `tune=3` means still-image IQ tuning, not animation.
+  - ffmpeg's `libsvtav1` wrapper has no top-level `-tune` flag at all (no
+    `"-tune animation"` string option exists for this codec the way it does
+    for libx264/libx265) — tune only goes through `-svtav1-params tune=N`,
+    numeric only.
+
+  **What *is* real and newly added:** `sharpness` (range -7 to 7, default
+  0, "bias towards decreased/increased sharpness" per the same authoritative
+  doc) — a genuine, previously-unused SVT-AV1 parameter that targets
+  line-art crispness more surgically than `tune=0`'s broader perceptual
+  optimization, without `tune=0`'s documented ringing-artifact caveat. Added
+  `sharpness=2` alongside (not instead of) `tune=0` in both anime SVT-AV1
+  param strings.
+
+  Also researched, at the user's request, whether to support the SVT-AV1-PSY
+  fork fleet-wide: confirmed VMAF-targeted search has zero compatibility
+  risk either way (`libvmaf` scores whatever file it's given regardless of
+  which SVT-AV1 variant produced it, and `ab-av1`/the internal search both
+  just shell out to system `ffmpeg`) — but PSY has no distro package for 4
+  of the fleet's 5 machines (only macOS/Homebrew has one), meaning a
+  from-source ffmpeg build-and-maintain burden on Fedora/Ubuntu/WSL2 hosts
+  with no confirmed quality win over mainline + the tuning already applied
+  here. Not pursued for now; revisit after real playback validates (or
+  doesn't) the current mainline tuning.
+
+  Verified via `bash -n` and the existing 30-test staging suite (unaffected,
+  still passing).
+
+  *(v5.0.27)*
 
 ## Source-file safety
 
