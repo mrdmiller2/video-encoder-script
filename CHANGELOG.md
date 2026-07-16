@@ -1,6 +1,6 @@
 # Changelog
 
-Detailed record of every bug found and fixed during the v5.0.9 → v5.0.20 hardening
+Detailed record of every bug found and fixed during the v5.0.9 → v5.0.21 hardening
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
@@ -414,6 +414,106 @@ turned out to be non-issues on inspection, and are not listed here.
   defaults.
 
   *(v5.0.20)*
+
+## v5.0.21 — fourth-round external re-audit: stale-review discipline + new gaps
+
+  A fourth round of the same three-way independent external re-audit, run after v5.0.20 shipped. This round's biggest lesson wasn't a
+  new bug class — it was a process failure that had to be caught before trusting
+  any of the three reports: **all three reviewers' "critical" findings were
+  against a stale copy** of the script in the repo clone that hadn't yet been
+  re-synced with the live working file's v5.0.20 fixes. Every one of those
+  "critical" findings — the fail-open staging fallback, the master-log
+  bypassing its own fd, the folder in-progress/done flags using check-then-
+  truncate, and the pipeline queue files' unguarded `rm`-then-recreate — was
+  already fixed. Confirmed by diffing the live working file directly rather
+  than trusting the reviewers' line numbers or quoted code at face value.
+
+  Genuinely new findings that survived that verification:
+
+  - **`label_mkv_tracks()` reopened the final output path by name for
+    `mkvpropedit` with no symlink check** (one reviewer). `mkvpropedit` edits its
+    target in place by reopening the path given to it — if the file at `$mkv`
+    had been swapped for a symlink in the window since
+    `optimize_mkv_for_streaming`'s `mv` last put a real file there, this step
+    would silently edit whatever the symlink pointed at (title, track names,
+    languages) rather than our own output. Since that target could be a real
+    source file elsewhere in the library, this was a genuine — if narrow —
+    path to violating the hard invariant. Fixed with an `[ -L "$mkv" ]` guard
+    immediately before the edit, matching the same defensive style already
+    used in `maybe_chown_for_media_user`.
+
+  - **`mkv_structure_cache_store()` and `build_shard_snapshot()` still had a
+    TOCTOU window despite already using the mv-into-place pattern.** Both
+    functions correctly rebuilt their sidecar file into a private `mktemp`
+    file and `mv`'d it into place — but then reopened the *same predictable
+    path a second time* for one final truncating write or append
+    (`>>"$cache"` / `: >"$out_file"` respectively), leaving a window between
+    the `mv` and that second reopen where a symlink raced into place would
+    get followed. Fixed by folding every write (the filtered old entries and
+    the new one) into the single private tempfile before one `mv` into place
+    — no second reopen-by-path exists anymore.
+
+  - **`source_dovi_profile()`'s bare, unguarded assignment could abort the
+    whole script under `pipefail`** (one reviewer) — `run_ffprobe ... | grep -E
+    '^[0-9]+$' | head -1` returns non-zero when `grep` finds no numeric
+    `dv_profile`, which is exactly the shape of source (Dolby Vision side-data
+    present, profile number unparseable) that the HDR classifier is supposed
+    to route to its "unknown, never guess" fallback rather than crash on.
+    Fixed by guarding both call sites with `|| dovi=""`; confirmed the empty
+    value still falls through to the classifier's existing catch-all case
+    correctly.
+
+  - **The three lower-frequency bookkeeping logs (`corrupt_files.txt`,
+    `bad_sources.txt`, `reconvert_files.txt`) were still only symlink-
+    neutralized once at init, then reopened by path on every append** — this
+    was previously accepted as lower-risk on the reasoning that "corrupting
+    these only breaks our own logs, not the user's media." Revisiting that
+    reasoning this round: it doesn't actually hold, since a symlink raced
+    into place at one of these predictable names could redirect the appended
+    text into *any* file the process can write, including a real source —
+    the same fd-based hardening already applied to the master/done logs was
+    extended to these three. The two scan-progress sidecars
+    (`convert-scan.total`, `convert-scan.done`) got the equivalent
+    private-tempfile/`mv` and `_safe_touch_empty_flag` treatment for the same
+    reason — they're `rm -f`'d at pipeline init but were being recreated via
+    a direct truncating `>`/`touch` later, the same gap already closed
+    elsewhere for the pipeline queue files.
+
+  - **Resource-leak hardening (not a source-safety bug, but worth closing):**
+    a `SIGINT`/`SIGTERM` mid-encode had no way to clean up the per-file
+    private local staging directory (the non-ramdisk fallback) — nothing else
+    would ever remove it, so repeated interrupted runs could strand
+    `.convert-stage-XXXXXX` directories on the destination filesystem
+    indefinitely (another reviewer). Added a global tracking variable
+    (`ACTIVE_LOCAL_STAGE_DIR`) set whenever that directory is created and
+    referenced from the signal handler for a best-effort cleanup.
+
+  **Self-caught bug worth recording:** the first draft of that last fix used a
+  bare `[ cond ] && action` as the final statement of `_cleanup_staged_file_dir`
+  — precisely the `set -e` landmine class this entire series of reviews has
+  been hunting elsewhere in the script. The existing unit-test suite caught it
+  immediately (a test run aborted mid-script instead of completing), and it
+  was rewritten as an explicit `if`/`fi`, which unlike the bare `&&` form
+  always returns exit status 0 when its condition is false. A repo-wide sweep
+  afterward confirmed no other instance of the same pattern was introduced
+  this round.
+
+  **Noted but not changed:** the root `chown` TOCTOU in
+  `maybe_chown_for_media_user` (check-then-chown, not atomic) was re-flagged
+  by one reviewer but is the same already-documented, already-reasoned-through
+  accepted risk as before — it only ever runs on our own just-created outputs,
+  and `chown` doesn't modify file content, so the blast radius is an ownership
+  change, not data loss or corruption. The WSL2 observation that RAM-disk
+  staging combined with a native Windows HandBrake binary forces I/O through
+  the 9P interop layer (another reviewer) is a real operational performance concern, not
+  a correctness or safety bug — left as a note for anyone tuning that specific
+  machine's config, not auto-fixed.
+
+  Verified via `bash -n`, the existing 30-test suite (all still passing after
+  each change), and a targeted regression test that caught the self-inflicted
+  `set -e` bug above before it ever shipped.
+
+  *(v5.0.21)*
 
 ## Source-file safety
 
