@@ -1,6 +1,6 @@
 # Changelog
 
-Detailed record of every bug found and fixed during the v5.0.9 → v5.0.27 hardening
+Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 hardening
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
@@ -776,6 +776,59 @@ turned out to be non-issues on inspection, and are not listed here.
   still passing).
 
   *(v5.0.27)*
+
+## v5.0.28 — split anime into anime (Japanese) + wanime (Western animation)
+
+  The Rick and Morty three-way comparison test (movie/tv vs. two rounds of
+  anime tuning) produced a consistent, striking result across all three
+  completed episodes: the anime profile's tuning (built around Japanese
+  hand-drawn line-art characteristics) made this content measurably *worse*
+  than even doing nothing special to it — one episode came out **larger
+  than its own source** (116.4% for E03) under the updated anime tuning,
+  versus 78.0% under the plain tv profile for the same episode. Research
+  independently confirmed the root cause, naming this exact content:
+  "for shows like South Park and Rick and Morty, film grain should be
+  disabled... for animation, CGI... where synthesized grain would look
+  unnatural." Western flat/vector-style digital ink-and-paint animation is
+  visually a distinct content class from Japanese hand-drawn anime, and the
+  single "anime" profile was applying line-art-oriented tuning
+  (film-grain synthesis, variance-boost) to both indiscriminately.
+
+  Added a fourth profile, `wanime`, alongside movie/tv/anime:
+
+  - **`anime` keeps its existing name and behavior unchanged** (Japanese-
+    style, auto-detected via `/Anime/` library paths) — no renaming churn,
+    already validated this session.
+  - **`wanime` has no path-based auto-detection at all** — Western
+    animation lives mixed inside ordinary `/Television/` folders with no
+    reliable folder-naming convention to key off, the same reasoning that
+    motivated `--profile` in the first place. `--profile wanime` is the
+    only way to select it, ever; `uses_wanime_profile()` is a pure
+    `FORCE_PROFILE` check, no path logic.
+  - **wanime's tuning is deliberately close to movie/tv's plain settings**
+    (film-grain implicitly off, since it's never set — matching the
+    documented film-grain=0 guidance for this content) plus `sharpness=2`
+    (not `tune=0`): flat vector art has the sharpest, highest-contrast
+    edges of any content type here, exactly where `tune=0`'s documented
+    ringing-artifact risk is most acute, so the more surgical `sharpness`
+    knob was chosen instead for the crispness goal.
+  - New independently-tunable constants (`SVT_AV1_CQ_WANIME`,
+    `NVENC_AV1_CQ_WANIME`, `FIXED_CRF_SVT_WANIME`, `FIXED_CRF_X265_WANIME`,
+    `VMAF_TARGET_WANIME`) and `wanime` added to `--profile`'s valid values,
+    `bakeoff_profile_key()`'s cache classes, `fixed_crf_for()`'s and
+    `resolve_crf_for_encode()`'s signatures, `build_ffmpeg_video_args()`'s
+    svtp branch, `load_encoder_profile()`'s HandBrake-dispatch branch, and
+    `process_video()`'s logging.
+
+  Verified with 11 new isolated unit tests (wanime never auto-detects;
+  `--profile wanime` overrides anime/tv/movie regardless of path, including
+  on genuine `/Anime/` paths; `--profile movie|tv|anime` never trigger
+  wanime), the existing 30-test staging suite (unaffected), and a real
+  end-to-end dry-run + encode confirming `Processing (wanime movie)` and
+  the correct `sharpness=2`-only (no film-grain/variance-boost/tune=0)
+  SVT-AV1 param string in the live ffmpeg command.
+
+  *(v5.0.28)*
 
 ## Source-file safety
 
