@@ -1,6 +1,6 @@
 # Changelog
 
-Detailed record of every bug found and fixed during the v5.0.9 → v5.0.22 hardening
+Detailed record of every bug found and fixed during the v5.0.9 → v5.0.23 hardening
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
@@ -584,6 +584,38 @@ turned out to be non-issues on inspection, and are not listed here.
   crf=NN, tv)` in the live log output.
 
   *(v5.0.22)*
+
+## v5.0.23 — manual override for movie/tv/anime profile classification
+
+  Reported immediately after v5.0.22 shipped: `/mnt/BabyBear/Media/Television/
+  American` contains adult animation (e.g. shows like South Park, Rick and
+  Morty) mixed in with live-action TV — content the path-based `tv`/`anime`
+  detection added in v5.0.22 can't tell apart, since both sit under the same
+  `/Television/American/` folder. Path-only classification has no way to
+  know which specific titles are actually animated.
+
+  Added `--profile movie|tv|anime`, which overrides auto-detection entirely
+  for the whole run — point it directly at the specific animated show's
+  folder with `--profile anime` (or the reverse: force `--profile tv`/`movie`
+  on a folder that would otherwise misclassify). Invalid values are rejected
+  immediately (`--profile must be movie, tv, or anime`) rather than silently
+  falling through to auto-detection.
+
+  Implementation: a new `FORCE_PROFILE` global, checked first thing inside
+  both `uses_anime_profile()` and `uses_tv_profile()` — when set, it's the
+  sole answer, path detection is skipped entirely; when unset (the default),
+  behavior is byte-for-byte identical to v5.0.22.
+
+  Verified with 10 new unit tests (all three override values against both
+  Television and Anime paths, confirming the override always wins over the
+  path, and that the unset/default case is unaffected) plus a real end-to-end
+  encode: a source file placed in a synthetic `/Television/American/` folder,
+  run with `--profile anime`, produced `ffmpeg encode (av1 crf=44, anime)` in
+  the live log — confirming the override reaches all the way through to the
+  actual encoder dispatch, not just the classification functions in
+  isolation.
+
+  *(v5.0.23)*
 
 ## Source-file safety
 
