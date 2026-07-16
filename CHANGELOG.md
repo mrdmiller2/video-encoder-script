@@ -830,6 +830,82 @@ turned out to be non-issues on inspection, and are not listed here.
 
   *(v5.0.28)*
 
+## v5.0.29 — fixed the real cause of anime bloat, added a fifth profile (vintage)
+
+  Before starting a new test round, researched optimal ffmpeg/SVT-AV1/x265
+  settings across all content profiles (primary sources: SVT-AV1's own
+  `Parameters.md`, x265's own docs, VMAF industry literature, plus
+  independent second opinions from two other reviewers). That research
+  led to finding the actual root cause of v5.0.28's Rick and Morty bloat —
+  not a tuning problem, a search/encode consistency bug:
+
+  - **The bug:** `vmaf_crf_search_abav1()` and the internal
+    `_vmaf_score_one()` search both encoded probe samples with only the
+    *base* svtav1-params (`enable-qm=1:qm-min=0`), never the profile's extra
+    params (film-grain, variance-boost, tune, sharpness). The final encode
+    then applied those extras at the *same* CRF the search chose. Since
+    film-grain synthesis and variance-boost both spend real bits, the final
+    file grew past what the search predicted at that CRF — exactly the shape
+    of E03's 116.4%-of-source result.
+  - **The fix:** extracted one `svtav1_profile_extras()` function (anime /
+    wanime / vintage extras) shared by both `build_ffmpeg_video_args()`
+    (final encode) and the search path, so the CRF chosen is always
+    calibrated against what the final encode will actually spend.
+  - **A second, independent problem for grain-using profiles:** synthesized
+    AV1 film grain is applied pseudo-randomly at decode time and doesn't
+    align pixel-for-pixel with the source, which corrupts VMAF scoring
+    during the search (confirmed against an ab-av1 GitHub issue, #139, that
+    remains open/unfixed as of the installed 0.11.4 — ab-av1 has no way to
+    disable synthesized-grain decode during its own internal VMAF scoring).
+    Fix: any AV1 profile using real film-grain synthesis (anime, and the new
+    vintage profile) now always uses the internal search
+    (`vmaf_crf_search_internal`), which decodes probe encodes with
+    `-export_side_data film_grain` before scoring so libvmaf sees the true
+    encoded quality rather than synthesized-grain noise. Non-grain profiles
+    (movie/tv/wanime) still prefer ab-av1 when installed, now with their
+    extras passed through via repeated `--svt key=value` flags so that
+    search stays consistent with the final encode too.
+
+  **New fifth profile: `vintage`**, for old/grainy live-action masters (film
+  scans, older TV masters with real photochemical grain) — manual-only via
+  `--profile vintage`, never auto-detected, same reasoning as wanime
+  (no reliable folder-naming convention for "old and grainy"). Unlike
+  movie/tv/wanime, film-grain synthesis is deliberately re-enabled: research
+  and community/streaming-industry guidance is that grain synthesis on
+  genuinely grainy sources can save on the order of 50% bitrate versus
+  literally re-encoding real grain as detail, since the encoder denoises to
+  a clean base layer and the decoder regenerates matching-looking grain.
+  SVT-AV1 params: `film-grain-denoise=1:film-grain=12:enable-tf=1:
+  enable-variance-boost=1:variance-boost-strength=2:variance-octile=4:
+  tune=0:sharpness=1` — lighter `sharpness`/`variance-boost-strength` than
+  anime's, and `enable-tf=1` (not anime's `0`) since live-action doesn't have
+  hand-drawn-frame smearing risk from temporal filtering. x265 fallback uses
+  `tune=grain`, a real x265 tune value (confirmed against x265's own docs)
+  distinct from anime's `tune=animation`. New independently-tunable
+  constants throughout (`SVT_AV1_CQ_VINTAGE`, `NVENC_AV1_CQ_VINTAGE`,
+  `FIXED_CRF_SVT/X265_VINTAGE`, `VMAF_TARGET_VINTAGE`) and `vintage` wired
+  into every profile-aware function (`--profile`, `uses_vintage_profile()`,
+  `bakeoff_profile_key()`, `vmaf_target_for_source()`, `fixed_crf_for()`,
+  `load_encoder_profile()`, `build_ffmpeg_video_args()`, `ffmpeg_encode()`,
+  `process_video()`).
+
+  Design and specific parameter values were cross-checked via
+  independent second opinions before implementation. One
+  factual claim surfaced in that research — that SVT-AV1's `tune=2` is
+  "VMAF tuning" — was caught and rejected against SVT-AV1's own
+  `Parameters.md` (the documented enum is `0=VQ, 1=PSNR, 2=SSIM, 3=IQ,
+  4=MS-SSIM, 5=VMAF`; `tune=2` is SSIM, `tune=5` is VMAF), consistent with
+  this project's standing practice of verifying secondary claims against
+  primary sources before acting on them.
+
+  Verified with 24 new isolated unit tests (`uses_vintage_profile()`
+  manual-only behavior; `svtav1_profile_extras()` exact strings per profile;
+  `svtav1_profile_uses_grain_synthesis()` correctness; `vmaf_target_for_source()`
+  and `fixed_crf_for()`'s new 6-argument signature), the existing 30-test
+  and 11-test staging suites (unaffected, still passing), and `bash -n`.
+
+  *(v5.0.29)*
+
 ## Source-file safety
 
 The hard invariant throughout this project: **an original source video file must
