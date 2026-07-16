@@ -1,6 +1,6 @@
 # Changelog
 
-Detailed record of every bug found and fixed during the v5.0.9 → v5.0.21 hardening
+Detailed record of every bug found and fixed during the v5.0.9 → v5.0.22 hardening
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
@@ -514,6 +514,76 @@ turned out to be non-issues on inspection, and are not listed here.
   `set -e` bug above before it ever shipped.
 
   *(v5.0.21)*
+
+## v5.0.22 — TV shows get their own encoder profile
+
+  A fleet-wide smoke test (one small real source file per machine, all 5:
+  workstation, WSL-LAPTOP, MAC-HOST, FEDORA-LAPTOP, Plex) surfaced two follow-on items,
+  neither a bug in the shipped v5.0.21 code but both worth fixing while the
+  topic was fresh.
+
+  **Profile detection is source-path-only, verified.** The test setup itself
+  (copying files into a scratch dir with no `/Anime/` segment) initially
+  produced a false alarm — every run used the generic movie profile even
+  though the content was genuine anime. Traced through every call site of
+  `uses_anime_profile`/`is_tv_episode`/`load_encoder_profile`/
+  `bakeoff_profile_key`/`pick_av1_encoder`: all of it keys off `$src`, the
+  real original source path, threaded consistently from the initial file
+  scan through the encoder dispatch and bake-off logic. The ramdisk/local
+  staging path (`resolve_encode_stage_path`) is a completely separate
+  mechanism that only decides where output bytes get written during the
+  encode — it was never involved in any classification decision. Once the
+  test paths were corrected to include an `Anime` segment, all 5 machines
+  correctly activated the anime profile (`ffmpeg encode (av1 crf=NN,
+  anime)`), confirming the existing behavior was already correct.
+
+  **TV shows previously shared the movie profile with no way to diverge.**
+  Non-anime TV content (`/Television/`, `/TV/`, `/TV Shows/`, `/Series/`)
+  fell through to the exact same encoder tuning as theatrical movies — there
+  was no distinct profile to independently tune even if a reason arose
+  later. Added a third named profile, `tv`, parallel to how `anime` already
+  works:
+
+  - `uses_tv_profile()` — path-based (like `uses_anime_profile`), not
+    filename-episode-pattern based (`is_tv_episode` has false-positive
+    shapes, e.g. a movie title ending "... 2", that are fine for cosmetic
+    logging but too risky to drive actual encode-tuning decisions). Anime
+    always takes precedence, since `is_tv_library_path` also matches
+    `/Anime/` paths (anime libraries are laid out the same way).
+  - New independently-configurable quality knobs: `SVT_AV1_CQ_TV`,
+    `NVENC_AV1_CQ_TV`, `FIXED_CRF_SVT_TV`, `FIXED_CRF_X265_TV`, and
+    `VMAF_TARGET_TV` (new `--vmaf-target-tv N` flag / `CONVERT_VMAF_TARGET_TV`
+    env var, mirroring the existing `--vmaf-target-4k` pattern). All default
+    to the exact same numeric values as the movie profile — there's no
+    empirical basis yet to diverge, unlike anime's flat-color/line-art
+    content, which has an established rationale for `tune=animation` and
+    film-grain synthesis. The infrastructure now exists to tune TV
+    independently later without touching movies.
+  - `load_encoder_profile()`, `fixed_crf_for()`, `resolve_crf_for_encode()`,
+    `vmaf_target_for_source()`, and `bakeoff_profile_key()` all updated to
+    recognize the three-way movie/tv/anime split consistently.
+  - `is_tv_library_path()` also now accepts a bare `TV` top-level folder name
+    as a variant of `Television` (both were already accepted alongside `TV
+    Shows`/`Series`/`Anime`).
+
+  **Self-caught bug in this round's own first draft:** an early version used
+  `[ "$anime" = true ] || uses_tv_profile "$src" && tv=true` to derive the tv
+  flag inside `resolve_crf_for_encode()`. Bash's `&&`/`||` are left-
+  associative with *equal* precedence, so this parses as `([ anime ] ||
+  uses_tv_profile) && tv=true` — not the intended `anime || (tv_check &&
+  set)` — meaning `tv` would have incorrectly been set to `true` whenever
+  content was anime too. Caught before shipping and rewritten as an explicit
+  `if`/`fi`.
+
+  Verified with 18 new isolated unit tests (9 covering `uses_tv_profile`/
+  `uses_anime_profile` path classification and mutual exclusivity across
+  `Television`/`TV`/`TV Shows`/`Series`/`Anime`/plain-movie paths, 9 covering
+  `fixed_crf_for`/`vmaf_target_for_source` constant selection), the existing
+  30-test staging suite (unaffected, still passing), and a real end-to-end
+  encode against a `/Television/`-path source confirming `ffmpeg encode (av1
+  crf=NN, tv)` in the live log output.
+
+  *(v5.0.22)*
 
 ## Source-file safety
 
