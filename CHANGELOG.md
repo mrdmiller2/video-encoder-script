@@ -1,6 +1,6 @@
 # Changelog
 
-Detailed record of every bug found and fixed during the v5.0.9 → v5.0.18 hardening
+Detailed record of every bug found and fixed during the v5.0.9 → v5.0.19 hardening
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
@@ -201,6 +201,95 @@ turned out to be non-issues on inspection, and are not listed here.
   it. Fixed before shipping.
 
   *(v5.0.18)*
+
+- **v5.0.18's ramdisk staging had two real symlink/TOCTOU gaps against the
+  hard source-safety invariant, found by an explicit three-way independent
+  external re-audit requested specifically
+  because "more changes were done" to a security-sensitive area.** All
+  three reviewers were given the actual new code and asked, directly: does
+  this satisfy "the original source is never touched," and is it safe to
+  run in production. Two of the three independently converged on the same
+  two blocking findings (the third reviewer's response was largely
+  positive but did not surface these two — convergence across the other
+  two, both citing the identical code paths, was treated as a strong
+  signal these were real rather than a single reviewer's false positive):
+
+  1. **Predictable staged path in a shared directory.** `resolve_encode_
+     stage_path` built its per-file staged path as `$RAMDISK_JOB_DIR/
+     .convert-stage.$$.basename` — a plain string directly inside
+     `RAMDISK_JOB_DIR`, which in the common (discovered) case is a shared,
+     world-writable system location like `/tmp`. Since the PID and output
+     basename are both either predictable or directly observable (`ps`,
+     directory listing), another local user or process could pre-create a
+     symlink at that exact path pointing anywhere — including at an
+     original source file — before the encode started. `ffmpeg -y ... "$dst"`
+     opens its output path by name and follows symlinks, so it would
+     write/truncate straight through to whatever the symlink pointed at.
+  2. **TOCTOU in the finalize/move step.** `finalize_staged_encode_output`
+     created a temp file with `mktemp "${final_dst}.stageXXXXXX"` (fine —
+     unpredictable, atomically created), but then *reopened that same path
+     by name* via `cp "$staged" "$tmp_on_dst"` to actually write the
+     content into it. Between the `mktemp` call and the `cp` call, another
+     writer with access to the destination directory could swap that name
+     for a symlink; `cp` would follow it on the next write.
+
+  Neither issue requires an untrusted local user on this specific fleet
+  today to be worth fixing — the whole point of the hard invariant, already
+  established over 5+ prior audit rounds of this codebase, is defending
+  against exactly this class of scenario even when it currently seems
+  unlikely, because "currently seems unlikely" is precisely how this
+  project's very first security rounds described the bugs they later found
+  and fixed.
+
+  **Fix:** replaced every predictable-path construction with a private,
+  `mktemp -d`-created, mode `0700` directory — one per job for staging
+  during the encode itself (`RAMDISK_JOB_STAGE_DIR`, created once in
+  `ramdisk_job_start` alongside the outer ramdisk resolution), and one
+  freshly created per call inside `finalize_staged_encode_output` for the
+  copy-into-place step. An unpredictable name plus owner-only permissions
+  means there is nothing left for another local actor to usefully race
+  against, even if they could guess the PID and filename exactly. This
+  closes the vulnerability class rather than patching the specific
+  reported instances of it.
+
+  Also fixed, from the same review round (none individually blocking, but
+  each a real gap):
+  - `CONVERT_RAMDISK_DIR` is now validated as genuinely tmpfs-backed (the
+    same `_is_tmpfs_dir` check every other candidate goes through) instead
+    of being trusted merely for existing and having free space — a
+    misconfigured override could otherwise have silently redirected
+    staging onto a normal disk, or worse an NFS/CIFS path, widening the
+    same symlink attack surface findings 1–2 already closed.
+  - macOS's stale-ramdisk detection had a loose fallback (`mount | grep`
+    for *any* mount at `/Volumes/ConvertRAMDisk`) that could misidentify
+    and eject an unrelated volume a user happened to mount at that exact
+    name. Removed; detection now relies solely on the existing positive
+    Virtual-Interface check.
+  - Linux's owned-resource detection used `findmnt --target`, which
+    reports the filesystem *containing* a path, not whether that path is
+    itself a mountpoint — since `/run` is already tmpfs on Fedora, a stale
+    plain (never separately mounted) leftover directory could be
+    misclassified as "mounted." Now requires an exact mountpoint match
+    (`mountpoint -q` / `findmnt --mountpoint`) before treating it as ours.
+  - `finalize_staged_encode_output`'s final `mv` wasn't checked for
+    failure — a failed move (disk full, permission issue) would still run
+    the cleanup steps and report success, silently discarding the only
+    completed copy of a successful encode. Now explicitly checked, and on
+    failure the staged copy is deliberately preserved for manual recovery
+    instead of being deleted.
+  - `ramdisk_job_start` now returns immediately during `--dry-run` (a
+    reviewer-suggested optimization — dry-run never actually encodes, so
+    creating/clearing a ramdisk for it was pure overhead).
+
+  Verified with 20 unit tests, including direct regression tests that
+  replicate the exact symlink pre-plant and TOCTOU scenarios both
+  reviewers described (a pre-planted symlink at the *old* predictable
+  path/pattern is confirmed to never be touched by the new code), plus
+  real end-to-end encodes on both the primary workstation (Linux, discovered
+  `/tmp`) and MAC-HOST (macOS, created-and-torn-down RAM disk)
+  confirming the fully hardened stage → encode → finalize path.
+
+  *(v5.0.19)*
 
 ## Source-file safety
 
