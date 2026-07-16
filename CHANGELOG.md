@@ -1,6 +1,6 @@
 # Changelog
 
-Detailed record of every bug found and fixed during the v5.0.9 → v5.0.25 hardening
+Detailed record of every bug found and fixed during the v5.0.9 → v5.0.26 hardening
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
@@ -698,6 +698,39 @@ turned out to be non-issues on inspection, and are not listed here.
   for the anime profile the way the movie/tv default already is.
 
   *(v5.0.25)*
+
+## v5.0.26 — anime film-grain aligned with SVT-AV1's own documented range
+
+  A deeper research pass (fetching SVT-AV1's own `Parameters.md` from its
+  GitLab repo, rather than relying on secondary summaries) turned up a real
+  mismatch: the anime profile's `film-grain=12` was well above SVT-AV1's own
+  documented guidance of **4-6 for 2D animation**. Lowered to `6` in both
+  code paths (the primary `build_ffmpeg_video_args()` softare path and
+  `load_encoder_profile()`'s HandBrake-dispatch path).
+
+  Also confirmed against the authoritative parameter reference (not a blog
+  summary): mainline SVT-AV1's `tune` only has meaningful values 0 (VQ) and
+  1 (PSNR) for our purposes (higher values are SSIM/IQ/MS-SSIM/VMAF tuning
+  modes, mostly still-image-oriented or requiring specific downstream
+  pipelines we don't use) — confirms the v5.0.25 finding that `tune=3`
+  (PSY-fork-specific) was never applicable here. `enable-variance-boost`,
+  `enable-overlays`, `scd`, and `enable-tf=0` were all already correctly
+  configured against the reference docs; `aq-mode=2` was found to be
+  redundant (already SVT-AV1's own default) but harmless, left as explicit
+  documentation of intent rather than removed.
+
+  One caveat surfaced by a secondary (non-SVT-AV1) source, noted in a code
+  comment rather than acted on: `tune=0`'s psycho-visual optimizer can
+  reportedly ring around strong edges in flat-color animation — exactly the
+  line-art scenario this tuning targets. Deliberately not hedged against
+  here (e.g. by reverting to `tune=1`) without evidence specific to this
+  script's own anime content; needs a real playback A/B test to judge
+  rather than a defensive guess.
+
+  Verified via `bash -n` and the existing 30-test staging suite (unaffected,
+  still passing).
+
+  *(v5.0.26)*
 
 ## Source-file safety
 
