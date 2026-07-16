@@ -1,6 +1,6 @@
 # Changelog
 
-Detailed record of every bug found and fixed during the v5.0.9 → v5.0.19 hardening
+Detailed record of every bug found and fixed during the v5.0.9 → v5.0.20 hardening
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
@@ -290,6 +290,130 @@ turned out to be non-issues on inspection, and are not listed here.
   confirming the fully hardened stage → encode → finalize path.
 
   *(v5.0.19)*
+
+- **v5.0.19's fix only covered the software-ffmpeg encode path -- a full-
+  script re-audit (three independent reviewers again, this time asked
+  to review the entire ~8900-line file rather than just the ramdisk
+  section) found the same class of symlink/TOCTOU gap in every OTHER
+  encoder invocation, plus several independent findings in sidecar-file
+  handling and `set -e` correctness.** All three reviewers were pointed at
+  the file directly (an earlier attempt embedding the full script inline in
+  the CLI argument hit the OS's ARG_MAX limit) and asked to find anything
+  new beyond what v5.0.19 already fixed.
+
+  **Critical -- direct encoder writes outside the software-ffmpeg path.**
+  `ffmpeg_encode` was the only function routed through `resolve_encode_
+  stage_path`/`finalize_staged_encode_output`. `ffmpeg_encode_hw` (hardware
+  NVENC/QSV/VAAPI/AMF/VideoToolbox), `handbrake_encode`, `vaapi_hevc_encode`
+  (AMD VCN), and `remux_copy_to_mkv` all still opened the final, predictable
+  output path directly. The caller's `[ -L "$out" ]` check is a one-time
+  snapshot taken *before* the bake-off/VMAF-search/encode itself runs --
+  easily minutes -- leaving a real window for another writer with access to
+  the destination directory to swap that path for a symlink before the
+  encoder actually opens it. Fixed by extending the same private-staging
+  model (a job's encode writes to an unpredictable, mode-0700 directory,
+  then gets moved into place afterward) to all four of these paths.
+
+  **Critical -- the multi-part merge had the identical gap.**
+  `ensure_multipart_merge`'s one-time `_neutralize_symlink_sidecar_path`
+  check on `$merged`/`$state`, followed later by `mkvmerge -o "$merged"`
+  opening that same predictable path directly, had the same check-then-use
+  race. Fixed by merging into a private `mktemp -d` sibling directory,
+  validating the result there, then moving both the merged file and its
+  cache-state sidecar into place.
+
+  **High -- `optimize_mkv_for_streaming`'s "unpredictable name" wasn't
+  actually enough.** Its `mktemp`-created temp file had an unguessable
+  name, but lived in the same shared, often world-writable media directory
+  as everything else -- an attacker doesn't have to *guess* the name if
+  they can just watch the directory (e.g. via `inotify`) and react the
+  instant the file appears, before `mkvmerge -o` reopens it by pathname a
+  moment later. A mode-0700 private directory closes this regardless of
+  whether the name itself is predictable, since only this UID can even
+  list the directory's contents.
+
+  **High -- several predictable sidecar files had the same one-time-check-
+  then-repeatedly-reopen-by-path pattern**, most notably the
+  `.convert-v4.IN_PROGRESS` semaphore (`cat >"$flag"` after an earlier
+  `[ -L "$flag" ]` check, with real time between the two), plus
+  `resume_persist_state`, `write_queue_snapshot`, and the pipeline's
+  ready-item queue. Fixed with two different patterns depending on write
+  frequency: infrequent whole-file writes (state, queue snapshot, the
+  in-progress flag) now build their content in a private `mktemp`'d file
+  and `mv` it into place -- `mv`/`rename()` replaces whatever sits at the
+  destination, including a symlink, directly and atomically, without ever
+  following it. Continuously-appended files (the master log, shard logs,
+  and the done-log) now open a file descriptor *once*, at path-resolution
+  time (right after the existing one-time symlink check), and write
+  through that same fd for the rest of the run instead of reopening the
+  path by name on every single log line -- a file descriptor refers to the
+  underlying inode directly and is immune to the path later being replaced
+  by something else, closing the window for the file's entire lifetime
+  after that one initial (checked) open.
+
+  **Medium -- `done_log_load` had a `set -e` correctness bug matching the
+  exact class found (and, it turns out, only partially understood) in
+  v5.0.18: not every bare `[ cond ] && action` is dangerous under `set -e`
+  -- only when it is the *last statement* of a function that is itself
+  invoked as a bare, non-if/while/&&/||-guarded statement all the way up
+  the call chain, since the function's own return value then becomes that
+  statement's truthiness.** `done_log_load`'s last line was exactly this
+  shape (`[ "$n" -gt 0 ] && log ...`), called bare through `resume_prepare_
+  convert` from `main()`. Whenever the done-log file existed but happened
+  to have zero matching `done`/`skip` entries, the function's implicit
+  "false" return silently aborted the entire script at startup, before any
+  conversion work happened. A hand-written test replicating the exact
+  shape (last-statement-in-function, called bare from a non-exempt
+  context) confirmed the mechanism and the fix; a broader sweep for the
+  identical shape elsewhere in the file found no other instances.
+
+  **Medium -- unguarded pipeline command substitutions under `pipefail`.**
+  A related but distinct `set -e` nuance both external reviewers
+  independently flagged: `set -o pipefail` (part of the script's `set
+  -euo pipefail`) means a *multi-stage pipe's* exit status reflects any
+  stage's failure, not just the last one -- so `dev="$(df ... | awk
+  ...)"`, `free_pages="$(vm_stat ... | awk ...)"`, `home="$(getent ... |
+  cut ...)"`, `home="$(dscl ... | awk ...)"`, and the mount-audit's `mnt="$
+  (df -P ... | tail ... | sed ...)"` could all abort the script if the
+  *first* stage failed (e.g. `df`/`vm_stat`/`getent`/`dscl` erroring on a
+  stale NFS handle or an unusual platform variant) even though the final
+  stage (`awk`/`cut`/`sed`) would have succeeded on empty input. All five
+  guarded with an explicit `|| var=""` fallback.
+
+  **Medium -- `--clean-junk-apply` could delete a real (if oddly named)
+  original.** The zero-byte-output cleanup matched purely on filename
+  (`*.AV1.mkv`, `*.x265.mkv`, `*.merged.mkv`) and size, with no check that
+  the candidate was actually something this script had created. A genuine
+  original file that happened to be zero bytes (a bad download, a failed
+  copy) and coincidentally named like our own output convention would be
+  deleted -- the hard invariant doesn't get to assume unusual filenames
+  never happen. Fixed: a zero-byte candidate is now only auto-deleted if a
+  plausible real source file (matching title, non-derived extension) is
+  found beside it; otherwise it's reported but left for manual review,
+  matching the precedent this same function already set for `.merged.mkv`
+  files with missing source parts.
+
+  **Noted but not changed this round:** the existing `flag_bad_processed_
+  output` mtime+codec-claim heuristic (deciding whether an existing file at
+  a computed output path is safe to treat as "ours") already has an
+  explicit code comment acknowledging that a genuine unrelated file could
+  in rare cases still pass both checks; closing that gap fully would need
+  a persistent provenance record of every file this script has created,
+  which is a larger change than this round's scope. The distributed
+  cross-host lock's 2-hour staleness window (a very long encode on another
+  machine being incorrectly reclaimed) and Plex-host resource contention
+  beyond CPU (memory/GPU/I-O, not addressed by the existing CPUQuota
+  wrapper) are both operational risk-acceptance calls, not correctness
+  bugs, and are left to the user's judgment rather than auto-fixed.
+
+  Verified with 30 unit tests (the previous 20 plus 10 new, including a
+  direct reproduction of the pre-fix symlink-race vulnerability against a
+  live pre-planted symlink, confirming the source file is never touched)
+  plus real end-to-end encodes with ramdisk staging both forced off
+  (exercising the new local-private-directory fallback) and left at
+  defaults.
+
+  *(v5.0.20)*
 
 ## Source-file safety
 
