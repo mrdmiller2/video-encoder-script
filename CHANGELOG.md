@@ -4,6 +4,23 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## Documentation — 2026-07-17
+
+No script behavior changed in this entry — `convert-v5.0.30.sh` remains the current
+release. Added a new README section, **"Optional: distributing the script across
+multiple machines,"** documenting an rsync-daemon-based pattern for keeping the
+script in sync and pulling logs across a multi-machine setup, plus a set of
+host/OS-level environment gotchas discovered while building and testing one:
+SELinux (`Enforcing` mode) blocking a confined rsync daemon from executing hook
+scripts — with a **false-positive symptom worth calling out specifically**: the
+push can report success while the server-side hook silently never ran at all,
+since a naive check only confirms "the marker says the right version," not "the
+promotion actually just happened" — WSL2 mirrored-networking's separate Hyper-V
+firewall layer, hostnames resolving IPv6 before IPv4 defeating an IPv4-only ACL,
+and macOS's built-in rsync lacking full daemon support. None of this is required
+reading to use the script itself — it's only relevant if you build something
+similar for your own multi-machine setup.
+
 Reviews were run using this repo's own script plus three external independent
 reviewers at high reasoning effort, each re-run after
 every round of fixes. Every finding from every reviewer was independently verified

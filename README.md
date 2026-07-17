@@ -480,6 +480,29 @@ HandBrakeCLI --help 2>&1 | grep -iE 'vt_h265|videotoolbox'
 
 ---
 
+## Optional: distributing the script across multiple machines
+
+If you run this script from more than one machine against a shared library, you don't need anything beyond a shared mount and this repo checked out on each box — but for keeping the script version in sync and pulling logs without repeated `ssh`/`scp`, an optional pattern works well: run an `rsync --daemon` on each machine with two modules — one write-enabled module for pushing a new script version, one read-only module for pulling logs — authenticated via `rsyncd.conf`'s `auth users`/`secrets file` (never pass the password inline on a command line; use `--password-file`). A small stable wrapper script (invoked by cron/systemd instead of a version-named file directly) can `exec` into whichever version a marker file currently names, so version bumps are an atomic file swap rather than an in-place overwrite of a running script.
+
+Optionally, the write-enabled module's `post-xfer exec` hook can auto-verify (checksum + `bash -n`) and atomically activate a freshly-pushed script with no SSH involved in the routine path at all — SSH stays available for actual troubleshooting, not routine distribution.
+
+### Known environment gotchas if you build something like this
+
+These aren't bugs in the script itself — they're host/OS-level things that can silently block an rsync-daemon-based distribution setup, worth knowing about upfront rather than debugging blind:
+
+- **SELinux in `Enforcing` mode (common on Fedora/RHEL)**: the confined `rsync_t` domain cannot execute arbitrary shell scripts by default, which blocks a `post-xfer exec` hook outright — and the client-side symptom is a **false positive**: your push tool may report success while the hook silently never ran, because it only checked "does the marker say the right version" rather than "did the promotion actually just happen." Check `sudo ausearch -m avc -ts recent | grep denied` for `execute`/`execute_no_trans`/`map` denials against `shell_exec_t`/`bin_t` if a push seems to succeed but nothing on the target actually changed. Fix with a narrowly-scoped custom policy module generated from your own actual denials — don't disable SELinux or grant broad access:
+  ```bash
+  sudo ausearch -m avc -ts recent | audit2allow -M my_rsync_promote
+  # review my_rsync_promote.te before loading — it should only grant exactly
+  # the file-execute-class permissions your own denials show, nothing broader
+  sudo semodule -i my_rsync_promote.pp
+  ```
+- **WSL2 with "mirrored" networking mode** (`networkingMode=mirrored` in `.wslconfig`): inbound connections pass through a separate Hyper-V firewall layer that an ordinary `New-NetFirewallRule` does not cover at all. Use `New-NetFirewallHyperVRule` instead, run on the Windows host, not inside the WSL2 distro.
+- **A hostname that resolves an IPv6 address before its IPv4 one**: an IPv4-only `hosts allow` line in `rsyncd.conf` will silently reject the connection, and rsyncd's error message ("Unknown module") looks exactly like a config typo rather than an ACL rejection. If a module works when addressed by IPv4 literal but not by hostname, this is almost certainly why.
+- **macOS's built-in `/usr/bin/rsync`** is often an old `openrsync` build without full daemon/module support — install a current rsync via Homebrew instead. On Apple Silicon, `/usr/local/sbin` may not exist at all (Homebrew uses `/opt/homebrew` exclusively) — create it first if you need to install a hook script there.
+
+---
+
 ## Storage, mounts, and performance
 
 The script is **I/O-heavy**: sharded `find` over thousands of folders, ffprobe per file, full source read during encode, and **simultaneous write** of a new `.AV1.mkv` / `.x265.mkv` beside the original. Storage choice affects **wall-clock time** and stability more than it changes compression quality.

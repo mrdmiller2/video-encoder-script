@@ -2,3 +2,10 @@
 *.tmp
 .DS_Store
 *~
+
+# Internal fleet coordination working area — contains real hostnames, IPs, and
+# machine-specific deployment artifacts. Never committed; see the GitHub
+# sanitization constant before ever removing this line.
+orchestration/
+__pycache__/
+
