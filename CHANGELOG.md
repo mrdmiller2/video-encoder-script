@@ -4,6 +4,49 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.32 — 2026-07-17
+
+Follow-on fixes/features surfaced while fleet-testing v5.0.31F's seven-profile
+system.
+
+- **Size-tiered upscale-overshoot guardrail.** The upscale acceptance cap
+  (`UPSCALE_MAX_OVERSHOOT_PCT`, default 50%) is now tiered by the *original*
+  file's size, since a fixed container/audio/metadata overhead dominates a
+  small file's overshoot percentage far more than a large one: ≤120MB gets up
+  to 100% growth, ≤1200MB gets up to 65%, >1200MB keeps the original 50%
+  (`UPSCALE_OVERSHOOT_SMALL_MAX_MB`/`_PCT`, `_MED_MAX_MB`/`_PCT`,
+  `UPSCALE_MAX_OVERSHOOT_PCT`). Non-upscale thresholds (AV1 20%, x265 5%) are
+  unchanged. Motivated by a live fleet test (PRINCE, VTV profile, 17.29MB
+  480p source) where both AV1 and x265 candidates were correctly rejected
+  after a 1080p upscale, but the fixed 50% cap left no headroom for how a
+  tiny source's fixed overhead dominates its overshoot %.
+- **Display/formula consistency fix.** The AV1/x265 rejection warnings
+  previously computed `(new/original)*100` ("% of original") but labeled it
+  as "...% larger", producing misleading numbers (e.g. a 157.8%-of-original
+  result shown next to ">20% larger"). All four rejection warnings now
+  consistently compute and show true overshoot `((new-original)/original)*100`;
+  the "Kept" messages (which correctly say "% of original") are unchanged.
+  The x265 non-upscale rejection now also shows its percentage (previously
+  showed none).
+- **Embedded MKV processed-tag.** Every finalized output gets a native
+  Matroska Tags-element marker (`VES_PROCESSED`) — distinct from track
+  properties (Name/Language/flags) and the Segment Info title, so it survives
+  renames/relocations that would defeat the folder done-log or filename
+  convention. `mkvpropedit --tags all: --tags global:...` clears every
+  pre-existing Tags scope (global + per-track + chapters) in the same command
+  before writing ours, leaving subtitle/audio track labels and playback-
+  affecting properties untouched. Tag value is `VES <version> processed`,
+  plus a sampled VMAF score comparing the actual output to the actual source
+  (`measure_final_vmaf`/`_vmaf_compare_clips` — a handful of short matched-
+  timestamp clips scored via libvmaf, not a re-encode), and — only when the
+  source was upscaled — the output resolution and "upscaled" ahead of the
+  VMAF number. A metadata-only re-tag of an already-AV1 file (no fresh
+  transcode this run) gets just the base tag, no quality readout, since
+  there's nothing new to measure. On scan, a cheap `ffprobe`-based read-check
+  skips re-processing any `.mkv` already carrying a tag for the current major
+  version — a second, path-independent signal alongside the done-log and
+  derived-output naming convention.
+
 ## v5.0.31F — 2026-07-17
 
 Two independent workstreams landed together: eliminating orphaned encoder
