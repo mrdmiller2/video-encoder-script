@@ -4,6 +4,100 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.31F — 2026-07-17
+
+Two independent workstreams landed together: eliminating orphaned encoder
+processes (the trigger was a live orphaned ffmpeg process found competing for
+CPU during a fleet performance test) and replacing the fixed five-profile
+encoding system with a seven-profile system matching a real library
+reorganization. Reviewed throughout by multiple independent reviewers,
+each round re-verified directly against the code
+before being accepted — several real, confirmed bugs were caught this way and
+are called out below rather than presented as a clean first pass.
+
+**Orphan-process hardening:**
+
+- **Kill the in-flight encoder on signal/error.** Every full encode/remux
+  subprocess (ffmpeg primary + subtitle-retry, hardware ffmpeg, AMD VAAPI,
+  stream-copy remux, streaming-optimization mkvmerge remux) now runs through
+  a tracked background child (`run_tracked_encoder()`), so `INT`/`TERM`/`ERR`
+  can terminate the in-flight process by PID instead of it becoming orphaned
+  when only the parent script dies. The `.convert-v4.IN_PROGRESS` flag gains
+  `encoder_pid=`, `encoder_started_utc=`, and `encoder_fingerprint=` fields —
+  the previous `pid=` field is the *script's* own PID, not the encoder's, and
+  was never usable for this. HandBrake's progress-piped path (which
+  previously made the encoder's real PID unobservable behind an `awk` pipe)
+  now runs through a private `.convert-hbprog-*` FIFO directory instead, so
+  its real PID is trackable the same way.
+- **Startup orphan reaper.** On every normal invocation (opt out with
+  `--no-auto-reap`), the script now walks same-host `.convert-v4.IN_PROGRESS`
+  flags and staging directories left behind by a prior hard crash, safely
+  identifies genuine orphans (script PID confirmed dead, encoder PID
+  confirmed alive and identity-verified — command name plus a start-time
+  cross-check, so a reused PID is never mistaken for the original encoder),
+  and terminates them. A killed orphan's generated output is validated
+  through a 4-gate sequence (source/candidate provenance → stable-size check
+  → tight duration match → fast Matroska structure check → a short tail
+  decode) before being either salvaged through the normal finalize path (if
+  it turns out to be complete) or deleted (if not) — the original source file
+  is never at risk under any code path.
+- **Defensive cleanup for an already-closed failure path.** `ffmpeg_encode()`
+  gained a defensive cleanup branch for a direct-write failure case that a
+  reachability test confirmed is unreachable in the current code (staging
+  setup already fails closed) — kept as cheap insurance against a future
+  change reopening that gap, not because it fixes a live bug.
+- **Timeout guards on validation subprocesses.** `run_ffprobe`,
+  `run_mkvmerge`, `run_mkvalidator`, and the fast EBML-bounds check now run
+  through a portable timeout wrapper (`VALIDATION_TIMEOUT_SECS`, default
+  120s) that works even without GNU coreutils' `timeout`/`gtimeout` (a
+  background-process-plus-poll fallback bounds the call instead). A timeout
+  is never treated as confirmed corruption — earlier drafts of this change
+  had callers still deleting a processed output or permanently recording a
+  source skip on a mere probe timeout (e.g. a stalled network mount); this
+  was caught in review and fixed so a timeout now leaves the file/source in
+  place for retry on the next run instead.
+
+**Seven-profile encoding system**, replacing the previous
+`movie`/`tv`/`anime`/`wanime`/`vintage` set:
+
+- **WANIME** — western animation (2D/3D, including Chinese CG), movies and TV.
+- **ANIME** — Japanese anime (`Movies/Anime/`, unambiguous).
+- **MOVIES** — general-purpose live-action (`Movies/<Language>/Modern/`).
+- **CLASSIC** — a real, distinct middle tier between MOVIES and VINTAGE
+  (`Movies/<Language>/Classic/`), light grain synthesis rather than a naive
+  average of its neighbors.
+- **VINTAGE** — older films, heavier grain, possibly B&W
+  (`Movies/<Language>/Vintage/`).
+- **MTV** — TV's equivalent of MOVIES (`Television/<Country>/Modern/`).
+- **VTV** — TV's equivalent of VINTAGE (`Television/<Country>/Vintage/`),
+  deliberately *not* tuned like VINTAGE — old TV's analog videotape noise
+  isn't photochemical film grain, so VTV skips x265's `tune=grain` in favor
+  of a bespoke low-motion/frequent-scene-cut parameter set.
+
+All seven are path-auto-detected from the library's existing folder
+structure, with one deliberate exception: `Movies/Japanese/Animation/` is
+genuinely ambiguous (some Japanese animated movies use anime style, others
+western style) and requires an explicit `--profile` flag rather than a
+guess. Sample-search and final-encode share each profile's complete
+parameter string (preserving the v5.0.29 fix against them drifting apart).
+Sub-720p sources now get a two-stage upscale decision instead of an
+unconditional 1080p upscale: a cheap metadata heuristic first (display
+resolution, bits-per-pixel-per-frame), falling back to a real 720p-vs-1080p
+sample encode scored via VMAF only when the heuristic is genuinely
+uncertain — the selected output resolution is part of the CRF-search cache
+key so it can't be silently reused across a different resolution decision.
+The metadata heuristic itself now fails closed to a conservative height-only
+decision when the underlying `ffprobe` metadata call fails or times out
+(e.g. a stalled network mount), rather than falling through into the sample
+encode — that path runs several full ffmpeg subprocesses with no timeout
+guard of their own, and would otherwise reintroduce exactly the kind of
+indefinite hang this release's timeout-guard work exists to eliminate.
+
+**Final-release review note**: this version's log/comment text originally
+carried over a real internal IP address and a real fleet hostname from an
+intermediate development copy — caught in review before release and
+replaced with documentation-safe placeholders. No script logic was affected.
+
 ## Documentation — 2026-07-17
 
 No script behavior changed in this entry — `convert-v5.0.30.sh` remains the current
