@@ -348,9 +348,16 @@ RAMDISK_JOB_STAGE_DIR=""
 # doesn't need this: RAMDISK_JOB_STAGE_DIR is a single job-scoped dir already
 # torn down as a whole by ramdisk_job_teardown's EXIT trap.
 ACTIVE_LOCAL_STAGE_DIR=""
-GPU_AV1=0
-GPU_HEVC_PRIMARY=0
-GPU_HEVC_FALLBACK=1
+# NVENC device indices (as seen by `nvidia-smi -L` / CUDA_VISIBLE_DEVICES) --
+# override per-machine when a box has multiple GPUs with different NVENC
+# capabilities. Not every NVENC generation supports AV1 hardware encode
+# (e.g. Ampere-generation cards have HEVC/H.264 NVENC but no AV1 encoder
+# block at all -- confirmed via a direct av1_nvenc probe, not a driver/config
+# issue), so GPU_AV1 in particular may need to stay pinned to a specific
+# card even when a second GPU is present and otherwise idle.
+GPU_AV1="${CONVERT_GPU_AV1:-0}"
+GPU_HEVC_PRIMARY="${CONVERT_GPU_HEVC_PRIMARY:-0}"
+GPU_HEVC_FALLBACK="${CONVERT_GPU_HEVC_FALLBACK:-1}"
 HAS_NVIDIA=false
 HAS_INTEL_QSV=false
 HAS_AMD_VCE=false
