@@ -4,6 +4,64 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.32A — 2026-07-18
+
+Follow-on to v5.0.32, closing a gap found during fleet re-testing: an
+already-encoded library file with no naming-convention marker (not one of
+our own `*.AV1.mkv`/`*.x265.mkv` outputs) would repeat the same ~4-minute
+sample-test on every scan forever, with no way to remember "no benefit."
+x265 sources additionally had **no** re-consideration logic at all — once a
+file was x265, it got a full real AV1 re-encode attempt on every scan,
+protected only by the post-hoc size guardrail. Reviewed through two rounds
+by three independent reviewers; both rounds caught real, independently
+confirmed bugs, all fixed and verified before release.
+
+- **Preexisting-desired-format tagging.** New tag value `VES <version>
+  Processed - Preexisting Desired Format`, written via the same
+  `_mkv_write_single_tag` helper as the guardrail-exceeded tag. Applied
+  whenever a source is determined to already be optimal: a small AV1/x265
+  source under its size gate, or a sample-test explicitly predicting no
+  size win.
+- **Codec-specific size gates.** AV1 sources ≤300MB and x265 sources
+  ≤250MB skip the sample-test entirely and get tagged immediately
+  (`PREEXISTING_SMALL_SKIP_MAX_MB`, `PREEXISTING_X265_SMALL_SKIP_MAX_MB`).
+  Gated to `ext == mkv && ! is_derived_output` only — a real correctness
+  bug from the first review round: applying the gate to non-MKV sources or
+  derived outputs would have skipped required container-unification remuxes
+  and wiped VMAF tags off derived outputs queued for a legitimate oversized
+  recheck.
+- **New `process_existing_x265()`.** x265 sources above their size gate are
+  now sample-tested (reusing the same codec-agnostic
+  `av1_source_reencode_sample_decision` primitive as the AV1-source path)
+  for whether AV1 — or a fresh x265 pass — would shrink the file further,
+  rather than committing straight to a full real re-encode attempt.
+- **Container unification for x265 sources.** Any non-MKV x265 source
+  (`.mp4`, `.ts`, etc.) is now unconditionally remuxed to `.x265.mkv`
+  before any sample-testing, mirroring the AV1-source path's existing
+  non-MKV handling — the project's container-unification goal (everything
+  ends up `.mkv`) doesn't depend on whether re-encoding would help.
+- **`force_transcode` fix for `try_x265_convert`.** A second real bug from
+  the first review round: `process_existing_x265`'s `x265` sample decision
+  (predicting a fresh x265 pass would shrink an already-HEVC `.mkv` source)
+  called `try_x265_convert` directly, which for an ordinary HEVC `.mkv`
+  input immediately took the existing stream-copy remux shortcut —
+  producing a same-size remux instead of the predicted real re-encode, then
+  silently marking it done. Fixed with a new `force_transcode` parameter
+  that bypasses the remux shortcut only when the caller has already decided
+  a real transcode is warranted; all three pre-existing call sites default
+  to `false` and are unaffected.
+- **NVDEC sample-encode fix (shared machinery, found on docm).** HandBrake's
+  NVDEC hardware decoder can choke on a `-ss`+`-c copy`-extracted sample
+  clip's irregular timestamps (a B-frame-reordering artifact at the cut
+  boundary), breaking the muxer. Confirmed via direct reproduction (HandBrake
+  exit 4, `av_interleaved_write_frame failed`) and fixed by adding a
+  `no_hw_decode` option to `build_handbrake_args`, used only by the two
+  sample-encode functions (`encode_sample_av1`/`encode_sample_x265`) — real
+  full-length encodes are unaffected, and decode speed doesn't matter for a
+  short sample anyway. This is pre-existing shared code (the same
+  clip-extraction path the AV1-source sample-test already used); the new
+  x265 feature simply exercised it for the first time on docm's NVENC setup.
+
 ## v5.0.32 — 2026-07-17
 
 Follow-on fixes/features surfaced while fleet-testing v5.0.31F's seven-profile
