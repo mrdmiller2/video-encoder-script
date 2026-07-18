@@ -4691,7 +4691,11 @@ find_convert_videos_under() {
   local -a raw=()
   while IFS= read -r f; do [ -n "$f" ] && raw+=("$f"); done < <(find_convert_videos_under_cached "$root")
   [ "$skip_merge" = true ] || apply_multipart_merging raw
-  printf '%s\n' "${raw[@]}"
+  # printf '%s\n' with a truly empty argument list still runs the format
+  # string once, emitting a single spurious blank line -- a shard/root with
+  # genuinely zero matching files would otherwise inject a phantom empty-
+  # string entry into every caller's video list.
+  [ "${#raw[@]}" -eq 0 ] || printf '%s\n' "${raw[@]}"
 }
 
 find_videos_at_root() {
@@ -4701,7 +4705,7 @@ find_videos_at_root() {
   while IFS= read -r f; do [ -n "$f" ] && raw+=("$f"); done < <(find "$root" -maxdepth 1 -type f "${pred[@]}" \
     ! -iname '*.AV1.mkv' ! -iname '*.x265.mkv' 2>/dev/null)
   [ "$skip_merge" = true ] || apply_multipart_merging raw
-  printf '%s\n' "${raw[@]}"
+  [ "${#raw[@]}" -eq 0 ] || printf '%s\n' "${raw[@]}"
 }
 
 find_isos_under() {
