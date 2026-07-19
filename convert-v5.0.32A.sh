@@ -573,6 +573,9 @@ STATS_INSPECTED=0
 CONVERT_JOB_INDEX=0
 CONVERT_JOB_TOTAL=0
 CONVERT_JOB_OK=true
+CONVERT_JOB_START_EPOCH=0
+CONVERT_JOB_SRC_DURATION=0
+CONVERT_BATCH_ENCODE_SECONDS=0
 CONVERT_SCAN_COUNT=0
 CONVERT_READY_FILE=""
 CONVERT_SCAN_DONE_FILE=""
@@ -2591,6 +2594,11 @@ begin_convert_job() {
     return 1
   fi
   resume_persist_state "started"
+  CONVERT_JOB_START_EPOCH="$(date +%s)"
+  CONVERT_JOB_SRC_DURATION="0"
+  if ! is_disk_source "$src"; then
+    CONVERT_JOB_SRC_DURATION="$(video_duration "$src")"
+  fi
   echo ""
   log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   log "Job $idx of $total: $name ($size)"
@@ -2612,10 +2620,28 @@ end_convert_job() {
   resume_persist_state "$status"
   if [ "$ok" = true ]; then
     log "Job $idx of $total complete: $(basename "$src")"
+    if [ "$DRY_RUN" = false ] && [ "${CONVERT_JOB_START_EPOCH:-0}" -gt 0 ]; then
+      local elapsed
+      elapsed=$(( $(date +%s) - CONVERT_JOB_START_EPOCH ))
+      [ "$elapsed" -ge 0 ] || elapsed=0
+      CONVERT_BATCH_ENCODE_SECONDS=$(( CONVERT_BATCH_ENCODE_SECONDS + elapsed ))
+      if awk -v d="${CONVERT_JOB_SRC_DURATION:-0}" 'BEGIN { exit !(d+0 > 0) }' && [ "$elapsed" -gt 0 ]; then
+        local speed
+        speed="$(awk -v d="$CONVERT_JOB_SRC_DURATION" -v e="$elapsed" 'BEGIN { printf "%.2f", d / e }')"
+        log "  Encode time: $(format_duration_hms "$elapsed") (source runtime $(format_duration_hms "$CONVERT_JOB_SRC_DURATION"), ${speed}x realtime)"
+      else
+        log "  Encode time: $(format_duration_hms "$elapsed")"
+      fi
+    fi
   else
     warn "Job $idx of $total failed: $(basename "$src")"
   fi
   echo ""
+}
+
+log_batch_encode_total() {
+  [ "$CONVERT_BATCH_ENCODE_SECONDS" -gt 0 ] || return 0
+  log "Total encode time this batch: $(format_duration_hms "$CONVERT_BATCH_ENCODE_SECONDS")"
 }
 
 detect_hw_environment() {
@@ -11158,6 +11184,7 @@ convert_library_pipeline() {
   else
     log "Convert queue finished: no items needed encoding"
   fi
+  log_batch_encode_total
 
   exec {CONVERT_READY_FD}<&- 2>/dev/null || true
 
@@ -11253,6 +11280,7 @@ convert_library_batch() {
     resume_clear_state
     log "Convert queue finished — resume state cleared"
   fi
+  log_batch_encode_total
 }
 
 convert_library() {
