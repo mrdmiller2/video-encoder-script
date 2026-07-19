@@ -8806,7 +8806,7 @@ find_convert_videos_under_cached() {
   if [ "${#subdirs[@]}" -eq 0 ]; then
     while IFS= read -r f; do [ -n "$f" ] && raw+=("$f"); done \
       < <(find "$root" -type f "${pred[@]}" 2>/dev/null)
-    printf '%s\n' "${raw[@]}"
+    [ "${#raw[@]}" -eq 0 ] || printf '%s\n' "${raw[@]}"
     return 0
   fi
 
@@ -8839,7 +8839,7 @@ find_convert_videos_under_cached() {
   if [ "$hits" -gt 0 ] || [ "$misses" -gt 0 ]; then
     log_err "File-list cache: $hits/$(( hits + misses )) subdirectory(ies) unchanged (skipped re-scan)"
   fi
-  printf '%s\n' "${raw[@]}"
+  [ "${#raw[@]}" -eq 0 ] || printf '%s\n' "${raw[@]}"
 }
 
 # ============================================================================
