@@ -247,7 +247,7 @@ set -euo pipefail
 
 _CONVERT_V4_SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
 
-VERSION="5.0.32B"
+VERSION="5.0.32C"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Matroska Tags element (global "Simple Tag") marking a file as already run through
 # this script's encode pipeline -- distinct from track properties (Name/Language/
@@ -3578,6 +3578,12 @@ detect_profile_for_path() {
   case "$p" in
     */Movies/Japanese/Animation/*) return 2 ;;
     */Movies/Anime/*) printf 'anime'; return 0 ;;
+    # Anime TV shows (Japanese/Chinese/Korean anime-styled) live at a
+    # top-level Anime/ folder, sibling to Movies/Television at the media
+    # root -- not nested under Television/<Country>/*. No separate TV-anime
+    # profile exists (matches Movies/Anime's tuning; MTV/VTV only split
+    # western live-action TV, not anime).
+    */Anime/*) printf 'anime'; return 0 ;;
     */Animation/*) printf 'wanime'; return 0 ;;
     */Movies/*/Modern/*) printf 'movies'; return 0 ;;
     */Movies/*/Classic/*) printf 'classic'; return 0 ;;
@@ -3631,7 +3637,7 @@ is_tv_library_path() {
   return 1
 }
 
-# TV episode markers: S01E01, EP1, Episode 1, 1x01, trailing -01, leading 01-
+# TV episode markers: S01E01, EP1, Episode 1, 1x01, trailing -01, leading 01-/065-
 is_tv_episode() {
   local f="$1"
   local stem
@@ -3644,7 +3650,10 @@ is_tv_episode() {
   [[ "$stem" =~ [0-9]{1,2}[xX][0-9]{1,2} ]] && return 0
   [[ "$stem" =~ -[[:space:]]*[0-9]{1,2}$ ]] && return 0
   [[ "$stem" =~ [[:space:]][0-9]{1,2}$ ]] && return 0
-  [[ "$stem" =~ ^[0-9]{2}- ]] && return 0
+  # 2-3 digits only: covers sequential numbering up to 999 episodes (e.g.
+  # "065-The Obsolete Man") without also matching a 4-digit year-prefixed
+  # movie title ("1999-Title", "2001-A Space Odyssey").
+  [[ "$stem" =~ ^[0-9]{2,3}- ]] && return 0
   return 1
 }
 
