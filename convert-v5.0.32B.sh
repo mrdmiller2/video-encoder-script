@@ -247,7 +247,7 @@ set -euo pipefail
 
 _CONVERT_V4_SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
 
-VERSION="5.0.32A"
+VERSION="5.0.32B"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Matroska Tags element (global "Simple Tag") marking a file as already run through
 # this script's encode pipeline -- distinct from track properties (Name/Language/
@@ -348,6 +348,10 @@ RAMDISK_JOB_STAGE_DIR=""
 # doesn't need this: RAMDISK_JOB_STAGE_DIR is a single job-scoped dir already
 # torn down as a whole by ramdisk_job_teardown's EXIT trap.
 ACTIVE_LOCAL_STAGE_DIR=""
+# Same idea for finalize_staged_encode_output's private .convert-finalize-*
+# copy dir -- an INT/TERM or set -e abort mid-copy needs somewhere other
+# than that function's own local variable to find it and clean it up.
+ACTIVE_FINALIZE_DIR=""
 # NVENC device indices (as seen by `nvidia-smi -L` / CUDA_VISIBLE_DEVICES) --
 # override per-machine when a box has multiple GPUs with different NVENC
 # capabilities. Not every NVENC generation supports AV1 hardware encode
@@ -2502,8 +2506,22 @@ place_in_progress_flag() {
 
   if ! mkdir -- "$lockdir" 2>/dev/null; then
     if junk_flag_is_stale "$flag" 2>/dev/null; then
-      rmdir -- "$lockdir" 2>/dev/null
-      if ! mkdir -- "$lockdir" 2>/dev/null; then
+      # rmdir-then-mkdir is two separate syscalls -- two hosts can both pass
+      # the staleness check and both attempt reclaim; whichever one's rmdir
+      # runs after the other's mkdir would silently delete the winner's
+      # brand-new lock. Reclaim via `mv` instead: rename() on a directory is
+      # a single atomic syscall, so exactly one racing process can win the
+      # rename of this exact source path -- the loser's mv simply fails and
+      # it backs off instead of destroying the winner's lock. No `-T`: that
+      # flag is a GNU extension and would break on macOS (Crystalight).
+      local reclaim_name="${lockdir}.reclaim.$(hostname 2>/dev/null || echo unknown).$$.$RANDOM"
+      if mv -- "$lockdir" "$reclaim_name" 2>/dev/null; then
+        rm -rf -- "$reclaim_name" 2>/dev/null
+        if ! mkdir -- "$lockdir" 2>/dev/null; then
+          warn "Title claimed by another process just now — skipping: $title"
+          return 1
+        fi
+      else
         warn "Title claimed by another process just now — skipping: $title"
         return 1
       fi
@@ -4000,8 +4018,15 @@ ramdisk_job_teardown() {
       fi
       ;;
     *)
+      # Mirrors _sudo_mount: ramdisk_create mounts via `sudo mount` for
+      # non-root users (every fleet worker account), so teardown needs the
+      # same fallback or the owned tmpfs is silently never unmounted here.
+      # -n (non-interactive) so this EXIT-trap cleanup can never block on a
+      # password prompt with no TTY attached.
       if [ "$(id -u)" -eq 0 ]; then
         umount "$RAMDISK_JOB_DIR" 2>/dev/null || true
+      else
+        sudo -n umount "$RAMDISK_JOB_DIR" 2>/dev/null || true
       fi
       ;;
   esac
@@ -4121,6 +4146,10 @@ finalize_staged_encode_output() {
   tmp_dir="$(mktemp -d "$(dirname "$final_dst")/.convert-finalize-XXXXXX" 2>/dev/null)" || return 1
   chmod 700 "$tmp_dir" 2>/dev/null || true
   tmp_on_dst="$tmp_dir/$(basename "$final_dst")"
+  # Tracked globally so an INT/TERM or a set -e abort mid-copy still has
+  # this private dir cleaned up (resume_on_signal / _convert_on_err), not
+  # just the three explicit rm -rf's on this function's own return paths.
+  ACTIVE_FINALIZE_DIR="$tmp_dir"
 
   if cp "$staged" "$tmp_on_dst" 2>/dev/null; then
     if [ "$(file_size_bytes "$tmp_on_dst")" -eq "$(file_size_bytes "$staged")" ]; then
@@ -4134,14 +4163,17 @@ finalize_staged_encode_output() {
       rm -f -- "$staged"
       _cleanup_staged_file_dir "$staged"
       rm -rf -- "$tmp_dir" 2>/dev/null
+      ACTIVE_FINALIZE_DIR=""
       return 0
     fi
     warn "Ramdisk staging: mv into $final_dst failed — keeping staged copy at $staged for manual recovery"
     rm -rf -- "$tmp_dir" 2>/dev/null
+    ACTIVE_FINALIZE_DIR=""
     return 1
   fi
 
   rm -rf -- "$tmp_dir" 2>/dev/null
+  ACTIVE_FINALIZE_DIR=""
   rm -f -- "$staged" 2>/dev/null
   _cleanup_staged_file_dir "$staged"
   return 1
@@ -4696,9 +4728,20 @@ resume_on_signal() {
     rm -rf -- "$ACTIVE_LOCAL_STAGE_DIR" 2>/dev/null || true
     ACTIVE_LOCAL_STAGE_DIR=""
   fi
+  if [ -n "${ACTIVE_FINALIZE_DIR:-}" ]; then
+    rm -rf -- "$ACTIVE_FINALIZE_DIR" 2>/dev/null || true
+    ACTIVE_FINALIZE_DIR=""
+  fi
   warn "Interrupted — resume state saved at job ${RESUME_LAST_INDEX:-0}: ${RESUME_LAST_SOURCE:-unknown}"
   if [ -n "${RESUME_LAST_SOURCE:-}" ]; then
-    warn "Left $(canonical_title_from_source "$RESUME_LAST_SOURCE").${IN_PROGRESS_FLAG_SUFFIX} — delete that title's partial .AV1.mkv/.x265.mkv before trusting them"
+    # finalize_mkv_output and tag_preexisting_desired_format both clear this
+    # title's in-progress flag themselves as soon as their output is durable
+    # -- so if the flag is still on disk here, the interrupt genuinely landed
+    # mid-encode and the advice below is accurate. If the flag is already
+    # gone, the job actually finished; don't tell a human to delete good output.
+    if [ -f "$(in_progress_flag_path "$RESUME_LAST_SOURCE" 2>/dev/null)" ]; then
+      warn "Left $(canonical_title_from_source "$RESUME_LAST_SOURCE").${IN_PROGRESS_FLAG_SUFFIX} — delete that title's partial .AV1.mkv/.x265.mkv before trusting them"
+    fi
   fi
   resume_persist_state "interrupted"
   exit 130
@@ -5893,6 +5936,12 @@ tag_guardrail_exceeded() {
 # and same exception to "never touch the source" as tag_guardrail_exceeded.
 tag_preexisting_desired_format() {
   local src="$1"
+  # This title's processing decision (no re-encode needed) is final as soon
+  # as we get here, regardless of which branch below actually runs -- clear
+  # the in-progress flag now rather than waiting for end_convert_job, so an
+  # interrupt landing right after this function can't make resume_on_signal
+  # tell a human to delete a file that was never even touched.
+  clear_in_progress_flag "$src"
   case "${src,,}" in *.mkv) ;; *) return 0 ;; esac
   if [ "$DRY_RUN" = true ]; then
     log "[dry-run] clear existing tags + write preexisting-desired-format marker on $src"
@@ -5909,6 +5958,11 @@ finalize_mkv_output() {
   label_mkv_tracks "$mkv" "$src" "$title"
   write_ves_processed_tag "$mkv" "$src"
   maybe_chown_for_media_user "$mkv"
+  # $mkv is now the real, durable, final output -- clear the in-progress
+  # flag here rather than waiting for end_convert_job, closing the window
+  # where an interrupt right after this point would otherwise make
+  # resume_on_signal warn a human to delete what is actually finished work.
+  clear_in_progress_flag "$src"
 }
 
 subtitle_target_name() {
@@ -6397,7 +6451,14 @@ source_looks_processable_quick() {
 
 mkv_structure_stat_key() {
   local dst="$1"
-  # size|mtime — portable via python (stat -c differs on macOS)
+  # size|mtime. Was an unconditional python3 spawn per file (this runs on
+  # every file during a library scan, so tens of thousands of fork+execs
+  # added real minutes just for a stat()) — native `stat` per platform is
+  # the fast path, python3 kept only as a fallback for anything else.
+  case "$PLATFORM" in
+    macos) stat -f '%z|%m' "$dst" 2>/dev/null && return 0 ;;
+    linux|wsl) stat -c '%s|%Y' "$dst" 2>/dev/null && return 0 ;;
+  esac
   python3 - "$dst" <<'PY' 2>/dev/null || return 1
 import os, sys
 p = sys.argv[1]
@@ -9785,7 +9846,7 @@ junk_flag_is_stale() {  # flag path -> 0 if safe to remove
 # title and a common video extension that ISN'T itself one of our derived
 # suffixes.
 _zero_byte_output_has_real_source() {
-  local f="$1" dir base title ext_pattern sib
+  local f="$1" dir base title escaped_title sib
   dir="$(dirname "$f")"
   base="$(basename "$f")"
   case "$base" in
@@ -9794,13 +9855,21 @@ _zero_byte_output_has_real_source() {
     *.[Mm][Ee][Rr][Gg][Ee][Dd].[Mm][Kk][Vv]) title="${base%.*.*}" ;;
     *) return 1 ;;
   esac
+  # $title comes from a real filename and can itself contain find -iname
+  # glob metacharacters (*, ?, [) -- unescaped, a title like "Who?" would
+  # match unrelated siblings ("WhoA...") and could misclassify a genuinely
+  # sourceless zero-byte output as having a real source.
+  escaped_title="${title//\\/\\\\}"
+  escaped_title="${escaped_title//\*/\\*}"
+  escaped_title="${escaped_title//\?/\\?}"
+  escaped_title="${escaped_title//\[/\\[}"
   while IFS= read -r sib; do
     [ -n "$sib" ] || continue
     case "$(basename "$sib")" in
       *.[Aa][Vv]1.[Mm][Kk][Vv]|*.[Xx]265.[Mm][Kk][Vv]|*.[Mm][Ee][Rr][Gg][Ee][Dd].[Mm][Kk][Vv]) continue ;;
     esac
     return 0
-  done < <(find "$dir" -maxdepth 1 -type f -iname "${title}.*" 2>/dev/null)
+  done < <(find "$dir" -maxdepth 1 -type f -iname "${escaped_title}.*" 2>/dev/null)
   return 1
 }
 
@@ -9856,8 +9925,18 @@ clean_junk_scan() {
   fi
 
   local apply_total=$(( ${#zero_byte[@]} + ${#stale_flags[@]} ))
-  for f in "${zero_byte[@]}" "${stale_flags[@]}"; do
+  for f in "${zero_byte[@]}"; do
     rm -f -- "$f" && log "  removed: $f"
+  done
+  for f in "${stale_flags[@]}"; do
+    rm -f -- "$f" && log "  removed: $f"
+    # The flag's own reclaim path (place_in_progress_flag) can't tell a
+    # missing flag apart from "not stale" once this deletes it out from
+    # under a live lockdir -- remove the sibling .lock too or the title is
+    # permanently skipped as "claimed elsewhere" on every future run.
+    if rmdir -- "${f}.lock" 2>/dev/null; then
+      log "  removed: ${f}.lock"
+    fi
   done
   log "Junk scan: removed $apply_total item(s)"
   if [ "${#zero_byte_no_source[@]}" -gt 0 ]; then
@@ -10111,7 +10190,7 @@ process_existing_av1() {
       fi
     fi
     log "AV1 remux to MKV: $src -> $out"
-    remux_copy_to_mkv "$src" "$out"
+    remux_copy_to_mkv "$src" "$out" || { warn "Remux failed — skipping title: $src"; return 1; }
     if ! validate_mkv_output "$src" "$out"; then
       if [ "$MKV_VALIDATE_TIMED_OUT" = true ]; then
         warn "Validation timed out for $out — leaving output in place for retry next run"
@@ -10378,7 +10457,7 @@ try_x265_convert() {
   if [ "$force_transcode" != true ] && [ "$ext" = "mkv" ] && is_hevc_codec "$codec" && [ -z "$hb_title" ] \
      && ! source_has_dolby_vision "$src"; then
     log "x265 remux (HEVC stream copy to MKV): $src -> $out"
-    remux_copy_to_mkv "$src" "$out"
+    remux_copy_to_mkv "$src" "$out" || { warn "Remux failed — skipping title: $src"; return 1; }
     if [ "$DRY_RUN" = true ]; then
       return 0
     fi
@@ -10631,7 +10710,7 @@ process_existing_x265() {
       fi
     fi
     log "x265 remux to MKV: $src -> $out"
-    remux_copy_to_mkv "$src" "$out"
+    remux_copy_to_mkv "$src" "$out" || { warn "Remux failed — skipping title: $src"; return 1; }
     if ! validate_mkv_output "$src" "$out"; then
       if [ "$MKV_VALIDATE_TIMED_OUT" = true ]; then
         warn "Validation timed out for $out — leaving output in place for retry next run"
@@ -11298,6 +11377,17 @@ _convert_on_err() {
     kill "$CONVERT_SCAN_PID" 2>/dev/null || true
     wait "$CONVERT_SCAN_PID" 2>/dev/null || true
     CONVERT_SCAN_PID=0
+  fi
+  # Mirrors resume_on_signal's cleanup -- a genuine script error (not just an
+  # interrupt) mid-encode was previously leaking these same private staging
+  # dirs, since only the signal path used to clean them up.
+  if [ -n "${ACTIVE_LOCAL_STAGE_DIR:-}" ]; then
+    rm -rf -- "$ACTIVE_LOCAL_STAGE_DIR" 2>/dev/null || true
+    ACTIVE_LOCAL_STAGE_DIR=""
+  fi
+  if [ -n "${ACTIVE_FINALIZE_DIR:-}" ]; then
+    rm -rf -- "$ACTIVE_FINALIZE_DIR" 2>/dev/null || true
+    ACTIVE_FINALIZE_DIR=""
   fi
   err "Script aborted (exit $exit_code near line ${BASH_LINENO[0]:-?})"
   exit "$exit_code"
