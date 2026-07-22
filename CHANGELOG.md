@@ -4,6 +4,46 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.32I — 2026-07-22
+
+Critical silent-data-loss bug found during a fleet-wide real-NAS re-test of
+v5.0.32H: a movie folder containing exactly one subfolder (e.g. a
+`Featurettes/` extras directory) alongside the main movie file caused the
+main movie file to be **silently skipped entirely** — no log entry, no
+skip-reason, nothing. Only the subfolder's files got processed. Confirmed
+live on AI-PROCESSOR: Oppenheimer (2023)'s 11.4GB main file was never
+touched (no VES tag, no `convert-v5.done` entry, no log mention) while its
+`Featurettes/` files were processed normally. Reviewed by two independent
+reviewers (a third reviewer failed to spawn — infra issue, not a review finding); both
+independently confirmed the diagnosis and found the same broken pattern
+duplicated across more call sites than the one first found.
+
+- **Root cause.** `get_scan_roots()` returns only real subdirectories at
+  `$SHARD_DEPTH` under `$SEARCH_PATH` when any exist — it never includes
+  `$SEARCH_PATH` itself in that case, only falling back to
+  `roots=("$SEARCH_PATH")` when zero subdirectories are found. Every
+  scanning function that iterates `roots` as shards also needs a separate
+  pass over `$SEARCH_PATH` itself to catch loose files sitting directly in
+  it (the main movie file, sibling to the extras subfolder) — but that
+  extra pass was gated on `shard_total -gt 1` everywhere it appeared.
+  With exactly one real subfolder (`shard_total == 1`), the gate is false,
+  so the loose top-level file is in neither the subfolder shard (it's not
+  under the subfolder) nor caught by the root pass (gate closed) —
+  vanishing from discovery with zero trace.
+- **Fix.** New helper `roots_need_catchup_scan()` (added right after
+  `get_scan_roots()`): true when `roots` holds real subdirectories rather
+  than the zero-subdirectory `("$SEARCH_PATH")` fallback, regardless of
+  count. Replaces the broken `[ "$NO_SHARD" = false ] && [ "$shard_total"
+  -gt 1 ]` (or `${#roots[@]} -gt 1`) condition at all 7 real call sites
+  that gated a root-level catch-up scan: `build_shard_snapshot`,
+  `discover_disk_sources` (ISO/Blu-ray discovery), `organize_library`,
+  `inspect_library`, `convert_estimate_scan_total` (batch-vs-pipeline mode
+  selection), `convert_scan_producer` (pipeline mode), and
+  `convert_library_batch` (the one that dropped Oppenheimer). A further
+  ~12 occurrences of the same `-gt 1` text elsewhere are cosmetic
+  shard-log formatting/looping guards, not this bug, and were left
+  unchanged.
+
 ## v5.0.32A — 2026-07-18
 
 Follow-on to v5.0.32, closing a gap found during fleet re-testing: an
