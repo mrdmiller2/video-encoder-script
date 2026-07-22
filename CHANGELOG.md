@@ -4,6 +4,103 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.32P — 2026-07-22
+
+Adds must-eliminate-format handling and a `Deferred/` human-review folder,
+per explicit new requirements: some source formats (disc images, raw
+transport streams, legacy containers) need to be eliminated regardless of
+whether re-encoding actually shrinks them, and files that can't be salvaged
+by a cheap fix need to stay visible to Plex/Sonarr instead of disappearing
+into a log. Reviewed E2E by two independent reviewers across three rounds; the first
+round caught a showstopper (below) that the initial implementation missed
+entirely.
+
+- **`is_must_eliminate_format()`** (new) — true for disc/BDMV sources and for
+  `.ts`/`.m2ts`/`.vob`/`.avi`/`.ogm` containers regardless of the codec they
+  hold. These formats are the actual problem (poor seekability/compatibility,
+  a disc image nobody can play directly), so eliminating the format matters
+  more than the normal size-keep guardrail.
+- **Size-guardrail bypass + AV1/x265 tie-break for must-eliminate sources.**
+  Previously, if both a fresh AV1 and fallback x265 encode came out larger
+  than the size cap allows, `try_x265_convert` rejected both and left the
+  original in place — for an ISO/.ts/.avi/.ogm source, that means the
+  undesirable format never gets eliminated. `try_av1_convert` now stashes an
+  oversized AV1 candidate (`MUST_ELIMINATE_AV1_CANDIDATE`/`_SIZE`) instead of
+  deleting it when the source is a must-eliminate format; `try_x265_convert`
+  tie-breaks between the two oversized candidates before falling through to
+  its normal reject-and-keep-original path: within `MUST_ELIMINATE_TIE_PCT`
+  (5%) of each other, AV1 wins; otherwise whichever is smaller wins. If x265
+  itself fails outright (encode or validation failure) for a must-eliminate
+  source, `must_eliminate_fallback_or_fail()` salvages the stashed oversized
+  AV1 candidate rather than giving up. Codec-in-bad-container sources
+  (e.g. HEVC inside an `.avi`) were already handled — `process_existing_av1`/
+  `process_existing_x265` unconditionally remux non-mkv containers before any
+  sample-testing — this only closes the gap for fresh/inefficient-codec
+  sources that go through `try_av1_convert`/`try_x265_convert` directly.
+- **`Deferred/` subfolder for human review.** `flag_bad_source_for_human()`
+  now physically moves the flagged file into a `Deferred/` subdirectory next
+  to its siblings (collision-avoided with a UTC timestamp prefix; skipped for
+  dry-run and disk sources, which can't be moved) instead of leaving it in
+  place and only logging it — the intent is a folder that's still visible to
+  Plex/Sonarr but easy to search for files needing manual intervention. All
+  directory-enumeration `find` calls (`get_scan_roots()`, twice, and
+  `find_convert_videos_under_cached()`) now exclude `Deferred` by name so a
+  parked file can't be rediscovered and reprocessed in a loop.
+- Corruption/integrity checking already ran before any codec/format decision
+  (`validate_source_media()` gates `process_video()` before the codec
+  branch), including its existing remux-repair-first, flag-for-human-if-that-
+  fails behavior — confirmed already correct, no change needed there.
+
+**Bugs caught by team review, before this ever reached the fleet:**
+
+- **Showstopper (both reviewers, independently): the stash defeated itself.**
+  The oversized AV1 candidate was originally stashed at its own canonical
+  `av1_output_path` — the exact path `try_x265_convert`'s own
+  `skip_if_complete_canonical_output` check looks for first thing. It matched
+  immediately, `try_x265_convert` returned 0 without ever running x265 or the
+  tie-break, and the stash was left on disk forever, unfinalized. Fixed by
+  stashing under a non-canonical `${out}.must_eliminate_stash` name instead,
+  moved back to the canonical path via `mv -f` only once actually chosen as
+  the winner; `try_av1_convert`'s entry does an idempotent `rm -f` of any
+  orphaned stash from a prior aborted run of the same source.
+- **Oversized x265 with no AV1 stash still got rejected.** If AV1 failed
+  outright (not just oversized — nothing to tie-break against), a must-
+  eliminate source's oversized x265 fell through to the normal reject path
+  and the undesirable format was never eliminated. Added a bypass block
+  right after the tie-break so a must-eliminate source keeps its oversized
+  x265 unconditionally when there's no AV1 candidate to compare against.
+- **Double outright failure never reached `Deferred/`.** If both AV1 and
+  x265 genuinely failed to encode/validate (not merely oversized) for a
+  must-eliminate source, nothing called `flag_bad_source_for_human` — the
+  bad format sat in place forever with no path forward. `must_eliminate_
+  fallback_or_fail()` now flags it, scoped so an ordinary source failing
+  both encoders is unaffected (still just retried later, as before).
+- **Division-by-zero risk in the tie-break math.** The awk percentage-delta
+  calculation divided by the stashed AV1 size with no zero-guard, which
+  would abort the whole script under `set -e` on mawk/BSD awk if that size
+  were ever empty or zero. Added an explicit guard that discards the stash
+  and keeps x265 in that case instead of crashing.
+- **`Deferred/` exclusion was incomplete.** The top-level shard-root find
+  calls excluded `Deferred` by name, but 5 other recursive `find` calls
+  didn't: `find_convert_videos_under_cached()`'s no-subdirectory fallback
+  and its per-subdirectory scan, plus `find_videos_under()`,
+  `find_isos_under()`, and `find_bluray_roots_under()`. Any of these could
+  have walked into a `Deferred/` folder and re-queued a parked file forever.
+  Added `! -path '*/Deferred/*'` to all 5.
+- **Cross-title global leak (one reviewer, second round).** The two globals used
+  to pass the stashed candidate from `try_av1_convert` to `try_x265_convert`
+  aren't cleared on every return path (deliberately — the validation-timeout
+  "leave in place for retry" paths don't touch them). That reviewer correctly
+  pointed out that an unrelated later title entering `try_x265_convert`
+  directly (via `process_existing_av1`/`process_existing_x265`'s sample-
+  decision path, bypassing `try_av1_convert`'s entry-reset) could delete or
+  wrongly tie-break against an earlier title's still-pending stash. Fixed by
+  making every consumption/deletion site verify ownership first — it only
+  acts if the global's value exactly matches `$(av1_output_path "$src").
+  must_eliminate_stash` for the *current* source — so a foreign candidate is
+  now left completely untouched everywhere instead of merely "usually"
+  untouched. Confirmed by a follow-up verification pass from that reviewer.
+
 ## v5.0.32O — 2026-07-22
 
 Replaces HandBrake with direct ffmpeg calls in the AV1-vs-x265 shrink-prediction
