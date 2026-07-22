@@ -4,6 +4,91 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.32O — 2026-07-22
+
+Replaces HandBrake with direct ffmpeg calls in the AV1-vs-x265 shrink-prediction
+sample-encode path, and fixes several real correctness bugs surfaced along the way.
+Prompted by a fleet HandBrake-version-compatibility crash discovered testing
+v5.0.32I: older stable HandBrakeCLI builds (1.9.0 on Plex, 1.11.0 on AI-PROCESSOR)
+silently failed to open ffmpeg `-c copy`-extracted sample clips at all
+(`unrecognized file type`), corrupting the sample decision into a false "test
+failed" skip with zero diagnostic detail. Reviewed across two rounds by two
+independent reviewers (a third reviewer failed to spawn both rounds — infra issue, not a review
+finding).
+
+- **HandBrake removed from the sample-encode path.** New `ffmpeg_sample_encode()`
+  reuses the real (non-sample) encode's own `determine_hdr_mode()` /
+  `build_ffmpeg_video_args()` for HDR/color-metadata handling — the same
+  machinery `determine_hdr_mode`'s own comments describe being shaped by "the
+  original tint bug" — so the sample can't diverge from the real encode's
+  color handling. `encode_sample_av1`/`encode_sample_x265` are now thin
+  wrappers around it. Sample-encode call sites never touch disc/ISO/Blu-ray
+  sources (`av1_source_reencode_sample_decision` has no disc/title parameter),
+  so this has zero effect on disc handling, which still goes through
+  HandBrake via the separate `handbrake_encode()` function.
+- **CRF alignment.** The sample now calls `resolve_crf_for_encode()` — the
+  same VMAF-targeted search the real SDR encode uses — instead of a generic
+  fixed CRF. The old fixed-CRF sample (true of the prior HandBrake sample too,
+  not new to this change) could land several CRF points below what a real SDR
+  encode's VMAF search would choose, systematically under-predicting how much
+  a file would shrink and permanently VES-tagging/done-logging files that
+  would have genuinely benefited from AV1 — exactly the false-negative-skip
+  risk this sample test exists to avoid. HDR sources are unaffected (both
+  paths already used the same fixed CRF for HDR). The VMAF search result is
+  cached (`VMAF_CRF_CACHE`) and reused verbatim if a real encode of the same
+  file follows, so this doesn't pay the search cost twice.
+- **Stream-mapping fix.** Clip extraction previously used `-map 0`, pulling
+  global attachments (cover art, embedded fonts) into the clip regardless of
+  clip length, while the sample encode itself never mapped attachments —
+  inflating the clip-size side of the encoded/clip ratio without a matching
+  inflation on the encoded side, corrupting the extrapolated full-file size
+  prediction on titles with a large attachment set. Clip extraction now maps
+  video/audio/subs only; the sample encode now also copies subs, so its track
+  composition matches both the clip and what a real encode actually mixes in.
+- **`hdr_mode=unknown` and Dolby Vision profile 5 (no libplacebo) now fail
+  closed and flag the source for human review**, matching the real encode's
+  behavior, instead of silently retrying forever with no trace in either
+  `bad_sources.txt` or the done-log.
+- **Two real `set -e` bugs fixed in production `ffmpeg_encode()`** (the real,
+  non-sample encode path): its retry-without-subtitles fallback used a bare
+  `run_tracked_encoder ...; rc=$?` with no `||` guard — under this script's
+  `set -e`, a real ffmpeg failure would abort the entire script immediately
+  instead of triggering the intended graceful retry. Also fixed 4 occurrences
+  of a related `[ "$acodec" = libopus ] && args+=(...)` pattern (bare
+  compound with no trailing `||`) that had the same abort risk whenever
+  `acodec` wasn't literally `libopus` (always true for x265 sample/real
+  encodes, and for AV1 on any ffmpeg build without libopus).
+- **Multi-point complexity sampling.** New `find_complexity_sample_points()`
+  picks 3 representative points (low/median/high local bitrate, a free
+  encoder-already-computed proxy for scene complexity/motion) instead of one
+  arbitrary mid-file cut, which could land on a uniquely quiet or uniquely
+  busy scene and skew the prediction either way. Uses `ffprobe -read_intervals`
+  to sparsely probe ~15 short (10s) windows spread across the usable duration
+  (excluding the first/last 3 minutes as likely credits) rather than a
+  continuous full-file packet scan — measured 3+ minutes and still incomplete
+  for a naive full scan on a 7GB 4K title over this fleet's NFS, vs ~8s for 32
+  sparse windows across a full 2h42m movie. `av1_source_reencode_sample_decision`
+  now extracts and encodes at each found point, averaging the 3 extrapolated
+  full-file predictions (falls back to one mid-file sample if the complexity
+  scan fails or the source is too short to usefully split).
+- **Real bug found via live testing, not static review:** a `printf -v`
+  variable-name collision. `ffmpeg_sample_encode()` passed the literal string
+  `"crf"` as `resolve_crf_for_encode()`'s output-variable name — but
+  `resolve_crf_for_encode()` has its own local variable of that exact name,
+  and bash resolves `printf -v`/nameref writes to the innermost scope with a
+  matching name, so the write silently landed on `resolve_crf_for_encode`'s
+  own local instead of the caller's. The caller's `$crf` was left permanently
+  unbound; under this script's `set -u`, the very next reference to it (the
+  `build_ffmpeg_video_args` call) killed the current subshell outright — no
+  graceful nonzero return, no diagnostic, nothing, which is what made this so
+  hard to pin down live (initially misdiagnosed as several different `set -e`
+  patterns, none of which were the actual cause; confirmed the real mechanism
+  only by isolating the crash on a local ramdisk copy with fully-cleared
+  sidecar state, ruling out NFS/caching artifacts, then sending the live
+  reproduction — not just a code read — to team review). Fixed by using a
+  distinctly-named `resolved_crf` local, mirroring how `ffmpeg_encode()`
+  already avoids this correctly.
+
 ## v5.0.32I — 2026-07-22
 
 Critical silent-data-loss bug found during a fleet-wide real-NAS re-test of
