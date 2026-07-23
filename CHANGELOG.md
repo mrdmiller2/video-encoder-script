@@ -4,6 +4,108 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.32Q — 2026-07-22
+
+Two things landed together: (1) a new upfront audio/subtitle-truncation
+check, prompted by Dune (2021) — its source's audio track was genuinely
+short, but this wasn't caught until AFTER a full ~2-hour real AV1 encode,
+because the existing truncation check only ran post-encode; (2) a
+comprehensive CRITICAL production-readiness pass — a full 4-way team review
+(both halves of the ~12,700-line file) ahead of turning this
+loose unattended across ~200TB, followed by two more verification rounds on
+the fixes. Every finding below was confirmed via direct bash testing before
+being fixed, not taken on the reviewers' word alone (which also correctly
+ruled out a few false positives — see below).
+
+**Audio/subtitle upfront validation:**
+- `validate_source_media()` now runs the same audio-truncation check that
+  previously only ran post-encode, so a truncated source is caught and
+  deferred for human review before an expensive real encode is ever
+  attempted.
+- New `validate_mkv_subtitle_tracks()` — NOT true dialogue-timing-accuracy
+  verification (infeasible cheaply, needs OCR/speech analysis), a coverage/
+  truncation check: does the primary subtitle track have any cue in the
+  film's last 25% of runtime. Went through 2 redesigns after team review
+  found the first version unsafe to ship: it did a full unseeked file scan
+  (defeating "cheap by design" and risking timeout-during-scan
+  misclassified as truncation) and used an unreliable cue-count heuristic
+  that would false-positive on real forced/sign-only subtitle tracks.
+  Redesigned to use the same bounded near-EOF seek as the audio check, plus
+  asking ffprobe's own `disposition:forced` flag directly instead of
+  guessing from cue density.
+
+**The single biggest finding, confirmed via direct bash testing:** a bare
+command (or command substitution) that fails, followed on the next line by
+code reading `$?` or `${PIPESTATUS[0]}`, aborts the ENTIRE script right at
+the failing line under `set -e` — the line reading the exit code never
+runs. This is fundamentally different from `A && B` (where A's failure is
+exempt); a bare unprotected statement has no such exemption. Fixed
+everywhere by replacing the bare-then-read-next-line pattern with
+`x="$(cmd)" && rc=0 || rc=$?` (or a trailing `|| true` where the code isn't
+needed) — exempt from `set -e` because it's part of an `&&`/`||` list, while
+still capturing the real exit code. This affected:
+- All 3 of the audio/subtitle validation functions above — their careful
+  timeout-vs-real-failure distinction logic was unreachable dead code.
+- 4 pre-existing encoder-dispatch functions (`ffmpeg_encode_hw`,
+  `handbrake_encode`, `vaapi_hevc_encode`, `remux_copy_to_mkv`) using a bare
+  `cmd; local rc=$?` pattern.
+- Encoder-version fingerprint parsing (`current_svtav1_major_minor`,
+  `current_x265_major_minor`) — a fleet-wide single point of failure if a
+  future encoder build ever changes its version-banner text.
+- 12 call sites of `mkv_structure_stat_key`/`dir_subtree_max_mtime` that
+  would crash if a file vanished or `stat` failed between being listed and
+  being checked — routine at fleet scale.
+
+**Other confirmed bugs fixed:**
+- **Must-eliminate tie-break could mark a source done with no valid output
+  anywhere** (`try_x265_convert`): an unchecked `mv` of a stashed AV1
+  candidate into its canonical path could fail (NFS glitch), leaving neither
+  AV1 nor x265 in place, while `record_conversion_result` unconditionally
+  marks the source permanently done regardless of whether the output
+  actually exists. Fixed by checking the `mv`'s success and falling back to
+  the already-validated x265 output if the move fails.
+- **Lock released before source mutation completes** (`tag_preexisting_
+  desired_format`): `clear_in_progress_flag` ran BEFORE the `mkvpropedit`
+  tag rewrite, letting a concurrent fleet machine see the source as
+  unlocked and start its own work while the same NFS-shared file was still
+  being rewritten. Fixed by reordering.
+- **Completed encode silently discarded on a transient copy failure**
+  (`finalize_staged_encode_output`): a failed `cp` to the final NFS
+  destination (disk full, transient I/O error) deleted the staged file —
+  potentially hours of work — unlike the sibling `mv`-failure branch, which
+  already preserved it for recovery. Fixed to match.
+- **One filename collision could kill an entire unattended organize pass**
+  (`organize_library`): `organize_movie_entry` legitimately returns 1 on a
+  destination collision, but the bare (unprotected) call in the for-loop
+  meant that single failure aborted the whole script under `set -e` — not
+  just that one file — confirmed via direct bash testing that a bare
+  failing command inside a for-loop body kills the entire script. Fixed
+  with `|| warn ...`.
+- **Missing timeout on post-encode decode validation** (`validate_mkv_
+  decode_windows`): unlike every other validation helper (ffprobe/mkvmerge/
+  mkvalidator), its ffmpeg decode-window probes had no timeout — a `-t`
+  argument bounds decoded output duration, not wall-clock time, so a
+  stalled NFS read could hang a machine indefinitely. Fixed with a new
+  `run_ffmpeg_validation()` wrapper, with proper timeout-vs-real-failure
+  distinction added (a timeout must never be misread as confirmed decode
+  corruption).
+
+**False positives ruled out** (claimed by the initial review, disproven via
+direct bash testing, left unchanged): bare `[ cond ] && simple_assignment`
+patterns (e.g. `[ "$ok" = false ] && status=failed`) do NOT trigger `set -e`
+when cond is false — a non-final command in an `&&`/`||` list is exempt
+regardless of whether it actually executes.
+
+**Deliberately deferred** (lower severity, noted for a future pass): no
+heartbeat refresh on the in-progress lock during long HandBrake disc
+encodes (only ffmpeg encodes refresh it); a must-eliminate AV1 candidate
+stash can be leaked (not corrupted) if x265's own validation times out;
+`run_mkvpropedit` still has no timeout; the disc AV1 encoder bake-off scores
+SSIM against a clip that's never created for a HandBrake-title source
+(wrong encoder choice, not data loss); done-log appends from multiple
+fleet machines on NFS aren't guaranteed atomic (could produce a garbled
+line, not data loss).
+
 ## v5.0.32P — 2026-07-22
 
 Adds must-eliminate-format handling and a `Deferred/` human-review folder,
