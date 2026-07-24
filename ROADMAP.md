@@ -18,18 +18,14 @@ it or discover data loss after the fact.
 
 ## Immediate next steps
 
-1. **Deploy v5.0.32R to GruntBox2 and launch its confidence-batch-test
-   title.** As of 2026-07-24, GruntBox2 is the only fleet machine still on
-   v5.0.32Q (still finishing its prior test job, "Harmony of Mille-Feuille").
-   Once idle: deploy the same way the other 7 machines were done (see
-   `orchestration/results/phase0-fleet-GruntBox2/` if a rsync-post-xfer
-   package exists for it, otherwise scp directly to
-   `/home/worker/VES/GruntBox2/script/` as done previously), then pick a
-   fresh, previously-untouched, genuinely legacy-codec (h264/hevc) anime
-   title for it the same way the other 5 replacement picks were done this
-   session (check codec via `ffprobe` on episode 1 AND check for a
-   pre-existing `convert-v4.log` in the folder before assigning — several
-   titles this session turned out to be already mostly/fully processed).
+1. **Relaunch confidence-batch-test jobs on PRINCE and GruntBox2.** Both
+   machines' 2026-07-24 encode jobs (PRINCE: 7Seeds; GruntBox2: 009-1) got
+   killed mid-run by the repeated WSL2 restarts during the fs-cache custom-
+   kernel work (see the fs-cache section below) — no process running on
+   either as of the last check. All other 5 Linux machines finished their
+   confidence-batch-test runs cleanly on v5.0.32R. Relaunch both once
+   convenient (same titles are fine to resume, or pick fresh ones — check
+   codec + any pre-existing `convert-v4.log` first, as usual).
 
 2. **Investigate the "A Centaur's Life (2017)" corruption on Plex.** All 12
    episodes hit genuine `mkvalidator` structure errors during the 2026-07-24
@@ -89,6 +85,80 @@ it or discover data loss after the fact.
    before its correct re-encode). Installing Homebrew coreutils would give
    Crystalight a real `gtimeout` and remove this whole class of risk. Raised
    but never actioned — no explicit user go-ahead yet.
+
+7. **Crystalight (macOS) fs-cache equivalent — not yet investigated.** See
+   the fs-cache section below for the full 7-machine Linux/WSL2 fix; macOS's
+   NFS client has no direct equivalent to Linux's persistent disk-backed
+   fscache/cachefilesd (only in-RAM buffer caching, not persistent across
+   reboots). Whether a userspace caching layer (e.g. a FUSE-based cache proxy)
+   is worth the complexity for Crystalight specifically has not been
+   researched yet.
+
+## fs-cache (FS-Cache/cachefilesd) — fleet status: 7/8 done (2026-07-24)
+
+Goal: leverage each machine's local disk to cache NFS reads, reducing
+redundant network trips to the NAS and load on the server. Final state:
+
+| Machine | Status |
+|---|---|
+| docm | Was already working correctly (reference config for all fixes below) |
+| Plex | Fixed — cache dir was pointed at `/tmp` (wiped on reboot) and the daemon was disabled; moved to `/var/cache/fscache`, enabled |
+| MacFedora | Fixed — `cachefilesd` wasn't installed; installed, cache dir set to `/mnt/DATA/fscache` (larger local partition, doesn't contend with the small OS disk) per user request; required fixing a real SELinux issue too — the whole `/mnt/DATA` mount was completely unlabeled (`unlabeled_t`), blocking `cachefilesd_t` from traversing into it at all; `restorecon -R /mnt/DATA` fixed it |
+| GruntVM | Fixed — `cachefilesd` wasn't installed, and the `cachefiles` kernel module wasn't loaded even after install (`/dev/cachefiles` didn't exist); installed, added `cachefiles` to `/etc/modules-load.d/`, and — separately — `/etc/default/cachefilesd` had no `RUN=yes` line at all (absence defaults to disabled, not enabled) |
+| AI-PROCESSOR | Same fixes as GruntVM (identical base image) |
+| **PRINCE** (WSL2) | Fixed via a **custom WSL2 kernel** — see below |
+| **GruntBox2** (WSL2) | Fixed via the same custom WSL2 kernel approach |
+| Crystalight (macOS) | Not yet addressed — see gap #7 above |
+
+**Why PRINCE and GruntBox2 needed a custom kernel:** Microsoft's stock WSL2
+kernel has `CONFIG_FSCACHE=y` built in but `CONFIG_CACHEFILES` is **not set**
+— the actual disk-cache backend driver is simply absent, no package can work
+around a kernel option that isn't compiled in. No prebuilt community WSL2
+kernel enables it either (checked several popular ones). Built one from
+`microsoft/WSL2-Linux-Kernel` at the exact matching tag
+(`linux-msft-wsl-6.18.33.2`), enabling `CONFIG_CACHEFILES=y` via
+`./scripts/config --enable CONFIG_CACHEFILES` + `make olddefconfig`,
+starting from `Microsoft/config-wsl` as the base.
+
+**The build was built once (on GruntBox2) and reused on both machines** —
+same kernel version, same WSL2 virtualized hardware regardless of physical
+host, so one `bzImage` + matching `/lib/modules/<version>/` tree works on
+both. PRINCE's own from-scratch build attempt OOM'd during BTF generation
+(`CONFIG_DEBUG_INFO_BTF`, a memory-hungry step, unnecessary for our purposes)
+under its original 24GB WSL2 memory cap; rather than keep fighting that,
+GruntBox2's build (144GB host RAM, no memory pressure, `CONFIG_DEBUG_INFO_BTF`
+left enabled and fine) was copied over instead. PRINCE's `.wslconfig` memory
+was also bumped 24GB→28GB per user's direction as a side benefit.
+
+**Real mistake made and fixed, worth remembering:** the first attempt to copy
+GruntBox2's ~2GB `/lib/modules/<version>/` tree to PRINCE via an 881MB tarball
+used a command wrapped in a short client-side SSH `timeout`, which silently
+truncated the extraction — 270 of 961 `.ko` files ended up 0 bytes, with no
+visible error at the time. This caused a cascade of confusing symptoms
+(`modinfo`/`depmod` "Invalid argument" on some modules, `mount.nfs: No such
+device`) that looked like a kernel/module version mismatch but was actually
+just corrupted files. **Lesson: after any large background file transfer or
+extraction, verify actual content (checksum, or at minimum a zero-byte-file
+count) before trusting it succeeded — a clean exit code is not proof of
+completeness if a wrapping timeout could have killed the underlying process.**
+Redoing the transfer+extraction in the background (no client-side timeout)
+and checking `find ... -size 0 | wc -l` was 0 before proceeding fixed it.
+
+**Ongoing maintenance cost accepted by user:** future Microsoft WSL2 kernel
+updates will not apply automatically to PRINCE or GruntBox2 anymore — each
+update requires manually re-cloning the new tag, re-enabling
+`CONFIG_CACHEFILES`, rebuilding, running `modules_install`, and redeploying
+to both machines. Not automated; revisit if this becomes a recurring burden.
+
+**Also needed on both WSL2 machines** (neither persisted across the fresh
+kernel by default): `nfs` and `nfsv4` modules added to
+`/etc/modules-load.d/cachefiles.conf` for boot-time auto-load (the mount
+otherwise fails at boot with "No such device" until `modprobe nfs nfsv4` is
+run manually), and `fsc` added to each NFS entry in `/etc/fstab`.
+
+All 7 fixed machines were verified with a real double-read `dd` timing test
+(not just checking service status) — e.g., PRINCE went from 9.3 MB/s on a
+first read to 13 GB/s on the immediate re-read (~1,400x).
 
 ## Housekeeping
 
