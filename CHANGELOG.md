@@ -4,6 +4,67 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.32R — 2026-07-24
+
+Two changes, both from the same fleet confidence-building test (10 items/machine
+across all 8 fleet machines on v5.0.32Q).
+
+**Lowered preexisting-desired-format size gates.** Several machines (PRINCE,
+Crystalight, GruntBox2) finished suspiciously fast — every assigned episode
+was already-AV1 and fell under the old `PREEXISTING_SMALL_SKIP_MAX_MB=300` /
+`PREEXISTING_X265_SMALL_SKIP_MAX_MB=250` caps, so the whole batch just got
+tagged "preexisting desired format" without ever running the real 3-point
+sample test. Lowered to 50MB/80MB respectively so anime-episode-sized files
+(typically 120–290MB) actually get sample-tested. Confirmed live: relaunching
+the same 3 machines' assignments under the new caps correctly switched every
+file from an instant skip to "AV1 source — sample-testing whether re-encode
+would shrink," with a genuine mix of real skips and real re-encodes on all
+three (PRINCE: 8 real re-encodes / 5 genuine skips across 13 episodes, zero
+aborts).
+
+**New season-level shrink-vs-predicted-no-shrink heuristic.** Same-season TV
+episodes are similar enough in content that sibling results are often a
+better predictor than the per-file 3-point sample test alone. Within a single
+batch/folder run, for each (show folder, season number) pair: if ≥60%
+(`CONVERT_SEASON_RETRY_THRESHOLD_PCT`, default 60) of that season's sample-
+tested episodes actually shrank, the remaining episodes the sample predicted
+*wouldn't* shrink get one real forced-encode retry instead of trusting that
+prediction — routed by actual source codec (`try_av1_convert` for an AV1
+source, `try_x265_convert` with `force_transcode=true` for HEVC/x265, both
+already judged against the normal size/VMAF guardrails). Went through 3 full
+rounds of independent review before being considered
+done; each round surfaced real issues that were fixed and re-verified:
+- **Cross-show pollution**: the season key was originally just the season
+  digits, so every unrelated show's "S01" pooled into one bucket. Fixed by
+  keying on `(dirname(file), season)` together, not season number alone.
+- **False-confirmed failures**: any `try_av1_convert` non-zero return was
+  originally treated as "confirmed no size win" and re-tagged, even though
+  non-zero can mean an encode-tool failure, a validation timeout, or a
+  path-collision guard — none of which are a real size verdict. Fixed by no
+  longer tagging anything on failure at all; the one case that IS a genuine
+  size rejection is already tagged correctly by `try_x265_convert`'s existing
+  `tag_guardrail_exceeded` call in that exact path.
+- **Missing NFS lock**: retries originally called the encode functions
+  directly, bypassing `begin_convert_job`/`end_convert_job`'s in-progress
+  flag — a real double-encode race window on the fleet's shared NFS mounts.
+  Fixed by wrapping each retry the same way the main queue does.
+- **Remux-shortcut false success**: retrying an HEVC/x265-sourced file
+  through `try_av1_convert` could fall back into `try_x265_convert`'s
+  HEVC-MKV stream-copy remux shortcut on AV1 rejection, "succeeding" by
+  repackaging the same bytes instead of actually re-encoding. Fixed by
+  checking the file's actual codec first and forcing `force_transcode=true`
+  for the HEVC/x265 cohort, matching the precedent already set by
+  `process_existing_x265`'s own x265-decision branch.
+- **Counter pollution**: the season shrink/tested counters originally
+  incremented for *any* kept TV conversion (fresh first-time encodes, disc
+  sources, plain remuxes), not just outcomes of the actual sample-test
+  decision, which could cross the 60% threshold from unrelated work. Fixed
+  with a `SEASON_SAMPLE_DECISION_CONTEXT` guard flag, set only around the
+  av1/x265 case branches in `process_existing_av1`/`process_existing_x265`.
+- **`S1E01` vs `S01E01`**: the season number wasn't zero-padded, so the same
+  season could split across two keys. Fixed with a forced base-10 `%02d`
+  normalization.
+
 ## v5.0.32Q — 2026-07-22
 
 Two things landed together: (1) a new upfront audio/subtitle-truncation
