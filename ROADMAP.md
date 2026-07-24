@@ -16,6 +16,47 @@ Everything below is in service of building enough confidence in correctness
 and safety to actually do that at scale without a human needing to babysit
 it or discover data loss after the fact.
 
+## Accepted scope gaps (from the 2026-07-24 crash-safety review loop)
+
+A full end-to-end team review plus two follow-up
+verification passes found and fixed a critical cross-host orphan-reaper bug,
+3 NFS-shared-file races, and several other real issues (see CHANGELOG.md for
+the full list once committed). Three items were deliberately left unfixed
+rather than risk shipping something worse than the original gap:
+
+1. **Same-host concurrent double-invocation can still race on the per-host
+   resume-state file.** The per-host filename fix (embedding hostname in
+   `convert-v4.<host>.state`/`.queue`/`.shards`) closes the *cross-host*
+   race, which is what actually happens in normal fleet operation. Two
+   *separate* script invocations on the *same* host against the *same*
+   `JOB_ROOT` at the same time (a user/cron double-launch mistake, not a
+   fleet-standard pattern) would still silently overwrite each other's
+   resume state. A proper fix needs a run-lifetime lock, which would have to
+   chain into the existing `EXIT` trap set (`ramdisk_job_teardown` already
+   registers its own `trap ... EXIT`, which a second one would silently
+   clobber rather than compose with) -- a real but riskier change, deferred
+   rather than rushed.
+
+2. **The season-level shrink heuristic is process-local**, not fleet-shared.
+   If one TV season were ever split across multiple fleet hosts scanning
+   concurrently, no single host would see the complete shrink/skip ratio
+   for that season. Not applicable to the current per-show-per-machine test
+   assignment strategy; would need a shared, locked, cross-host season-state
+   file (similar to the done-log/mkv-structure-cache fix) to address for a
+   true full-library unattended run.
+
+3. **Derived-AV1 (oversized `.AV1.mkv` re-check) sample-skips are
+   deliberately excluded from the season-retry cohort.** A first attempt to
+   enroll them was reverted after review found it would silently no-op
+   (the existing-output shortcut in `try_av1_convert`/`try_x265_convert`
+   only checks `FORCE_REPROCESS_TAGGED`, not `SEASON_RETRY_IN_PROGRESS`) and
+   mis-route to an x265-only forced retry (`season_retry_pass` routes
+   purely on the stored file's current codec, and the original pre-
+   conversion sibling stored for this cohort is often not AV1). Fixing this
+   properly needs changes to `season_retry_pass`'s own routing/bypass
+   logic, not just the enrollment call site -- left as documented accepted
+   scope rather than a broken "fix."
+
 ## Immediate next steps
 
 1. **Relaunch confidence-batch-test jobs on PRINCE and GruntBox2.** Both

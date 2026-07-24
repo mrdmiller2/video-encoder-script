@@ -4,6 +4,94 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.32S — 2026-07-24
+
+A full end-to-end team review (three independent reviewers, both halves of the file
+plus a cross-cutting integration pass) ahead of the next fleet confidence test,
+followed by three rounds of fix → re-review until every finding was resolved or
+explicitly documented as accepted scope. Every fleet job was cleanly stopped
+(SIGTERM to each script's top-level PID, confirmed via the signal trap correctly
+killing its tracked ffmpeg child too) before this work began, since several
+findings touched concurrency/locking correctness.
+
+**Critical: orphan reaper could delete another fleet machine's live encode.**
+`is_convert_script_process`/`kill -0` in the staging-directory cleanup path only
+ever tests the *local* host's PID namespace — on the shared NFS library, a
+remote host's live `.convert-stage-*` directory has no matching local PID at
+all, making it look "dead" here even while it's actively being written to.
+Fixed by writing a `.convert-stage-host` marker at every staging/finalize/
+multipart directory's creation, checked by the reaper *before* any local-PID
+judgment — a marked directory belonging to another host is now skipped
+entirely (new `dirs_skipped_cross_host` stat). A directory with no marker at
+all (a pre-fix leftover, or if the marker write itself failed) is now handled
+more conservatively too: it can no longer be disposed via "local kill -0 says
+dead," only via the existing age-gate threshold — closing the gap for
+marker-less directories as well, found in a second review pass.
+
+**High: a source could be permanently moved to `Deferred/` on a transient
+NFS blip.** Both `source_looks_processable_quick` (pre-lock quick scan) and
+`validate_source_media` (encode-time) treated any non-timeout ffprobe
+failure as confirmed corruption on the first attempt — a brief NFS/network
+hiccup often surfaces as a read error rather than a clean timeout, so it
+never hit the existing "possible stalled mount" exemption. Both now retry
+once (2s pause) before concluding the source is genuinely bad.
+
+**3 NFS-shared-file race conditions**, found via full-file review:
+- The mkv-structure-validation cache and the done-log are both genuinely
+  meant to be one shared ledger across the whole fleet — their
+  read-modify-write (cache) and append (done-log) operations had no
+  cross-host locking at all, so two machines updating them concurrently
+  could silently lose each other's writes. Fixed with a new mkdir-based
+  cross-host mutex (`_shared_mutex_acquire`/`_shared_mutex_release` —
+  `mkdir` is atomic across NFS regardless of client OS, unlike `flock`
+  across this fleet's mixed Linux/WSL2/macOS clients; a ~10s stale-lock
+  reclaim prevents a crashed holder from deadlocking the fleet).
+- The resume-state/queue/shards files, by contrast, are NOT meant to be
+  shared — each tracks a single run's own progress for restart purposes.
+  These are now per-host (hostname embedded in the filename) instead of one
+  shared filename fleet-wide. Deliberately not also keyed by PID: doing so
+  would break resume-across-restart entirely (a restarted process gets a
+  new PID and could never find its own prior state). A same-host *concurrent
+  double-invocation* race is accepted as a documented residual gap rather
+  than risk a run-lifetime lock conflicting with the existing `ramdisk_job_
+  teardown` `EXIT` trap — see ROADMAP.md.
+
+**Medium fixes:**
+- `optimize_mkv_for_streaming`'s temp directory is now tracked in a new
+  `ACTIVE_STREAMOPT_DIR` global, cleaned up by both the signal-interrupt
+  handler and the `set -e` error trap — previously a local-only variable, so
+  an INT/TERM mid-remux left it behind permanently (the same pattern already
+  used for `ACTIVE_LOCAL_STAGE_DIR`/`ACTIVE_FINALIZE_DIR`).
+- `current_tool_versions_tag_suffix` computed each tool-version string via a
+  bare command substitution with no fallback — a missing/erroring `ffmpeg`
+  or `mkvmerge` would abort the whole script under `set -e` mid-tag-write
+  instead of falling back to "unknown" the way the string implied. Each
+  piece is now computed separately with its own `|| var=""`.
+- Multipart-merge finalization had two unchecked `mv` calls; a mid-sequence
+  failure could abort under `set -e`, or (if only the second `mv` failed)
+  leave the real merged output in place with no matching state file. The
+  state `mv` now retries once after a pause, and if it still fails, the
+  merge itself is reverted (`rm -f` the merged output) so the next run just
+  redoes the whole merge cleanly instead of hitting an ambiguous half-done
+  state.
+- A misleading comment claimed x265's "already small enough" skip threshold
+  sits lower than AV1's; the actual values (AV1 50MB / x265 80MB) mean the
+  opposite. Comment corrected; no functional change.
+
+**Considered but reverted:** enrolling the season-level shrink heuristic's
+derived-AV1 (oversized `.AV1.mkv` recheck) sample-skips into the same
+forced-retry cohort as genuinely-original skips. A second review pass found
+this would have actively misbehaved rather than just missing a bonus retry —
+`season_retry_pass` routes purely on the stored file's current codec, and the
+resolved original sibling for this cohort is usually not AV1, so it would
+get force-routed to an x265-only retry; separately, the already-existing
+oversized output would make `try_av1_convert`/`try_x265_convert`'s own
+existing-output shortcut return "success" immediately without re-encoding
+anything, since only `FORCE_REPROCESS_TAGGED` bypasses that check, not
+`SEASON_RETRY_IN_PROGRESS`. Reverted rather than ship a season-retry entry
+that silently no-ops; documented as accepted scope in ROADMAP.md pending a
+real fix to `season_retry_pass`'s own routing/bypass logic.
+
 ## v5.0.32R — 2026-07-24
 
 Two changes, both from the same fleet confidence-building test (10 items/machine
