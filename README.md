@@ -536,6 +536,66 @@ The script is **I/O-heavy**: sharded `find` over thousands of folders, ffprobe p
 | **USB 2.0** | Poor | Medium | **Not recommended** for transcode output |
 | **WSL `/mnt/c/` on network redirector** | Poor for metadata | High | **Avoid** for `--path` on huge trees — copy or NFS-mount into WSL instead |
 
+### Recommended: local disk caching for NFS mounts (FS-Cache / cachefilesd)
+
+If the library lives on NFS (the common case above), enable **FS-Cache** on
+each Linux/WSL2 client that runs this script — it persists recently-read
+NFS blocks to local disk, so a file the script reads more than once (the
+3-point sample test, then the full encode; a re-run after a threshold
+change; another machine's earlier pass) hits local disk instead of the
+network on the second read. This measurably reduces both wall-clock time
+and load on the NAS itself across a multi-machine fleet, at zero cost to
+correctness (it's a transparent read cache, not a change in what data is
+served).
+
+```bash
+# Debian/Ubuntu/WSL2
+sudo apt-get install -y cachefilesd
+# Fedora/RHEL
+sudo dnf install -y cachefilesd
+
+# point the cache at whichever local disk has room (defaults to
+# /var/cache/fscache — override the `dir` line in /etc/cachefilesd.conf
+# if you'd rather use a larger/dedicated local partition)
+sudo sed -i 's/^#RUN=yes/RUN=yes/' /etc/default/cachefilesd   # Debian/Ubuntu
+sudo systemctl enable --now cachefilesd
+
+# add fsc to each NFS mount's options in /etc/fstab, then remount
+sudo sed -i 's/\(vers=4\.[0-9]\)/\1,fsc/' /etc/fstab
+sudo mount -a
+```
+
+Verify it's actually caching (a running `cachefilesd` process alone doesn't
+guarantee the mount is using it):
+
+```bash
+# should show `fsc` in the active options, not just fstab
+mount | grep nfs
+
+# real proof: second read should be dramatically faster than the first
+dd if="$YOUR_PATH/some-large-file.mkv" of=/dev/null bs=1M count=50
+dd if="$YOUR_PATH/some-large-file.mkv" of=/dev/null bs=1M count=50
+```
+
+**WSL2 caveat:** Microsoft's stock WSL2 kernel has `CONFIG_FSCACHE=y` built
+in but **not** `CONFIG_CACHEFILES` — the actual disk-cache backend is
+simply absent, and no package install can work around a kernel option
+that isn't compiled in. Getting FS-Cache working on a WSL2 fleet machine
+means building a custom WSL2 kernel from
+[microsoft/WSL2-Linux-Kernel](https://github.com/microsoft/WSL2-Linux-Kernel)
+at the tag matching `uname -r`, enabling `CONFIG_CACHEFILES=y`
+(`./scripts/config --enable CONFIG_CACHEFILES && make olddefconfig`), then
+pointing `.wslconfig`'s `kernel=` at the resulting `bzImage` — a real,
+one-time build effort (and a small ongoing one: future WSL2 kernel updates
+won't apply automatically to a custom-kernel machine). Weigh that against
+how much the machine actually re-reads the same files before taking this
+on for a given box.
+
+macOS has no equivalent — its NFS client only offers an in-RAM buffer
+cache (not persistent across reboots), and the closest third-party options
+(FUSE-based caching filesystems) are either explicitly alpha-quality or not
+designed for this use case. Not recommended for a macOS fleet member.
+
 ### Practical recommendations
 
 1. **Point `--path` at the fastest mount that holds the library** — same path you would use for Plex/Jellyfin (e.g. `/mnt/BigMomma/Media/Movies/Chinese` on NFS).
