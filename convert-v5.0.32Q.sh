@@ -325,8 +325,8 @@ UPSCALE_MAX_OVERSHOOT_PCT="${CONVERT_UPSCALE_MAX_OVERSHOOT_PCT:-50}"
 # Above their threshold, both get sample-tested (existing process_existing_av1
 # for AV1; process_existing_x265 for x265, which was never previously
 # reconsidered at all once converted, regardless of size).
-PREEXISTING_SMALL_SKIP_MAX_MB="${CONVERT_PREEXISTING_SMALL_SKIP_MAX_MB:-300}"
-PREEXISTING_X265_SMALL_SKIP_MAX_MB="${CONVERT_PREEXISTING_X265_SMALL_SKIP_MAX_MB:-250}"
+PREEXISTING_SMALL_SKIP_MAX_MB="${CONVERT_PREEXISTING_SMALL_SKIP_MAX_MB:-50}"
+PREEXISTING_X265_SMALL_SKIP_MAX_MB="${CONVERT_PREEXISTING_X265_SMALL_SKIP_MAX_MB:-80}"
 # RAM-backed output staging: encode writes to a tmpfs/ramdisk (avoids the
 # active encode ever touching the NFS write path -- reads tolerate network
 # blips fine via retry, but a stalled/interrupted write on a `hard` NFS mount
