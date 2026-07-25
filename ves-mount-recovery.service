@@ -1,0 +1,12 @@
+[Unit]
+Description=VES: self-heal NFS mounts + cachefilesd after restart
+After=network-online.target cachefilesd.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/ves-mount-recovery.sh
+
+[Install]
+WantedBy=multi-user.target

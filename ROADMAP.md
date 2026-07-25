@@ -216,6 +216,56 @@ first read to 13 GB/s on the immediate re-read (~1,400x).
    is the source of truth — but worth a cleanup pass if the table's
    continuity starts to matter to someone reading it top-to-bottom.
 
+## WSL2 NFS auto-mount unreliable across restarts (2026-07-25 — root-caused and fixed)
+
+Discovered when GruntBox2's WSL2 instance restarted unattended (~7h45m
+gap in its journal, abrupt stop with no shutdown sequence, no OOM/panic —
+almost certainly the Windows host itself sleeping or rebooting, not
+anything wrong with the script or WSL2/the custom kernel). Its confidence-
+test job died silently and all three NFS mounts were gone (`df` showed
+nothing) — the folder path simply stopped existing until manually
+remounted.
+
+**Root cause, confirmed via `journalctl` on both WSL2 machines — two
+distinct failure modes, same end result:**
+- **PRINCE**: `remote-fs.target` genuinely attempts to start at boot but
+  fails via a real race — WSL2's own very-early `/etc/fstab` pass runs
+  *before* `systemd-modules-load` finishes loading the `nfs`/`nfsv4`
+  kernel modules (fails immediately, "No such device"), then systemd's
+  own generated mount units retry afterward (modules now loaded) but
+  **time out after 90s** — which lines up with the `resvport` block found
+  and fixed earlier that same session (this particular boot predated that
+  fstab fix).
+- **GruntBox2**: nothing attempted the mount at all — no fstab processing,
+  no mount-unit activity in the boot journal whatsoever. `remote-fs.target`
+  never got pulled in. A `network-online.target` timestamp claiming
+  "active since" a time *before* this boot even started is a strong clue
+  this was a host **sleep** (not a full power cycle) leaving WSL2's systemd
+  dependency graph confused rather than doing a clean cold boot.
+
+**The critical shared behavior: once a mount unit fails once, systemd
+does not retry it for the rest of that boot** — so regardless of which
+specific race fires, the practical result is identical: every WSL2
+restart (sleep, host reboot, crash, or a manual `wsl --shutdown`)
+currently requires a manual `mount -a` (and often a `cachefilesd
+reset-failed`, matching the known cosmetic LSB-exit-code quirk) before
+the machine can see its media library again.
+
+**Fix: a small self-healing systemd unit**, `ves-mount-recovery.service`
+(`ExecStart=/usr/local/sbin/ves-mount-recovery.sh`, `WantedBy=multi-
+user.target`, `After=network-online.target cachefilesd.service`) —
+unconditionally retries `systemctl reset-failed cachefilesd` + `mount -a`
+up to 6 times with a 5s backoff, checking all three mountpoints via
+`mountpoint -q`, logging the outcome via `logger -t ves-mount-recovery`
+(check with `journalctl -t ves-mount-recovery`). Deployed and functionally
+tested (manual `systemctl start`, confirmed active) on both PRINCE and
+GruntBox2 — **not yet verified across a real reboot/sleep cycle on either
+machine**, which should be done opportunistically next time either
+restarts. Not yet deployed to docm/MacFedora/Plex/GruntVM/AI-PROCESSOR/
+Crystalight — those aren't WSL2 and haven't shown this failure mode, but
+the fix is cheap/idempotent insurance worth considering for the rest of
+the fleet too.
+
 ## PRINCE full rebuild (2026-07-24 — post-fs-cache filesystem corruption)
 
 PRINCE's WSL2 root filesystem became corrupted after this session's repeated

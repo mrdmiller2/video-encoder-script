@@ -4,6 +4,24 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## Infrastructure — WSL2 NFS auto-mount self-healing service — 2026-07-25
+
+Not a script change. Root-caused why GruntBox2's confidence-test job died
+silently overnight (its WSL2 instance restarted — almost certainly the
+Windows host sleeping/rebooting — and all NFS mounts simply vanished,
+never coming back automatically). Confirmed via `journalctl` that
+`remote-fs.target`'s boot-time NFS automount is genuinely unreliable on
+this fleet's WSL2 machines (two different failure modes on PRINCE vs
+GruntBox2, same end result — see `ROADMAP.md` for the full diagnostic
+detail) and, critically, systemd never retries a mount unit after it
+fails once per boot. Added `ves-mount-recovery.sh`/`.service` (now in the
+repo root) — a small self-healing systemd unit that retries `mount -a` +
+`cachefilesd` recovery up to 6 times with backoff after any restart,
+independent of whatever specific race caused that boot's automount to
+fail. Deployed and functionally tested on PRINCE and GruntBox2; not yet
+verified across a real reboot on either (opportunistic next time one
+restarts) and not yet deployed to the non-WSL2 fleet members.
+
 ## Infrastructure — PRINCE parity audit + GruntVM/AI-PROCESSOR mount fix — 2026-07-24
 
 Not a script change. Fixed the long-tracked flat-vs-nested NFS mount
