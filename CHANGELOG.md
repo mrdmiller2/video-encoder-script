@@ -4,6 +4,30 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.32T — 2026-07-25
+
+**Real bug found during a full fleet log audit (not a hypothetical):** on
+Crystalight, one episode's source needed an `mkvalidator` repair, the
+repair succeeded, but the resulting re-encode's own output *also* failed
+`mkvalidator` structure validation and was correctly discarded (original
+preserved, no data lost) — yet the batch log showed `Job 12 of 13
+complete` with no "Job failed" warning, and the run's final tally counted
+it in neither `files processed` nor `files skipped`. Root cause:
+`process_video()`'s AV1/HEVC-source dispatch branches called
+`process_existing_av1 "$src"` / `process_existing_x265 "$src"` and then
+**unconditionally `return 0`**, discarding those functions' real exit code
+(1 on a genuine encode/validation failure) before it ever reached the
+caller (`process_video "$f" && CONVERT_JOB_OK=true || warn "Job failed —
+continuing queue: $f"`). Fixed by capturing and propagating the real
+return code (`local rc=0; process_existing_av1 "$src" || rc=$?; return
+"$rc"`, same for x265) — `set -e`-safe since the call sits on the left of
+`||`. Confirmed via 3-way independent review that: the fix is correct, no similar bug exists on the disc-source path
+(which already propagates `try_av1_convert`'s exit code naturally as the
+function's last command), and — a benefit none of us had fully clocked
+going in — this also restores correct **resume** behavior, since a
+falsely-"successful" job was previously never eligible for retry on a
+subsequent resumed run.
+
 ## Infrastructure — WSL2 NFS auto-mount self-healing service — 2026-07-25
 
 Not a script change. Root-caused why GruntBox2's confidence-test job died
