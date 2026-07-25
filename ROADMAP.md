@@ -92,22 +92,27 @@ rather than risk shipping something worse than the original gap:
 
 ## Known-but-not-yet-fixed infrastructure gaps
 
-4. **GruntVM and AI-PROCESSOR still use the old flat NFS mount convention**
-   (`10.x.x.150:/mnt/BigPoppa/Media` mounted directly at `/mnt/BigPoppa`, no
-   nested `/Media` segment) — confirmed still broken as of the 2026-07-24
-   confidence-batch-test launch (both failed with "Path not found" on the
-   nested-convention path, worked once given the flat path instead). Plex,
-   docm, PRINCE, MacFedora, GruntBox2, and Crystalight (via its own
-   `/Volumes/...` convention) were already standardized to the nested
-   convention back on 2026-07-23. Fix: edit `/etc/fstab` on both machines
-   the same way it was done for Plex (`sudo cp /etc/fstab /etc/fstab.bak-*`,
-   change the NFS source from `.../BigPoppa/Media` to `.../BigPoppa`, keep
-   the local mount point at `/mnt/BigPoppa`, remount). Lower risk than the
-   Plex migration was — no database to rewrite, just a mount + `find`/`ls`
-   verification pass afterward. **Every script invocation on these two
-   machines needs to keep using the flat path (`/mnt/BigPoppa/Anime/...`,
-   no `/Media/`) until this is fixed** — don't forget when picking future
-   test titles for them.
+4. ~~GruntVM and AI-PROCESSOR still use the old flat NFS mount convention~~
+   **Fixed 2026-07-24.** Both machines' `/etc/fstab` changed from
+   `10.0.1.103:/mnt/<Share>/Media` (flat, mounted directly at
+   `/mnt/<Share>`) to bare `10.0.1.103:/mnt/<Share>` — matching the
+   nested convention every other Linux/WSL2 fleet machine already uses
+   (`/mnt/<Share>/Media/...` resolves via NFSv4's unified pseudo-filesystem,
+   same mechanism PRINCE/GruntBox2 rely on). Old fstab backed up first
+   (`/etc/fstab.bak-20260724`). AI-PROCESSOR's separate `StockLake` mount
+   (different source IP, `10.0.2.101`, unrelated export) was deliberately
+   left untouched per explicit instruction. Verified on both via `ls
+   /mnt/BigPoppa/Media` showing real content post-remount. One real
+   complication on AI-PROCESSOR: the old flat mount wouldn't `umount` —
+   `fuser -vm` showed it was genuinely busy, not just mount-stacking: a
+   live confidence-test job (VMAF comparison, `ffmpeg ... libvmaf`, PID
+   1319172, ~1.5hr in) had files open through it. Fixed with `umount -l`
+   (lazy unmount) — detaches the stale mount from the namespace
+   immediately without disturbing already-open file handles, confirmed
+   the live job kept running normally (`ps -p` before/after, same PID,
+   uninterrupted). **Every script invocation on these two machines can
+   now use the same nested path convention as the rest of the fleet** —
+   the flat-path exception above no longer applies.
 
 5. **Crystalight path uniformity via symlinks — not yet executed.**
    Proposed approach (from 2026-07-23): create `/mnt/BigMomma`,
@@ -324,6 +329,56 @@ credentials were shared out-of-band (not committed) and stored client-side
 at `~/.config/ves-secrets/PRINCE-{vesdeploy,veslogs}.pw` on the control
 host, matching the `CLIENT_DEPLOY_PASSWORD_FILE`/`CLIENT_LOGS_PASSWORD_FILE`
 convention `generate-rsync-secrets.sh` already anticipated.
+
+## PRINCE feature-parity audit — 2026-07-24 (post-rebuild)
+
+Full comparison against GruntBox2 (same WSL2 platform), MacFedora (same
+personal-account-plus-service-`worker`-account model), and docm (control
+host / fleet standard reference), to confirm PRINCE is a genuine full
+member of the fleet after its rebuild, not just "ffmpeg works again":
+
+- **SVT-AV1 encoder version matches exactly** across docm, PRINCE, and
+  GruntBox2 — `v4.1.0-279-gd3c4cb394` on all three, despite the wrapping
+  ffmpeg nightly builds having different build dates (BtbN pins the same
+  SVT-AV1 source commit across nightlies). Satisfies the fleet-wide
+  SVT-AV1 version constant with no action needed.
+- **sshd session-concurrency settings match the actual fleet standard**
+  (confirmed via docm's own `/etc/ssh/sshd_config`: `Port 2022`,
+  `MaxSessions 50`, `MaxStartups 50:30:100`) — PRINCE's settings, applied
+  earlier this session, are correct. GruntBox2, by contrast, is still on
+  stock defaults (`Port 22`, no `MaxSessions`/`MaxStartups` override) —
+  a **pre-existing GruntBox2 gap**, not something this audit was scoped to
+  fix, but worth closing in a future pass for real fleet-wide consistency.
+- **`worker` group membership**: added `docm` as a supplementary member of
+  PRINCE's `worker` group (`sudo usermod -aG worker docm`), matching the
+  cross-membership pattern MacFedora already uses (`worker`'s groups
+  include `localuser2`) — lets the interactive account browse/manage the
+  `worker`-owned `~/VES/PRINCE/` tree without needing `sudo` for routine
+  read access.
+- **`cachefilesd` cache directory**: confirmed default (`/var/cache/fscache`),
+  matching docm/GruntBox2's convention (not a custom location like
+  MacFedora's `/mnt/DATA/fscache` — that was a deliberate choice specific
+  to MacFedora's small OS disk, doesn't apply to PRINCE's WSL2 virtual
+  disk which has ample room).
+- **No fastfetch/neofetch banner risk** — confirmed absent from PRINCE's
+  `/etc/bashrc`/`~/.bashrc`/profile.d entirely, and moot regardless since
+  the `worker` account has `/usr/sbin/nologin` as its shell (can never get
+  an interactive session that could trigger one).
+- **No cron/automation timers beyond stock Ubuntu system timers** (12
+  standard timers — `apt-daily`, `logrotate`, `man-db`, etc.) — matches
+  GruntBox2 and the rest of the fleet; the script is still invoked
+  manually everywhere, no machine has cron-driven automation yet.
+- Tool inventory (ffmpeg/mkvmerge/HandBrakeCLI/ab-av1/nvidia-smi/
+  cachefilesd/NFS mounts/rsyncd/`~/VES/PRINCE/` script deployment) — all
+  covered in the "PRINCE full rebuild" section above, all verified present
+  and working.
+
+**Conclusion: PRINCE is a fully verified, feature-complete fleet member**
+as of this audit — no remaining gaps found specific to PRINCE. The two
+items surfaced (GruntBox2's sshd hardening gap, and GruntBox2/PRINCE both
+lacking `rsyncd` before this session) are pre-existing gaps on *other*
+machines, tracked here for a future pass rather than blocking this audit's
+conclusion.
 
 ## Process notes for future sessions (see also Memory/nuance below)
 

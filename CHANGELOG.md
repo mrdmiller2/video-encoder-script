@@ -4,6 +4,23 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## Infrastructure — PRINCE parity audit + GruntVM/AI-PROCESSOR mount fix — 2026-07-24
+
+Not a script change. Fixed the long-tracked flat-vs-nested NFS mount
+convention mismatch on GruntVM and AI-PROCESSOR (`/etc/fstab` source
+changed from `.../BigPoppa/Media` to bare `.../BigPoppa`, matching the
+nested convention already used everywhere else) — AI-PROCESSOR's separate
+`StockLake` mount (different source IP, unrelated export) was explicitly
+left untouched. One real complication handled safely: AI-PROCESSOR had a
+live confidence-test VMAF comparison job with files open through the old
+mount; `umount -l` cleared it without disturbing the running job. Also
+ran a full feature-parity audit of PRINCE against GruntBox2/MacFedora/docm
+post-rebuild — SVT-AV1 version, sshd hardening, worker-group membership,
+cachefilesd config, fastfetch exclusion, and cron/timer inventory all
+confirmed matching the fleet standard, with two small gaps closed
+(`docm` added to PRINCE's `worker` group for parity with MacFedora's
+model). Full detail in `ROADMAP.md`.
+
 ## Infrastructure — PRINCE full WSL2 rebuild — 2026-07-24
 
 Not a script change (no version bump) — PRINCE's WSL2 root filesystem
