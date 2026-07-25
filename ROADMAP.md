@@ -211,6 +211,120 @@ first read to 13 GB/s on the immediate re-read (~1,400x).
    is the source of truth — but worth a cleanup pass if the table's
    continuity starts to matter to someone reading it top-to-bottom.
 
+## PRINCE full rebuild (2026-07-24 — post-fs-cache filesystem corruption)
+
+PRINCE's WSL2 root filesystem became corrupted after this session's repeated
+"Catastrophic failure" WSL restarts (compounded by the Windows C: drive
+being nearly full — 13GB free — at the time), surfaced when the
+2026-07-24 confidence-test job reported "successfully completed" 12/12
+episodes but every single one had actually hit "SKIP: x265 sample test
+failed" — zero real encodes happened. Root-caused via direct reproduction:
+`ffmpeg` crashed with a **Bus error (SIGBUS, exit 135)** decoding *any* MKV,
+including a synthetic file it had just encoded itself seconds earlier —
+ruling out a content-specific issue. Filesystem-level `Input/output error`
+reading unrelated binaries (`ffmpeg`, `lscpu`, `dmesg`, `mount`, `sudo`
+itself) confirmed real ext4 corruption inside the `.vhdx`, not a
+CPU/SIMD/content bug (a GruntBox2 same-kernel-version comparison ruled that
+out first).
+
+**Fix: full rebuild, not repair.** Given the disk was disposable (20G used,
+no media — all media is NFS, not local) and C: was nearly full anyway,
+`wsl --unregister Ubuntu` + fresh install directly on D: (500GB free)
+was faster and safer than fsck-ing a nearly-full disk. The custom kernel
+survived untouched (it's a global `.wslconfig` setting, not part of the
+distro). Full re-provisioning from that fresh distro:
+
+- `openssh-server`, `nfs-common`, `cachefilesd`, `curl`, `xz-utils`,
+  `ca-certificates`, `mkvtoolnix` via apt; `ffmpeg`/`ffprobe` via a fresh
+  BtbN static build (`ffmpeg-master-latest-linux64-gpl.tar.xz`); `ab-av1`
+  v0.11.4 via its GitHub release (correct asset is `.tar.zst`/`musl`, not
+  `.tar.gz`/`gnu` — the obvious guessed URL 404s); `handbrake-cli` via apt.
+- `/etc/modules-load.d/cachefiles.conf` (`cachefiles`, `nfs`, `nfsv4`) and
+  `RUN=yes` in `/etc/default/cachefilesd` — **but the custom kernel's
+  `/lib/modules/<version>/` tree does NOT survive a distro rebuild** (it
+  lives in the distro's own root filesystem, not the shared `.wslconfig`
+  kernel image) — re-transferred fresh from GruntBox2 (881MB tarball,
+  checksum-verified at every hop: GruntBox2 → sandbox → PRINCE, all three
+  matched). `/lib/modules` itself didn't even exist yet on the fresh distro
+  (no distro kernel package ever installed inside WSL) — had to `mkdir -p`
+  it before extracting.
+- `~/VES/PRINCE/script/convert-v5.0.32S.sh` redeployed from the canonical
+  copy (checksum-verified match), following the same `~/VES/<host>/script/`
+  + `~/VES/<host>/logs/` + `convert-current.target` convention already in
+  use on GruntBox2.
+- `nvidia-smi` (RTX 4070 Laptop GPU, NVENC AV1 confirmed working) lives at
+  `/usr/lib/wsl/lib/nvidia-smi` on a fresh WSL2 GPU-passthrough install but
+  isn't on `PATH` by default — added via `/etc/profile.d/wsl-nvidia-path.sh`.
+- sshd: `MaxSessions 50`, `MaxStartups 50:30:100`, `ClientAliveInterval 60`,
+  `ClientAliveCountMax 120` reapplied (no prior record of the original
+  values existed in CHANGELOG/ROADMAP/memory — a discipline gap now closed
+  by this entry existing). `Port 2022` already present in the base
+  `/etc/ssh/sshd_config` (this was mis-read as `Port 22` mid-session by
+  comparing against the wrong host's config — always double check which
+  machine's file is on screen).
+
+**Two real networking bugs found and fixed on the fresh install, in this
+order:**
+
+1. **A misleading GRO red herring.** `dmesg` showed "Driver has suspect GRO
+   implementation, TCP performance may be compromised" on `eth0` — looked
+   like the obvious explanation for the session's earlier intermittent
+   SSH connectivity (TCP handshakes randomly stalling in `SYN-SENT` despite
+   ICMP/ARP working fine, across dozens of retries). Disabling
+   `gro`/`gso`/`tso` via `ethtool -K eth0` did **not** fix the actual NFS
+   mount hang tested afterward — this was a genuine kernel warning, but not
+   the cause of either symptom. Don't chase this again if it recurs; it
+   didn't correlate with either bug below.
+2. **The real cause: NFS's default `resvport` (privileged source port
+   <1024) gets silently blocked** on this fresh install, while normal
+   high-port connections (SSH, a plain `/dev/tcp` bash test) work fine —
+   this is almost certainly also what caused the earlier SSH connectivity
+   saga (intermittent success was likely luck of ephemeral port selection
+   landing above/below some threshold, not genuine flakiness). Confirmed
+   by testing `mount -t nfs4 ... 10.0.1.103:/mnt/BigMomma/Media
+   /mnt/testmount` directly: hung indefinitely with default options,
+   `-o noresvport` mounted instantly with real data visible. Fixed
+   permanently by adding `noresvport` to all three NFS lines in
+   `/etc/fstab` (`fsc,noresvport` — order matters only cosmetically).
+   **If PRINCE (or any future fresh WSL2 install on this fleet) ever shows
+   NFS mounts hanging while `showmount -e`/`rpcinfo -p`/ICMP all work fine
+   against the server, check `noresvport` first before anything else.**
+
+Final verification: `ffmpeg` decode of a synthetic file (exit 0, no Bus
+error) **and** the exact real-fleet sample-clip-extraction command against
+`A Certain Scientific Accelerator S01E06` that previously crashed all
+12/12 episodes (exit 0, real 2MB clip produced). PRINCE is confirmed fully
+working end to end as of this entry; the 2026-07-24 confidence-test job on
+PRINCE needs to be relaunched from scratch (the earlier "successful"
+12/12 result was entirely false — zero real encodes occurred).
+
+**Also restored: PRINCE's rsync-daemon fleet-distribution setup**, which
+the rebuild wiped along with everything else. Fleet-wide rollout status
+turned out to be much further along than this conversation initially
+assumed — `docm`, Plex, MacFedora, GruntVM, AI-PROCESSOR, and Crystalight
+all already run the Phase 0 `rsyncd` daemon (`ves-deploy` write module +
+`ves-logs` read-only module, per `orchestration/tasks/phase0-rsync-setup.md`);
+only GruntBox2 and PRINCE were missing it (GruntBox2's absence is a
+pre-existing, separately-tracked gap, not something this session touched).
+Redeployed on PRINCE from the pre-generated
+`orchestration/results/phase0-fleet-PRINCE/` config, substituting the real
+control-host CIDR (`10.0.0.100/32`) for the `__DOCM_CONTROL_IP_CIDR__`
+placeholder. One real gap found and fixed along the way: **PRINCE never had
+the fleet's unified `worker` system account** (used by every other Linux/
+WSL2 machine — including personal-login machines like MacFedora — to own
+the `/home/worker/VES/<host>/` tree, distinct from whatever account SSH
+login actually uses). Created it (`useradd -m -s /usr/sbin/nologin worker`),
+relocated the already-deployed script from `/home/docm/VES/PRINCE/` to
+`/home/worker/VES/PRINCE/`, and re-owned it — the pre-generated `rsyncd.conf`
+already correctly pointed at the `worker`-owned path, it just didn't exist
+yet under that user. Verified end to end: both modules list correctly via
+`rsync --password-file=... --list-only rsync://<user>@10.0.0.101:873/
+ves-<module>/` from the control host. Generated `vesdeploy`/`veslogs`
+credentials were shared out-of-band (not committed) and stored client-side
+at `~/.config/ves-secrets/PRINCE-{vesdeploy,veslogs}.pw` on the control
+host, matching the `CLIENT_DEPLOY_PASSWORD_FILE`/`CLIENT_LOGS_PASSWORD_FILE`
+convention `generate-rsync-secrets.sh` already anticipated.
+
 ## Process notes for future sessions (see also Memory/nuance below)
 
 - Multi-reviewer review gate (advisory only) is

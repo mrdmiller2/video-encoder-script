@@ -4,6 +4,23 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## Infrastructure — PRINCE full WSL2 rebuild — 2026-07-24
+
+Not a script change (no version bump) — PRINCE's WSL2 root filesystem
+corrupted (repeated "Catastrophic failure" restarts + a near-full C: drive),
+causing `ffmpeg` to crash with a Bus error decoding *any* file, which made
+the running confidence-test job silently produce zero real encodes while
+reporting "successfully completed." Fixed via a full distro rebuild (not
+repair) plus two real networking bugs on the fresh install: a misleading
+GRO-driver dmesg warning that turned out not to be the cause, and the
+actual root cause — NFS's default `resvport` (privileged source port)
+being silently blocked, fixed with the `noresvport` mount option. Full
+diagnostic story, exact fix commands, and the "check this first next time"
+guidance are in `ROADMAP.md`'s "PRINCE full rebuild" section — kept there
+rather than duplicated here since it's as much a runbook as a record.
+Verified via the exact ffmpeg command that previously crashed on all 12/12
+episodes of the confidence-test title, now succeeding cleanly.
+
 ## v5.0.32S — 2026-07-24
 
 A full end-to-end team review (three independent reviewers, both halves of the file
