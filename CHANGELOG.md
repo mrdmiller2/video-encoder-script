@@ -4,6 +4,111 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.32U — 2026-07-25/26
+
+A full end-to-end team review (three independent reviewers, against
+the complete ~13,000-line file) requested proactively as a fleet-wide health
+check ahead of the next confidence test — not triggered by a known bug this
+time. Went 4 rounds of fix → re-review before all three reviewers
+independently converged on "genuinely clean, ship it." Full story of what
+was found and fixed, in the order it surfaced:
+
+**Round 1 (fresh findings, no prior context):**
+- **[3-way independent consensus, Medium/High] `_shared_mutex_acquire`'s 10-second lock
+  reclaim was based on a spin counter, not real elapsed time.** `sleep 0.1`
+  isn't guaranteed to take only 0.1s under load, so the actual time before
+  reclaim could be far more or less than intended — and a genuine NFS stall
+  inside the critical section (a slow done-log append, a slow structure-
+  cache rewrite) was entirely plausible on this fleet and well within that
+  window, meaning a live holder's lock could get stolen out from under it,
+  reintroducing the exact lost-update race the mutex exists to prevent.
+  First-pass fix: check the lockdir's actual wall-clock mtime (new
+  `_shared_mutex_dir_age_secs` helper) instead of a spin count, raise the
+  threshold to 90s, only re-check age every ~2s of spinning (not every
+  0.1s poll) to avoid extra NFS traffic.
+- **[one reviewer] `process_video()`'s early `validate_source_media` failure was
+  unconditionally folded into `return 0`, even for NFS-stall timeouts** —
+  the same false-success class of bug v5.0.32T fixed one step later in the
+  same function, just missed on this earlier call. A stalled-mount timeout
+  during source validation silently logged as "Job complete" and, worse,
+  got wrongly marked `completed` in the resume state (so a later resumed
+  run would skip it forever instead of retrying once the mount recovered).
+  Fixed with a new `SOURCE_VALIDATE_TIMED_OUT` flag, set at each of
+  `validate_source_media`'s 7 timeout-class return sites, checked by
+  `process_video` to propagate a real failure only for the timeout case
+  (a durable bad-source verdict, already permanently handled via
+  `flag_bad_source_for_human`/Deferred/, still correctly returns 0).
+- **[another reviewer] The unlocked pre-queue quick-scan gate
+  (`source_looks_processable_quick`) could call `flag_bad_source_for_human`
+  (an unlocked `mv` to Deferred/) while another host was actively encoding
+  that exact title** — a genuine race against a live job on a shared NFS
+  library, not just wasted duplicate work.
+- The third reviewer's concern that `convert_scan_producer`'s background-subshell EXIT
+  trap wouldn't fire on SIGINT/TERM (risking a hang) was investigated and
+  found not applicable: the main script's own signal handler
+  (`resume_on_signal`) directly `kill`s and `wait`s the child PID without
+  ever depending on the done-file or the child's EXIT trap.
+- The second reviewer's note that `tag_preexisting_desired_format`/`tag_guardrail_exceeded`
+  write tags directly to original sources was confirmed as an existing,
+  explicitly-documented accepted exception, not a new bug.
+
+**Round 2 (re-review of round 1's fixes):**
+- **[two reviewers, independently converged] The round-1 fix for the
+  quick-scan race acquired the REAL per-title lock, then released it — but
+  had no cleanup guard.** If the process was killed (SIGTERM) mid-check
+  (while holding the lock during ffprobe/EBML validation), the release
+  never ran, leaking a lock other hosts would treat as live for up to 2
+  hours — blocking a real encode of that title fleet-wide for the rest of
+  that window. Fixed properly by never acquiring the lock at all: a
+  plain read-only existence check (`[ -d "...lock" ]`) has nothing to leak
+  on an abnormal exit, and is sufficient to answer "is someone else
+  actively working this title right now?"
+- **[another reviewer] Even with round 1's atomic-mv reclaim fix, `_shared_mutex_acquire`
+  had no ownership verification on release** — if a slow original holder
+  was timed out and reclaimed by a waiter, the original holder's own
+  eventual `_shared_mutex_release` would blindly `rmdir` whatever lockdir
+  existed by then, which could now belong to the legitimate new holder,
+  letting a third waiter in concurrently and reopening the lost-update
+  race. Fixed with an ownership token: acquire writes a unique token into
+  the lockdir and returns it; release takes the token and refuses to
+  remove the lock if the on-disk token doesn't match. All 3 call sites
+  (`done_log_append`, `mkv_structure_cache_invalidate`,
+  `mkv_structure_cache_store`) updated to capture and pass the token
+  through both their success and early-exit release paths.
+
+**Round 3 (re-review of round 2's fixes):**
+- **[all 3 reviewers, independently converged — the strongest signal of
+  this whole pass] The round-2 ownership-token fix broke the release
+  happy path entirely.** `rmdir` only removes *empty* directories; writing
+  the `.owner` token file into the lockdir meant every legitimate release's
+  `rmdir` would now silently fail (`|| true` swallowed the error), leaking
+  every single successful acquisition until the 90s stale-reclaim path —
+  turning the done-log append and structure-cache updates into ~90-second
+  fleet-wide stalls after the very first use. Fixed by having release
+  remove the `.owner` file before the `rmdir`.
+- **[one reviewer] The round-2 read-only-existence-check fix for the quick-scan
+  gate (correct for avoiding the SIGTERM leak) had a side effect:** a
+  genuinely abandoned/stale lock was treated the same as a live one, so
+  that title would never reach `place_in_progress_flag`'s own reclaim
+  logic either — silently regressing recovery to depend on the orphan
+  reaper alone instead of the normal path. Fixed by also checking
+  `junk_flag_is_stale` on the lock's flag file: a stale lock is treated as
+  "not actually held" (proceed with the quick check; real reclaim still
+  happens later, at actual encode-claim time).
+
+**Round 4 (final verification):** all three reviewers independently
+confirmed both round-3 fixes are correct and complete, found no further
+issues in the mutex/lock area after 4 passes over it, and gave an explicit
+"genuinely clean, ship it" signal. One Medium-severity, single-reviewer
+note — NFS close-to-open cache consistency for the persistent
+`DONE_LOG_FD` possibly delaying done-log visibility across hosts — was
+evaluated by the other two reviewers and determined not worth acting on:
+the done-log is a fast-skip/resume optimization, not the actual
+correctness guarantee (per-title locks, output inspection, and tags
+already provide that), and the persistent FD is itself an intentional
+symlink-race hardening choice from an earlier round. Tracked as a
+low-priority future hardening idea, not a blocker.
+
 ## v5.0.32T — 2026-07-25
 
 **Real bug found during a full fleet log audit (not a hypothetical):** on
