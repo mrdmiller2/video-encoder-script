@@ -430,6 +430,47 @@ lacking `rsyncd` before this session) are pre-existing gaps on *other*
 machines, tracked here for a future pass rather than blocking this audit's
 conclusion.
 
+## Full fleet log audit — 2026-07-25 (all 8 machines, post-confidence-test)
+
+Requested explicitly: review every machine's `convert-v4.log` in full (not
+just the tail) for silent failures, not just "did it finish." Results:
+
+- **docm, MacFedora, AI-PROCESSOR, PRINCE (2nd run)**: completely clean.
+  docm's high "Job failed" count (33 of 48) is 100% legitimate size-
+  guardrail rejections on already-efficient h264 content — verified by
+  reading the actual log lines, each properly tagged and original
+  preserved, not a bug.
+- **Plex**: matches the already-known "A Centaur's Life (2017)" corruption
+  (6 episodes, genuinely bad source, correctly deferred) — not new.
+- **GruntVM — real diagnostic finding, not a bug.** 12 of 23 files hit
+  `mkvalidator timed out (possible stalled mount)` and were safely skipped
+  (not flagged bad, no data touched) but never actually evaluated.
+  Root-caused by manually reproducing the exact `mkvalidator` invocation
+  against one of the affected files with the script's real
+  `VALIDATION_TIMEOUT_SECS` (120s, not the 15s I first tried by mistake):
+  it completed successfully in ~96s, with only ~1.2s of actual CPU time —
+  i.e., genuinely valid, just slow, almost entirely I/O wait. This strongly
+  suggests real NFS contention from the 4-5 other fleet machines hammering
+  the same NAS concurrently during that run, not a GruntVM-specific issue
+  or file corruption. Confirmed by relaunching once most other machines had
+  finished: all 12 files succeeded cleanly with real VMAF-tagged results on
+  the very next attempt (well, the attempt after that — the immediate retry
+  still hit 4/12 timeouts before contention fully cleared; a second retry
+  got all 4 remaining ones clean). **Takeaway for future confidence tests:**
+  if `mkvalidator`/ffprobe/EBML timeouts cluster heavily on one machine
+  during a fleet-wide simultaneous launch, suspect NFS server contention
+  from the other 7 machines before suspecting that machine's mount/hardware
+  specifically — a manual reproduction with the script's actual configured
+  timeout (not a shorter one for convenience) is the fastest way to tell
+  "genuinely too slow under current load" from "actually broken."
+- **Crystalight — led directly to the v5.0.32T fix.** One episode (S01E02)
+  had both a corrupted source (repaired successfully via the existing
+  remux-repair path) and a corrupted re-encoded output (correctly
+  discarded, original preserved) — but the batch summary counted it in
+  neither "processed" nor "skipped," because `process_video()` was
+  discarding the real failure return code. See the v5.0.32T changelog
+  entry for the full fix; this log audit is what surfaced it.
+
 ## Process notes for future sessions (see also Memory/nuance below)
 
 - Multi-reviewer review gate (advisory only) is
