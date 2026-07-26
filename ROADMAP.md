@@ -16,6 +16,39 @@ Everything below is in service of building enough confidence in correctness
 and safety to actually do that at scale without a human needing to babysit
 it or discover data loss after the fact.
 
+## Deferred findings from the pre-Movies/TV-test team review (2026-07-26)
+
+A 3-way independent review ahead of the first non-anime
+(Movies/TV) confidence test this session found several real issues in the
+movies/classic/vintage/mtv/vtv profile paths. One (the `process_video()`
+silent-success bug on profile-detection failure) was fixed immediately in
+v5.0.32V since it's a general safety-net gap. These four were checked
+against the real library/code and deliberately deferred rather than fixed
+under time pressure — full triage detail in `CHANGELOG.md`'s v5.0.32V entry:
+
+- **HandBrake HDR handling is weaker than the ffmpeg path**: `handbrake_
+  append_color_metadata()` tags HLG sources with PQ transfer characteristics,
+  and `load_encoder_profile()`'s HandBrake branches never pass `hdr=true`
+  into `profile_fixed_crf()` (SDR fixed CRFs get used for HDR discs). Real
+  bugs, but the fleet currently only uses HandBrake for disc sources and no
+  machine is processing any — fix before disc ingestion is ever turned on.
+- **`profile_fixed_crf()` hardcodes numeric CRF literals** instead of
+  referencing the declared `FIXED_CRF_SVT_*`/`FIXED_CRF_X265_*` variables.
+  Currently a DRY nit with zero behavioral effect (values match, and those
+  variables aren't exposed via any override flag today) — worth cleaning up
+  next time that function is touched for another reason.
+- **Case order in `detect_profile_for_path()`** checks `*/Animation/*`
+  before `*/Movies/*/Classic|Vintage/*`, so a hypothetical `Movies/<Lang>/
+  Classic/Animation/...` folder would misroute to `wanime`. No such nested
+  structure exists on the NAS today (confirmed directly) — a robustness
+  fix for if the library structure ever changes, not urgent.
+- **`anime_title_year()`'s year regex could theoretically match a
+  parenthesized resolution tag** like `(1080)` and misroute a title to the
+  classic-anime profile. Only one of three reviewers flagged this;
+  not reproduced against real data. Worth a closer look (grep the anime
+  library for any `(1080)`/`(2160)`-style tags in a folder/file name) next
+  time anime-profile work is being done, but not confirmed as live.
+
 ## Accepted scope gaps (from the 2026-07-24 crash-safety review loop)
 
 A full end-to-end team review plus two follow-up

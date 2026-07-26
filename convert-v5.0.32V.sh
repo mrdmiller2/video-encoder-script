@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# convert-v5.0.32U.sh — Organize movie folders, transcode TV/movies to AV1/x265 MKV.
-# Version: 5.0.32U (see CHANGELOG.md for the full per-version history from
+# convert-v5.0.32V.sh — Organize movie folders, transcode TV/movies to AV1/x265 MKV.
+# Version: 5.0.32V (see CHANGELOG.md for the full per-version history from
 # 5.0.32A onward -- the header below was never backfilled past 5.0.32A/32,
 # a known documented gap, not a functional issue: CHANGELOG.md is current)
 #
@@ -251,7 +251,7 @@ set -euo pipefail
 
 _CONVERT_V4_SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
 
-VERSION="5.0.32U"
+VERSION="5.0.32V"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Matroska Tags element (global "Simple Tag") marking a file as already run through
 # this script's encode pipeline -- distinct from track properties (Name/Language/
@@ -12443,7 +12443,7 @@ process_disk() {
 process_video() {
   local src="$1"
   local codec kind ext profile
-  profile="$(profile_for_source "$src")" || return 0
+  profile="$(profile_for_source "$src")" || return $?
   codec="$(video_codec "$src")"
   ext="$(to_lower "${src##*.}")"
   if is_tv_episode "$src"; then

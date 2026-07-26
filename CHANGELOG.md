@@ -4,6 +4,96 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.32V — 2026-07-26
+
+Full 8-machine v5.0.32U confidence test completed (same anime titles as
+every prior round, `--no-resume`, all machines checksum-verified beforehand).
+Result: no silent failures anywhere, every skip/keep/failure outcome matched
+its logged tally. One genuine content-integrity finding on Crystalight
+(`16bit Sensation- Another Layer S01E02`): the source failed mkvalidator,
+got auto-repaired via remux (source untouched), but the re-encoded *output*
+also failed mkvalidator — the script correctly rejected the bad output,
+kept the original, and logged a real "Job failed" (not silent). Worth a
+future look into why corruption survived the repair into the re-encode, but
+the safety net itself worked as designed. Also found (and fixed) a second
+instance of the same mkvalidator-parity gap PRINCE had: MacFedora's `worker`
+account was also missing the binary (present only under the personal
+login account, `localuser2`) — copied over, checksum-matched to the rest of the
+fleet (`5db0a566ee39253bb5b65df7aa1f107cb9590bd035effc0eafcf90363be2c537`).
+
+Ahead of the next-stage test (first real Movies/TV content this session,
+not anime-only — auto-detecting the profile from the library path instead
+of forcing `--profile anime`), sent the script through a fresh 3-way team
+independent review focused specifically on the profile
+auto-detection and movies/classic/vintage/mtv/vtv encode paths, since
+those have never been exercised or scrutinized this session the way the
+anime path has. Findings, triaged against the real on-disk library
+structure rather than taken at face value:
+
+- **[two reviewers, real, fixed] `process_video()` silently marked a file
+  "done" on profile-detection failure.** `profile="$(profile_for_source
+  "$src")" || return 0` (line 12446) meant any unmapped or ambiguous path
+  (e.g. `Movies/Japanese/Animation/*` reached via a broad scan rather than
+  as the exact `SEARCH_PATH`) returned success with no encode and no retry
+  — permanently invisible to monitoring, same false-success bug class as
+  the v5.0.32T `process_video()` fix and the v5.0.32U round-1/2 lock bugs.
+  Fixed: `|| return $?`, propagating the real failure into the existing
+  `process_video "$f" && CONVERT_JOB_OK=true || warn "Job failed —
+  continuing queue"` handling (already proven correct this session).
+  Doesn't affect this round's planned test (all chosen paths cleanly
+  auto-detect), but matters for the eventual full-scale rollout where an
+  unanticipated path is inevitable.
+- **[two reviewers, verified NOT a real gap] `Television/*/Classic/*` is
+  unmapped in `detect_profile_for_path()`.** True as read, but checked
+  against the actual NAS structure: no `Television/*/Classic` folder
+  exists anywhere in the library (TV only ever has Animation/Modern/
+  Vintage — confirmed both on-disk and in memory's library-structure
+  record). Not a missing case, just TV's real 2-era taxonomy vs Movies'
+  3-era one. No fix needed; noted here so a future reviewer doesn't
+  re-flag it without checking the real data first.
+- **[two reviewers, real, deferred] HandBrake color-metadata/CRF paths
+  don't handle HDR as correctly as the ffmpeg path.** `handbrake_append_
+  color_metadata()` (~5726) tags HLG sources with PQ transfer
+  characteristics, and `load_encoder_profile()`'s HandBrake branches
+  (~8471, 8480) never pass `hdr=true` into `profile_fixed_crf()`, so
+  HandBrake/disc-sourced HDR encodes get SDR fixed CRFs. ffmpeg's
+  equivalent paths handle both correctly. Not fixed this round: the fleet
+  currently only uses the HandBrake engine for disc sources, which no
+  fleet machine is currently processing — deferred to ROADMAP rather than
+  risk an under-tested change to a currently-inactive path under time
+  pressure.
+- **[one reviewer only, verified real but currently dead code] `profile_fixed_crf()`
+  hardcodes numeric CRF literals instead of referencing the declared
+  `FIXED_CRF_SVT_*`/`FIXED_CRF_X265_*` variables.** Checked directly: the
+  literals exactly match the variables' current values, and those variables
+  aren't exposed via any `--flag`/env-override today (unlike `VMAF_TARGET_*`,
+  which do support `--vmaf-target`), so there's no behavioral difference
+  right now — a DRY/maintainability nit, not a functional bug. Deferred to
+  ROADMAP.
+- **[one reviewer only, verified real but unreachable on current library] Case
+  order in `detect_profile_for_path()` checks `*/Animation/*` (line 3817)
+  before `*/Movies/*/Classic|Vintage/*` (3819-3820)**, so a hypothetical
+  `Movies/<Lang>/Classic/Animation/...` or `.../Vintage/Animation/...`
+  folder would misroute to `wanime` instead of the classic/vintage
+  profile. Checked directly: no such nested structure exists on the NAS
+  (Animation is always a sibling of Classic/Vintage/Modern, never nested
+  under them). Deferred to ROADMAP as a robustness item, not urgent.
+- **[one reviewer only, unconfirmed by the other two, not yet independently
+  verified] `anime_title_year()`'s year-extraction regex could theoretically
+  match a parenthesized resolution tag like `(1080)`** and misroute a title
+  to the classic-anime profile. Not confirmed by either other reviewer, not
+  reproduced against real data this round — flagged in ROADMAP for a
+  closer look, not treated as confirmed.
+
+**Note on the archived `Old Versions/5.x/convert-v5.0.32U.sh`**: due to
+fix-then-archive ordering, that file actually contains this round's one-line
+fix baked in — its checksum will NOT match the originally-recorded
+deployed-v5.0.32U checksum (`b9b4fc695612ee54e157a9eaa38dd536bc204641b3191c8d0e8f9f225633b1e0`).
+Purely a provenance/bookkeeping note, not a functional issue — v5.0.32V is
+what's actually deployed everywhere going forward.
+
+`convert-v5.0.32V.sh` checksum: `d10bf2ae9c2f48458d1c60a19820b50dcaf7ab4060c984809276a5833746aec9`.
+
 ## v5.0.32U — 2026-07-25/26
 
 A full end-to-end team review (three independent reviewers, against
