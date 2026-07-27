@@ -4,6 +4,58 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.32Y — 2026-07-27
+
+Retunes v5.0.32X's `MKVALIDATOR_MAX_SIZE_BYTES` and validation-timeout
+constants based on real data the user pushed back with: a full library scan
+(16,615 real movie files across `/mnt/BigMomma/Media/Movies`) showed the
+2GiB ceiling excluded **49.6% of all movies** — far too aggressive, since
+real movie content routinely runs 3-10GB with a genuine tail to ~69GB (only
+Stand-Up Comedy content stayed mostly under 5GB). Two ideas for a faster
+alternative were considered and ruled out first: sampling via extracted
+clips (doesn't validate the *original* file's actual container structure —
+a freshly-muxed clip tells you nothing about whether the source is
+truncated or has a corrupt Cues table, which is exactly the failure mode
+this check exists to catch) and mkvalidator's own `--quick` flag (only
+speeds up already-broken files, not the common healthy-file case).
+
+Directly measured a real 20.15GiB file's healthy full mkvalidator scan at
+**~114 minutes (~340s/GiB)** — worse per-GiB than the earlier 2.59GiB data
+point (~260s/GiB), confirming the cost isn't flat and climbs at scale.
+Using the full library's cumulative size distribution to pick a ceiling
+that trades validation depth for time proportionately:
+
+| Ceiling | Library coverage | Single-attempt budget @350s/GiB |
+|---|---|---|
+| 7GiB | 85.9% | ~43 min |
+| **10GiB (chosen)** | **94.8%** | **~60 min** |
+| 15GiB | 98.6% | ~90 min |
+| 20GiB | 99.5% | ~118 min |
+
+**Changes**: `MKVALIDATOR_MAX_SIZE_BYTES` raised 2GiB → 10GiB;
+`_validation_timeout_for_args`'s `extra_per_gib` raised 300 → 350 and `cap`
+raised 1800s → 3620s (~60 min — not a round number, it's exactly what a
+file at the new 10GiB ceiling needs at 350s/GiB, so the formula and the cap
+agree at the boundary rather than one silently overriding the other).
+Files above 10GiB (the remaining 5.2%, the true long tail) still get the
+fast EBML-bounds check, which catches truncation — the dominant real-world
+failure mode — without a multi-hour scan.
+
+Also confirmed for the user, in response to "if it helps to confirm a file
+is good before we even start the better": `validate_source_media()` is
+already called at the very top of `process_video()`, before any codec
+dispatch or encode work begins — source integrity has always been checked
+before a single second of encoding starts, this session's fixes only
+changed how *long* that check is allowed to take.
+
+Team-confirmed (quick pass since the underlying mechanism was
+already reviewed twice this session — only the constants changed): no
+functional findings; one stale doc comment fixed (a leftover note citing
+old "~170KB/s, tens of hours" figures that predated the real 20GiB
+measurement).
+
+`convert-v5.0.32Y.sh` checksum: `6c63878090f0ca1aa072d4ef8ccccc1582e06bc98952a544697048b815b9df42`.
+
 ## v5.0.32X — 2026-07-27
 
 Closes the residual gap left by v5.0.32W's size-scaled validation timeout:

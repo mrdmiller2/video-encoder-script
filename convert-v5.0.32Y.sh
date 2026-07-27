@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# convert-v5.0.32X.sh — Organize movie folders, transcode TV/movies to AV1/x265 MKV.
-# Version: 5.0.32X (see CHANGELOG.md for the full per-version history from
+# convert-v5.0.32Y.sh — Organize movie folders, transcode TV/movies to AV1/x265 MKV.
+# Version: 5.0.32Y (see CHANGELOG.md for the full per-version history from
 # 5.0.32A onward -- the header below was never backfilled past 5.0.32A/32,
 # a known documented gap, not a functional issue: CHANGELOG.md is current)
 #
@@ -251,7 +251,7 @@ set -euo pipefail
 
 _CONVERT_V4_SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
 
-VERSION="5.0.32X"
+VERSION="5.0.32Y"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Matroska Tags element (global "Simple Tag") marking a file as already run through
 # this script's encode pipeline -- distinct from track properties (Name/Language/
@@ -413,19 +413,26 @@ HAS_MKVALIDATOR=false
 MKVALIDATOR_ON_QUICK="${CONVERT_MKVALIDATOR_ON_QUICK:-0}"
 # mkvalidator (v0.6.0) parses the EBML tree with very small sequential reads
 # (~700 bytes/syscall observed) -- fine for typical TV-episode-sized files but
-# on a 20GB+ movie this drops to ~170KB/s effective throughput, i.e. tens of
-# hours to validate one file (found via the fleet performance test, 2026-07).
+# directly measured at ~340s/GiB on a real 20.15GiB movie (~114 minutes total,
+# 2026-07-27) -- worse per-GiB than a smaller 2.59GiB file's ~260s/GiB, so the
+# cost isn't flat and keeps climbing past this size.
 # Skip full mkvalidator above this size and fall back to the fast EBML-bounds
 # check (same as when the binary isn't installed at all) rather than stall.
-# Lowered from 5GiB to 2GiB (2026-07-27): real movie/TV testing found files
-# in the 2.6-3.2GB range routinely needed several minutes for a full
-# mkvalidator structural scan, with real run-to-run NFS timing variance
-# occasionally exceeding even the size-scaled VALIDATION_TIMEOUT_SECS
-# allowance. The fast EBML-bounds check (still runs, still catches
-# truncated remuxes) is a deliberate trade of validation thoroughness for
-# reliability on files this large -- see _validation_timeout_for_args and
-# VALIDATION_TIMEOUT_RETRIES for the complementary fix on the timeout side.
-MKVALIDATOR_MAX_SIZE_BYTES="${CONVERT_MKVALIDATOR_MAX_SIZE:-2147483648}"  # 2 GiB
+# Raised from 2GiB to 10GiB (2026-07-27, same day as the 2GiB cut): a full
+# library scan (16,615 real movie files) showed 2GiB excluded roughly HALF
+# of all movies (49.6% exceed 2GB) -- far too small a ceiling for real
+# content, where the distribution is Movies/TV/Anime routinely running
+# 3-10GB and a genuine long tail up to ~69GB. 10GiB covers 94.8% of the
+# scanned library with full mkvalidator coverage. Directly measured a real
+# 20.15GiB file's healthy full scan at ~114 minutes (~340s/GiB, worse than
+# the ~260s/GiB seen on a 2.59GiB file -- the per-GiB cost isn't flat, it
+# gets worse at scale) -- confirms 10GiB is near the practical ceiling for
+# "reasonable single-attempt validation time" (~60 min) before the
+# remaining 5.2% of files fall back to the fast EBML-bounds check (still
+# catches truncation, the dominant real-world failure mode) rather than
+# spending 1.5-2+ hours validating one file. See _validation_timeout_for_args
+# and VALIDATION_TIMEOUT_RETRIES for the complementary timeout-side fix.
+MKVALIDATOR_MAX_SIZE_BYTES="${CONVERT_MKVALIDATOR_MAX_SIZE:-10737418240}"  # 10 GiB
 # Bound for validation-path subprocesses (ffprobe/mkvmerge/mkvalidator/EBML).
 # Overridable like CONVERT_MKVALIDATOR_MAX_SIZE. Orphan gates keep their own
 # shorter ORPHAN_* timeouts when calling tools directly via run_with_timeout.
@@ -2277,7 +2284,7 @@ run_with_timeout() {
   return 124
 }
 
-# Size-scaled validation timeout (2026-07-26): VALIDATION_TIMEOUT_SECS=120
+# Size-scaled validation timeout (2026-07-26/27): VALIDATION_TIMEOUT_SECS=120
 # was tuned for anime's typical 300-700MB episodes. Real movie/TV content
 # can be multi-GB, and a genuinely healthy (not stalled) mkvalidator/ffprobe
 # structural scan of a 2-5GB file was directly measured taking 10+ minutes
@@ -2295,14 +2302,23 @@ run_with_timeout() {
 # it) only the last one -- reviewers found a large-part-then-small-part
 # merge would otherwise get a near-base timeout despite reading/writing the
 # full combined size. Falls back to the flat base timeout if no file
-# argument is found or none exist yet (e.g. `--version` probes). 300s/GiB
-# was chosen with real margin over the ~230-250s/GiB the motivating
-# incident implied (a 2.59GiB file measured at ~650-700s total, i.e. close
-# to zero headroom at a naive 200s/GiB) -- never shrinks below the base,
-# capped so a genuinely stuck process still fails within a bounded time
-# rather than hanging forever.
+# argument is found or none exist yet (e.g. `--version` probes). Never
+# shrinks below the base; capped so a genuinely stuck process still fails
+# within a bounded time rather than hanging forever.
+#
+# Rate/cap raised again 2026-07-27 alongside the MKVALIDATOR_MAX_SIZE_BYTES
+# increase to 10GiB: the 300s/GiB rate (chosen against a 2.59GiB data
+# point at ~260s/GiB actual) turned out too optimistic once a real 20.15GiB
+# file was directly measured at ~340s/GiB -- the per-GiB cost isn't flat,
+# it worsens at larger sizes. 350s/GiB + a cap of 3620s (~60 min, exactly
+# what a file at the new 10GiB mkvalidator ceiling needs at this rate)
+# keeps real margin at every size up to that ceiling; files above it skip
+# full mkvalidator entirely (see MKVALIDATOR_MAX_SIZE_BYTES) so never hit
+# this cap in practice for that specific tool, though the same scaling
+# still applies to ffprobe/mkvmerge/ffmpeg-validation calls on any file
+# size.
 _validation_timeout_for_args() {
-  local base="${VALIDATION_TIMEOUT_SECS}" cap=1800 extra_per_gib=300
+  local base="${VALIDATION_TIMEOUT_SECS}" cap=3620 extra_per_gib=350
   local f="" prev="" a sz total=0 extra scaled
   for a in "$@"; do
     [ "$prev" = "-i" ] && f="$a"
