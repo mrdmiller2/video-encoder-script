@@ -16,6 +16,173 @@ Everything below is in service of building enough confidence in correctness
 and safety to actually do that at scale without a human needing to babysit
 it or discover data loss after the fact.
 
+## NFS contention pattern refined — first Movies/TV test (2026-07-26)
+
+The 51-file mixed-content test (first non-anime round this session) hit
+`mkvalidator`/audio-track "possible stalled mount" timeouts on 4 of 8
+machines (docm, PRINCE, MacFedora, GruntVM) shortly after simultaneous
+launch. Initially assumed to be the same benign pattern already documented
+below (GruntVM's earlier confirmed-benign contention) — the user correctly
+pushed back ("this was not happening before") and a deeper investigation
+found a real, more specific cause worth recording:
+
+- Manually reproducing one failure (`Sex Explained S01E01.mkv` on docm)
+  with the real 120s timeout hung the **full** timeout **twice in a row**
+  — a materially different signature than the earlier GruntVM case, which
+  completed (just slowly, ~96s) every time it was manually reproduced.
+- Isolating further: `stat`, a 1MB `head` read, and `ffprobe` all completed
+  on the *exact same file* in under 0.1s while `mkvalidator` was hanging.
+  Checking the hung process directly (`ps -o wchan`, `/proc/pid/fdinfo`)
+  showed it genuinely in `D` state (`folio_wait_bit_common`, real
+  uninterruptible I/O wait) with its read position slowly advancing — not
+  an infinite loop or parser bug, but a real, severe, per-request NFS
+  stall specific to `mkvalidator`'s seek-heavy whole-file structural walk
+  (it reads near-EOF for Cues/Tags, unlike a quick header-only ffprobe
+  call).
+- A third manual attempt on the same file, no timeout, completed cleanly
+  in 20 seconds and confirmed the file valid. So the underlying cause is
+  genuinely intermittent/bursty NFS latency, not a corrupt file or a
+  mkvalidator bug.
+- Best-understood root cause: this is the **first time this session** all
+  8 machines launched simultaneously against **fresh, large (1-5GB)
+  movie/TV files** — every prior round was anime-only with much smaller
+  (~300-700MB) episodes, often already cache-warmed from repeated re-runs
+  across the day. The simultaneous multi-GB cold-read burst against the
+  shared NAS is a heavier concurrent load than anything tested before,
+  and appears to produce sharper, more volatile stalls than the steadier
+  "somewhat slow under load" pattern documented for GruntVM below.
+
+**Update — the first retry attempt also failed, and it wasn't contention
+easing that was needed (2026-07-26, same day):** after the 4 affected
+machines (docm, PRINCE, MacFedora, GruntVM) finished their original runs,
+they were retried on the assumption that "most of the fleet is done now,
+load has eased." All 4 failed again, on different files than the first
+round, at the same ~120s timeout signature. Investigating why revealed the
+real, more precise cause: **Crystalight and GruntBox2 were still actively
+mid-encode the entire time**, each pulling sustained multi-hour sequential
+reads directly off the same shared NAS (Crystalight's `REC² (2009)` x265
+encode ran 2+ continuous hours; GruntBox2's `Cunk on Earth` episodes each
+take a similarly long time on its weak hardware). So "most machines
+finished" was never the same thing as "the NAS is actually idle" — two
+long-running heavy jobs are enough on their own to starve another
+machine's seek-heavy `mkvalidator` validation, regardless of whether a
+launch was staggered or simultaneous. The "simultaneous launch burst"
+framing above was real but incomplete; **sustained overlapping heavy I/O
+from even just 1-2 machines is the actual trigger**, not launch timing
+specifically.
+
+**Update — the real root cause, found by checking the NAS itself
+(2026-07-26, same day):** a third retry against a genuinely idle fleet
+(Crystalight fully idle, GruntBox2 down to negligible NFS footprint)
+**still failed**, disproving the fleet-contention theory entirely. Checked
+whether it was specific to the BigMomma/BabyBear shares (both new to this
+session) vs BigPoppa (used all session without incident) — but a
+similarly-large file on BigPoppa timed out at the same moment, ruling that
+out too. The real cause, found by SSH'ing directly into the NAS
+(`admin@10.0.1.103`, TrueNAS SCALE, credentials from the user):
+`zpool status` showed **BigMomma's scrub finished at 16:17 PDT and
+BigPoppa's finished at 18:55 PDT — both during this test's window**. A ZFS
+scrub reads every block on every disk and is extremely I/O-intensive,
+producing exactly the widespread, unpredictable, large-file-biased latency
+spikes seen all day, completely independent of anything the fleet clients
+were doing. Once both scrubs were confirmed complete (`zpool iostat`
+showing the pools quiet), the retry succeeded. Full diagnostic writeup in
+memory (`project_nas_scrub_validation_timeout_root_cause`).
+
+**Correction — the scrub theory was also wrong (2026-07-26, same day,
+same investigation):** a FOURTH retry, launched only after directly
+confirming via `zpool status`/`iostat` that both scrubs had completed and
+the pools were quiet, **still failed on the exact same specific files as
+every prior retry** (Titane always fails; Newtopia always fails on
+S01E02/S01E07/S01E03; The Trunk always fails on S01E02/S01E04/S01E01 —
+identical files, identical order, across all 4 attempts). That
+reproducibility across every environmental condition tried (busy fleet,
+idle fleet, mid-scrub, post-scrub) is the tell: this was never a transient
+event at all.
+
+Ran `mkvalidator` unconstrained (no timeout) directly against one of the
+chronically-failing files (`The Trunk - S01E01 - Episode 1.mkv`, 2.59GB, on
+GruntVM) and let it run to genuine completion: it took **roughly 10+
+minutes** and correctly reported the file valid. Confirmed via `/proc/pid/
+fdinfo` across multiple checks that it was continuously making real (if
+slow, ~1.6MB/s) read progress the whole time — not stuck, just
+fundamentally slow for this file size over this NFS path.
+
+**The real root cause**: `VALIDATION_TIMEOUT_SECS=120` was sized for
+anime's typical 300-700MB episodes and is simply insufficient for the
+multi-GB movie/TV files this test introduced for the first time this
+session. The NAS scrubs and fleet-load investigations above were real
+observations but coincidental, not causal — they happened to overlap with
+some of the failures in time without actually being why the same specific
+large files failed every single retry regardless of environmental state.
+
+**How to apply**: `VALIDATION_TIMEOUT_SECS` (and the equivalent audio-track-
+check timeout) need to scale with source file size rather than stay a flat
+120s, similar to the existing size-tiered pattern already used for
+`effective_upscale_overshoot_pct()`. A fixed bump (e.g. to 300s) would
+still fail on files like this one that need 10+ minutes; a fixed bump large
+enough to cover the worst case (15+ minutes) risks masking a genuinely
+stuck/hung validator on smaller files that should fail fast. Scaling by
+file size is the right shape of fix. Not yet implemented — see the v5.0.32V
+follow-up work for this fix once designed and reviewed.
+
+**Diagnostic lesson for next time**: don't trust "the same specific files
+keep failing" as evidence of a stable *external* cause (scrub, contention,
+a bad NFS mount) without first checking whether those same files are just
+disproportionately large — reproducibility across changing environmental
+conditions is actually the signature of a deterministic client-side
+threshold problem, not an environmental one. This cost two extra retry
+cycles (and an unnecessary NAS deep-dive) before landing on the real
+answer.
+
+## Crystalight's RAM disk is too small for movie-scale content (2026-07-26)
+
+While investigating why the fleet-wide retry kept failing (see the NFS
+contention section above), found a second, distinct, real contributor:
+Crystalight's `/Volumes/ConvertRAMDisk` is only **2.4GB total**. During the
+mixed-content test's `REC² (2009)` job, the AV1 candidate encode staged
+successfully on the ramdisk, but the subsequent x265 fallback attempt
+(likely triggered because the AV1 candidate didn't beat the size/quality
+target on this grain-heavy found-footage source) staged directly on the
+NFS-mounted destination path instead — confirmed by checking the ramdisk
+was completely empty (nothing occupying it) at the time, meaning the
+script's capacity check correctly predicted the candidate output (approaching
+or exceeding 2GB) wouldn't fit and safely fell back rather than overflowing
+the ramdisk. This is the intended fallback behavior, not a bug — but it has
+a real cost: writing a multi-GB output continuously over NFS instead of to
+local RAM is both much slower for that individual job (this encode ran
+3.5+ hours for what should be a much shorter x265 pass) and keeps the
+shared NAS under sustained write load the whole time, contributing directly
+to the mkvalidator-timeout contention seen on other machines during this
+test.
+
+This never surfaced during any of this session's anime-only testing because
+anime episodes are typically 300-700MB — comfortably under the 2.4GB
+ceiling. Movies routinely produce 1-3GB+ candidate outputs, so this is a
+**real capacity gap that will recur** on every movie encode on Crystalight
+going forward, not a one-off.
+
+**How to apply**: resize Crystalight's RAM disk to comfortably exceed the
+largest realistic movie candidate size (headroom for both an AV1 and an
+x265 candidate to coexist if a bake-off or fallback needs both, plus normal
+working overhead — 8-16GB would be a reasonable target, subject to how much
+RAM Crystalight can spare from encoding itself on an M2 Max). This is a
+system-level change (recreating the APFS RAM-backed volume) — deferred to
+the user's judgment on sizing and timing rather than done unilaterally
+during this test.
+
+**Done 2026-07-26**: resized from 2.4GB to 12GB (`hdiutil attach -nomount
+ram://25165824` + `diskutil eraseVolume APFS ConvertRAMDisk`). Verified
+nothing but Spotlight's `mds` had the old volume open before ejecting it
+(no active job was using it at the time) — no data lost. **Found in the
+process: this ramdisk has no persistence mechanism** (no LaunchDaemon/
+LaunchAgent recreates it) — it was originally created manually at some
+point and would silently vanish on Crystalight's next reboot, at which
+point the script would presumably fall back to non-ramdisk staging with no
+obvious alert. Worth adding a login/boot LaunchDaemon that recreates the
+12GB ramdisk automatically, matching the self-healing pattern already used
+for PRINCE/GruntBox2's WSL2 mount recovery — not yet done.
+
 ## Deferred findings from the pre-Movies/TV-test team review (2026-07-26)
 
 A 3-way independent review ahead of the first non-anime

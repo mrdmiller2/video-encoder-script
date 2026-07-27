@@ -4,6 +4,63 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.32W — 2026-07-26/27
+
+Fixes the real root cause behind the "possible stalled mount" validation
+failures that dominated most of the v5.0.32V mixed-content test session
+(see that entry below for the full, initially-wrong-twice diagnostic
+journey through fleet contention and NAS scrub theories before landing
+here). **The actual bug**: `VALIDATION_TIMEOUT_SECS=120` — the flat timeout
+wrapping every `ffprobe`/`mkvmerge`/`mkvalidator`/`ffmpeg`-validation
+subprocess call via `run_with_timeout` — was tuned for anime's typical
+300-700MB episodes and is far too short for real movie/TV content. Directly
+measured: a genuinely healthy `mkvalidator` structural scan of a 2.59GB
+file took roughly 650-700 seconds over NFS, not the 120s the timeout
+allowed — the file was fine, just larger and slower than anything this
+timeout had ever been exercised against. Confirmed via 4 consecutive fleet
+retries all failing on the exact same specific large files regardless of
+fleet load or NAS state — the reproducibility across every environmental
+condition was the actual signal (missed twice) that this was a
+deterministic client-side threshold problem, not an external one.
+
+**Fix**: new `_validation_timeout_for_args()` function, called by all 4
+validation wrappers (`run_ffprobe`, `run_mkvmerge`, `run_ffmpeg_validation`,
+`run_mkvalidator`) plus `validate_mkv_ebml_bounds`, replacing the flat
+`${VALIDATION_TIMEOUT_SECS}` with `$(_validation_timeout_for_args "$@")`.
+It finds the file(s) being validated from the wrapper's own arguments — an
+`-i FILE` pair if present (ffmpeg-validation's convention), else the sum of
+every plain trailing argument that currently exists as a file (naturally
+handles both a single-source call, where a not-yet-created `-o` output
+target contributes nothing, and a multi-part merge, where every real part
+counts) — and scales the timeout at 300s per GiB, capped at 1800s, never
+below the 120s base.
+
+Sent through the 3-way independent team review gate before
+deploying, since this touches a core safety timeout fleet-wide:
+- **[3-way consensus, real, fixed]** the first draft's fallback file-finder
+  used "last non-flag argument wins," which correctly handled every
+  single-file call site but silently under-scaled a multi-part `mkvmerge`
+  merge (`part1 + part2 + part3`) down to only the *last* part's size —
+  all three reviewers independently caught this, the same "independent
+  convergence = real bug" pattern seen repeatedly this session. Fixed by
+  summing all existing real files instead of picking the last one.
+- **[one reviewer, real, fixed]** the first draft's 200s/GiB scaling factor left
+  ~0 safety margin against the actual measured rate (the incident's 2.59GiB
+  file needed ~230-250s/GiB, not 200s/GiB) — raised to 300s/GiB and the cap
+  from 1200s to 1800s to keep real headroom even for the largest files
+  `mkvalidator` will still run against (5GiB, the existing
+  `MKVALIDATOR_MAX_SIZE_BYTES` ceiling).
+- **[another reviewer only, checked directly and found to be a false positive]**
+  claimed the `stat -c%s -- / stat -f%z --` portability fallback always
+  fails on macOS because BSD `stat` doesn't support the `--`
+  option-terminator. Verified directly on Crystalight (the fleet's actual
+  macOS machine): `stat -f%z -- <file>` works fine, exit 0. Not fixed —
+  there was nothing to fix; a useful reminder that even confident,
+  detailed-sounding single-reviewer findings need direct verification
+  before acting on them, not just plausibility.
+
+`convert-v5.0.32W.sh` checksum: `ba888a248298711fe7dbbfb22002c6416d9f906b546f73fcea2713297ad02611`.
+
 ## v5.0.32V — 2026-07-26
 
 Full 8-machine v5.0.32U confidence test completed (same anime titles as
