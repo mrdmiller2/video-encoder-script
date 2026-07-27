@@ -4,6 +4,80 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.32X — 2026-07-27
+
+Closes the residual gap left by v5.0.32W's size-scaled validation timeout:
+even at 300s/GiB, occasional failures remained on the very largest movie/TV
+files because real NFS timing variance means the SAME file can take 2x+
+longer on one attempt than the next (directly measured: a file that hit
+rc=124 at its full scaled timeout succeeded cleanly in under half that time
+on an immediate fresh retry). No fixed timeout eliminates that variance —
+retrying is the correct answer, not further inflating the ceiling.
+
+**Two complementary fixes**, both deployed together:
+
+1. **`_run_timeout_retry()`** — every validation wrapper (`run_ffprobe`,
+   `run_mkvmerge`, `run_ffmpeg_validation`, `run_mkvalidator`) now retries
+   up to `VALIDATION_TIMEOUT_RETRIES` (default 2) extra times specifically
+   on `rc=124` (timeout) before giving up. A genuine structural failure
+   (mkvalidator reporting the file is actually invalid, rc 1/2) is never
+   retried — a bad file won't become good on a second attempt, but a slow
+   NFS moment often clears. `validate_mkv_ebml_bounds`'s python3 heredoc
+   call is deliberately excluded: a heredoc's stdin is consumed on first
+   read, so a naive retry would feed the second attempt an empty script
+   (verified directly: reproduced the empty-stdin-on-reread behavior before
+   deciding to exclude it, rather than assuming).
+2. **`MKVALIDATOR_MAX_SIZE_BYTES` lowered from 5GiB to 2GiB** — files in the
+   2-5GB range (exactly where today's failures clustered) now skip full
+   `mkvalidator` and fall back to the fast EBML-bounds check, trading some
+   structural-validation depth for reliability on files this large. Other
+   gates (ffprobe metadata, `mkvmerge --identify`, decode-window checks,
+   audio/subtitle validation) remain active regardless.
+
+Sent through the 3-way team review gate before deploying:
+- **[3-way consensus, real, fixed]** the first draft's retry loop ran
+  inside a function whose *caller* redirects stdout/stderr to a shared
+  file/pipe for the entire call (e.g. `run_mkvalidator ... 2>"$errf"` in
+  `validate_mkv_mkvalidator`). If attempt 1 wrote diagnostic output (even
+  an `ERR` line) before timing out, that content persisted in the shared
+  target; a clean, successful attempt 2 then appended nothing new, so the
+  caller's post-hoc `grep ERR "$errf"` could still find attempt 1's stale
+  output and misreport a successful retry as a failure. All three
+  reviewers caught this independently — one reviewer named the exact three
+  affected call sites (`validate_mkv_mkvalidator`,
+  `validate_mkv_decode_windows`, `ffprobe_metadata_ok`). Fixed by having
+  `_run_timeout_retry` isolate each attempt's stdout/stderr into its own
+  fresh temp file and replay only the FINAL attempt's captured output to
+  the caller — works uniformly regardless of whether the caller redirected
+  to a file or a command-substitution pipe, without touching any call
+  site. Verified directly: reproduced the exact stale-output scenario in
+  isolation before the fix (confirmed the bug was real) and after (confirmed
+  it's gone) using a synthetic mock command.
+- **[one reviewer, real, fixed]** the fix's own first pass leaked a temp file if
+  the first `mktemp` succeeded but the second failed. Fixed.
+- **[one reviewer, real, deferred]** `VALIDATION_TIMEOUT_RETRIES` accepts any
+  digit string, including one large enough to break the `-gt` comparison
+  under `set -e`. User-misconfiguration-only, not a default-path issue —
+  tracked in ROADMAP.md rather than fixed under time pressure.
+- **[one reviewer, real, deferred]** the mkvalidator structure-cache doesn't
+  distinguish an EBML-only pass (now more common with the lower 2GiB
+  ceiling) from a full mkvalidator pass — only matters if
+  `CONVERT_MKVALIDATOR_MAX_SIZE` is raised again later and a cached
+  EBML-only result is trusted as if it were a full pass. Tracked in
+  ROADMAP.md.
+- **[another reviewer only, checked directly and confirmed a false positive, again]**
+  That reviewer repeated (for the third time this session, across three separate
+  review rounds) its claim that the `stat -c%s -- / stat -f%z --`
+  portability fallback fails on macOS/BSD because `--` isn't supported.
+  Already directly disproven on Crystalight (the fleet's real macOS
+  machine): `stat -f%z -- <file>` works fine, exit 0. Not fixed — there is
+  nothing to fix. Noted here explicitly since a claim repeating across
+  multiple independent review rounds could otherwise look like mounting
+  evidence; it's the same single mistaken prior each time, not
+  independent confirmation.
+
+`convert-v5.0.32X.sh` checksum: `8a9d31cd4fb83d05ca50fbeddda4c44921451440327d216490ac25f6bdcd57e3`.
+
 ## v5.0.32W — 2026-07-26/27
 
 Fixes the real root cause behind the "possible stalled mount" validation

@@ -417,7 +417,15 @@ MKVALIDATOR_ON_QUICK="${CONVERT_MKVALIDATOR_ON_QUICK:-0}"
 # hours to validate one file (found via the fleet performance test, 2026-07).
 # Skip full mkvalidator above this size and fall back to the fast EBML-bounds
 # check (same as when the binary isn't installed at all) rather than stall.
-MKVALIDATOR_MAX_SIZE_BYTES="${CONVERT_MKVALIDATOR_MAX_SIZE:-5368709120}"  # 5 GiB
+# Lowered from 5GiB to 2GiB (2026-07-27): real movie/TV testing found files
+# in the 2.6-3.2GB range routinely needed several minutes for a full
+# mkvalidator structural scan, with real run-to-run NFS timing variance
+# occasionally exceeding even the size-scaled VALIDATION_TIMEOUT_SECS
+# allowance. The fast EBML-bounds check (still runs, still catches
+# truncated remuxes) is a deliberate trade of validation thoroughness for
+# reliability on files this large -- see _validation_timeout_for_args and
+# VALIDATION_TIMEOUT_RETRIES for the complementary fix on the timeout side.
+MKVALIDATOR_MAX_SIZE_BYTES="${CONVERT_MKVALIDATOR_MAX_SIZE:-2147483648}"  # 2 GiB
 # Bound for validation-path subprocesses (ffprobe/mkvmerge/mkvalidator/EBML).
 # Overridable like CONVERT_MKVALIDATOR_MAX_SIZE. Orphan gates keep their own
 # shorter ORPHAN_* timeouts when calling tools directly via run_with_timeout.
@@ -2321,11 +2329,70 @@ _validation_timeout_for_args() {
   printf '%s' "$scaled"
 }
 
+# Retry-on-timeout wrapper (2026-07-26/27): direct measurement showed the
+# SAME file's validation time can vary 2x+ between consecutive attempts due
+# to genuine NFS timing variance (confirmed: a file that hit rc=124 at its
+# full size-scaled timeout succeeded cleanly in under half that time on an
+# immediate retry). No fixed timeout eliminates that variance, so rather
+# than keep inflating it, retry a FEW times specifically on rc=124 (timeout)
+# before giving up -- a genuine structural failure (mkvalidator says the
+# file is actually invalid, rc=1/2) is never retried here, only timeouts
+# are, since a bad file won't become good on a second attempt but a slow
+# NFS moment often clears. VALIDATION_TIMEOUT_RETRIES counts EXTRA attempts
+# after the first (default 2 => up to 3 total tries).
+case "${VALIDATION_TIMEOUT_RETRIES:-}" in
+  ''|*[!0-9]*) VALIDATION_TIMEOUT_RETRIES=2 ;;
+esac
+# 3-way review (2026-07-27) independently caught the same real bug in the
+# first draft: callers like validate_mkv_mkvalidator redirect this whole
+# call's stdout/stderr to a shared file once (`run_mkvalidator ... 2>"$errf"`).
+# If attempt 1 times out after writing some diagnostic output, that content
+# stayed in $errf; a clean attempt 2 then appended nothing new, and the
+# caller's post-hoc `grep ERR "$errf"` could still find attempt 1's stale
+# output and misreport a successful retry as a failure. Fixed by isolating
+# each attempt's stdout/stderr into its own fresh temp file and only
+# replaying the FINAL attempt's (the one whose rc is actually returned)
+# output to the caller's real stdout/stderr -- works uniformly whether the
+# caller redirected to a file or captured via `$(...)`, without needing to
+# touch every call site individually.
+_run_timeout_retry() {
+  local timeout_s="$1" attempt=0 rc out_tmp err_tmp
+  shift
+  out_tmp="$(mktemp)" || { run_with_timeout "$timeout_s" "$@"; return $?; }
+  err_tmp="$(mktemp)" || {
+    # Couldn't get a second isolated capture file -- fall back to a single
+    # unretried attempt rather than risk the stale-output problem this
+    # exists to prevent (and clean up the first mktemp so it isn't leaked).
+    rm -f -- "$out_tmp"
+    run_with_timeout "$timeout_s" "$@"
+    return $?
+  }
+  while :; do
+    run_with_timeout "$timeout_s" "$@" >"$out_tmp" 2>"$err_tmp"
+    rc=$?
+    if [ "$rc" -ne 124 ]; then
+      cat -- "$out_tmp"
+      cat -- "$err_tmp" >&2
+      rm -f -- "$out_tmp" "$err_tmp"
+      return "$rc"
+    fi
+    attempt=$((attempt + 1))
+    if [ "$attempt" -gt "$VALIDATION_TIMEOUT_RETRIES" ]; then
+      cat -- "$out_tmp"
+      cat -- "$err_tmp" >&2
+      rm -f -- "$out_tmp" "$err_tmp"
+      return "$rc"
+    fi
+    : >"$out_tmp"
+    : >"$err_tmp"
+  done
+}
+
 # Validation-path wrappers: single-point timeout covers all call sites.
 # Streaming remux uses run_tracked_encoder + MKVMERGE_CMD directly (Phase A),
 # not run_mkvmerge — intentionally unbound by VALIDATION_TIMEOUT_SECS.
-run_ffprobe() { run_with_timeout "$(_validation_timeout_for_args "$@")" "${FFPROBE_CMD[@]}" "$@"; }
-run_mkvmerge() { run_with_timeout "$(_validation_timeout_for_args "$@")" "${MKVMERGE_CMD[@]}" "$@"; }
+run_ffprobe() { _run_timeout_retry "$(_validation_timeout_for_args "$@")" "${FFPROBE_CMD[@]}" "$@"; }
+run_mkvmerge() { _run_timeout_retry "$(_validation_timeout_for_args "$@")" "${MKVMERGE_CMD[@]}" "$@"; }
 # Team review (2026-07-22): plain run_ffmpeg (below, unbound) is correct for
 # a real multi-hour encode, but validate_mkv_decode_windows's short bounded
 # decode-window probes were using that same unbound call -- a `-t 30`
@@ -2334,7 +2401,7 @@ run_mkvmerge() { run_with_timeout "$(_validation_timeout_for_args "$@")" "${MKVM
 # indefinitely even though every other validation helper (ffprobe/mkvmerge/
 # mkvalidator) is timeout-wrapped. Use this for short/bounded validation
 # ffmpeg probes only -- never for a real encode.
-run_ffmpeg_validation() { run_with_timeout "$(_validation_timeout_for_args "$@")" "${FFMPEG_CMD[@]}" "$@"; }
+run_ffmpeg_validation() { _run_timeout_retry "$(_validation_timeout_for_args "$@")" "${FFMPEG_CMD[@]}" "$@"; }
 
 # Cheap, tag-only check for the current major version's processed marker --
 # survives renames/moves since it's embedded in the container, not derived from
@@ -2370,7 +2437,7 @@ mkv_ves_tag_tools_drifted() {
   fp="svtav1=$(_fp_field "$bracket" svtav1);x265=$(_fp_field "$bracket" x265)"
   tools_fingerprint_is_stale "$fp"
 }
-run_mkvalidator() { run_with_timeout "$(_validation_timeout_for_args "$@")" "${MKVALIDATOR_CMD[@]}" "$@"; }
+run_mkvalidator() { _run_timeout_retry "$(_validation_timeout_for_args "$@")" "${MKVALIDATOR_CMD[@]}" "$@"; }
 
 # Deliberate scope boundary: short probe/sample-clip ffmpeg calls stay
 # synchronous. Only full encode/remux subprocesses use run_tracked_encoder().
@@ -7306,6 +7373,10 @@ validate_mkv_ebml_bounds() {
   local out rc=0
   # Capture status via || so we never toggle set -e (toggling -e then
   # `return 124` exits the whole shell when the caller used set +e; fn; rc=$?).
+  # NOT _run_timeout_retry: this call's script body is a heredoc, and a
+  # heredoc's stdin is consumed on first read -- a retry attempt would see
+  # an empty script instead of the real one. Single attempt, still with the
+  # size-scaled timeout.
   out="$(run_with_timeout "$(_validation_timeout_for_args "$dst")" python3 - "$dst" <<'PY'
 import os, sys
 

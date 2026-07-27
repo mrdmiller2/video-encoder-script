@@ -16,6 +16,31 @@ Everything below is in service of building enough confidence in correctness
 and safety to actually do that at scale without a human needing to babysit
 it or discover data loss after the fact.
 
+## Deferred from the v5.0.32X retry-on-timeout review (2026-07-27)
+
+Two low-severity, real findings from independent review of `_run_timeout_retry()`
+and the lowered `MKVALIDATOR_MAX_SIZE_BYTES`, deferred rather than fixed
+under time pressure since neither affects the default path:
+
+- **`VALIDATION_TIMEOUT_RETRIES` isn't bounds-checked against integer
+  overflow.** The current validation rejects unset/non-numeric values
+  (falls back to 2) but not an absurdly large digit string, which could
+  make the `-gt` comparison in `_run_timeout_retry` emit an `integer
+  expected` error under `set -e`. Only reachable via deliberate
+  misconfiguration (`VALIDATION_TIMEOUT_RETRIES` is an env override, not
+  user-facing). Worth capping to a sane max (e.g. reject anything over
+  some reasonable ceiling like 20) next time this function is touched.
+- **The mkvalidator structure-cache doesn't distinguish an EBML-only pass
+  from a full mkvalidator pass.** Since `MKVALIDATOR_MAX_SIZE_BYTES` was
+  lowered to 2GiB, files in the 2-5GB range now commonly get EBML-only
+  validation, but the cache entry looks identical to a file that got the
+  full mkvalidator treatment (cache key is just `size|mtime` + path). Only
+  matters if `CONVERT_MKVALIDATOR_MAX_SIZE` is ever raised again and an
+  operator expects previously-EBML-only-validated files to get re-checked
+  with full mkvalidator — they won't, since the cache will report them as
+  already validated. Fix would be encoding which validation level was used
+  into the cache entry itself.
+
 ## NFS contention pattern refined — first Movies/TV test (2026-07-26)
 
 The 51-file mixed-content test (first non-anime round this session) hit
@@ -123,8 +148,17 @@ check timeout) need to scale with source file size rather than stay a flat
 still fail on files like this one that need 10+ minutes; a fixed bump large
 enough to cover the worst case (15+ minutes) risks masking a genuinely
 stuck/hung validator on smaller files that should fail fast. Scaling by
-file size is the right shape of fix. Not yet implemented — see the v5.0.32V
-follow-up work for this fix once designed and reviewed.
+file size is the right shape of fix.
+
+**Done — v5.0.32W (size scaling) and v5.0.32X (retry-on-timeout + lowered
+mkvalidator ceiling)**, see CHANGELOG.md for both. Even the size-scaled
+timeout alone left occasional residual failures on the largest files, since
+real NFS timing variance means the same file can take 2x+ longer on one
+attempt than the next — no fixed formula eliminates that. v5.0.32X's retry-
+on-timeout (specifically on rc=124, never on genuine structural failure)
+plus lowering `MKVALIDATOR_MAX_SIZE_BYTES` to 2GiB (so the files in the
+2-5GB range where this variance showed up most just skip the slow full
+scan) together close the gap.
 
 **Diagnostic lesson for next time**: don't trust "the same specific files
 keep failing" as evidence of a stable *external* cause (scrub, contention,
