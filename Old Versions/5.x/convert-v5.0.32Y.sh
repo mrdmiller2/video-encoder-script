@@ -1730,8 +1730,11 @@ resolve_job_sidecar_paths() {
   MASTER_LOG_FILE="$JOB_SIDECAR_DIR/convert-v4.log"
   STATS_LOG_FILE="$MASTER_LOG_FILE"
   _neutralize_symlink_sidecar_path "$MASTER_LOG_FILE"
-  exec {MASTER_LOG_FD}>>"$MASTER_LOG_FILE" 2>/dev/null || MASTER_LOG_FD=""
-  [ -n "$MASTER_LOG_FD" ] && chmod 0666 "$MASTER_LOG_FILE" 2>/dev/null || true
+  if { exec {MASTER_LOG_FD}>>"$MASTER_LOG_FILE"; } 2>/dev/null; then
+    chmod 0666 "$MASTER_LOG_FILE" 2>/dev/null || true
+  else
+    MASTER_LOG_FD=""
+  fi
   echo "[convert] Log file: $MASTER_LOG_FILE (job_root_writable=$JOB_ROOT_WRITABLE)" >&2
 }
 
@@ -4747,19 +4750,31 @@ resume_init_paths() {
            "$RESUME_SHARDS_FILE" "$RESUME_DONE_LOG"; do
     _neutralize_symlink_sidecar_path "$p"
   done
-  exec {DONE_LOG_FD}>>"$RESUME_DONE_LOG" 2>/dev/null || DONE_LOG_FD=""
-  [ -n "$DONE_LOG_FD" ] && chmod 0666 "$RESUME_DONE_LOG" 2>/dev/null || true
+  if { exec {DONE_LOG_FD}>>"$RESUME_DONE_LOG"; } 2>/dev/null; then
+    chmod 0666 "$RESUME_DONE_LOG" 2>/dev/null || true
+  else
+    DONE_LOG_FD=""
+  fi
   # Same fd-based hardening as MASTER_LOG_FD/DONE_LOG_FD: these three are
   # appended to many times per run via a predictable path. A symlink raced
   # into place there could redirect appended text into any file the process
   # can write, not just "our own logs" -- opening the fd once, right after
   # the neutralization above, closes that window for the rest of the run.
-  exec {CORRUPT_FILES_LOG_FD}>>"$CORRUPT_FILES_LOG" 2>/dev/null || CORRUPT_FILES_LOG_FD=""
-  [ -n "$CORRUPT_FILES_LOG_FD" ] && chmod 0666 "$CORRUPT_FILES_LOG" 2>/dev/null || true
-  exec {BAD_SOURCES_LOG_FD}>>"$BAD_SOURCES_LOG" 2>/dev/null || BAD_SOURCES_LOG_FD=""
-  [ -n "$BAD_SOURCES_LOG_FD" ] && chmod 0666 "$BAD_SOURCES_LOG" 2>/dev/null || true
-  exec {RECONVERT_FILES_LOG_FD}>>"$RECONVERT_FILES_LOG" 2>/dev/null || RECONVERT_FILES_LOG_FD=""
-  [ -n "$RECONVERT_FILES_LOG_FD" ] && chmod 0666 "$RECONVERT_FILES_LOG" 2>/dev/null || true
+  if { exec {CORRUPT_FILES_LOG_FD}>>"$CORRUPT_FILES_LOG"; } 2>/dev/null; then
+    chmod 0666 "$CORRUPT_FILES_LOG" 2>/dev/null || true
+  else
+    CORRUPT_FILES_LOG_FD=""
+  fi
+  if { exec {BAD_SOURCES_LOG_FD}>>"$BAD_SOURCES_LOG"; } 2>/dev/null; then
+    chmod 0666 "$BAD_SOURCES_LOG" 2>/dev/null || true
+  else
+    BAD_SOURCES_LOG_FD=""
+  fi
+  if { exec {RECONVERT_FILES_LOG_FD}>>"$RECONVERT_FILES_LOG"; } 2>/dev/null; then
+    chmod 0666 "$RECONVERT_FILES_LOG" 2>/dev/null || true
+  else
+    RECONVERT_FILES_LOG_FD=""
+  fi
   filecache_init
 }
 
@@ -5584,8 +5599,13 @@ begin_shard_log() {
   fi
   SHARD_LOG_ACTIVE=true
   _neutralize_symlink_sidecar_path "$SHARD_LOG_FILE"
-  exec {SHARD_LOG_FD}>>"$SHARD_LOG_FILE" 2>/dev/null || { SHARD_LOG_FD=""; SHARD_LOG_ACTIVE=false; return 0; }
-  chmod 0666 "$SHARD_LOG_FILE" 2>/dev/null
+  if { exec {SHARD_LOG_FD}>>"$SHARD_LOG_FILE"; } 2>/dev/null; then
+    chmod 0666 "$SHARD_LOG_FILE" 2>/dev/null
+  else
+    SHARD_LOG_FD=""
+    SHARD_LOG_ACTIVE=false
+    return 0
+  fi
   {
     echo ""
     echo "=== shard log — $(date -u '+%Y-%m-%d %H:%M:%S UTC') ==="
@@ -5601,7 +5621,7 @@ end_shard_log() {
     SHARD_LOG_ACTIVE=false
     SHARD_LOG_FILE=""
     if [ -n "$SHARD_LOG_FD" ]; then
-      exec {SHARD_LOG_FD}>&- 2>/dev/null || true
+      { exec {SHARD_LOG_FD}>&-; } 2>/dev/null || true
       SHARD_LOG_FD=""
     fi
     return 0
@@ -5610,7 +5630,7 @@ end_shard_log() {
   # master log -- makes sure everything written through it has actually
   # landed, and the fd itself only ever pointed at this shard's own file.
   if [ -n "$SHARD_LOG_FD" ]; then
-    exec {SHARD_LOG_FD}>&- 2>/dev/null || true
+    { exec {SHARD_LOG_FD}>&-; } 2>/dev/null || true
     SHARD_LOG_FD=""
   fi
   master_log_write ""
@@ -13249,7 +13269,7 @@ convert_library_pipeline() {
   fi
   log_batch_encode_total
 
-  exec {CONVERT_READY_FD}<&- 2>/dev/null || true
+  { exec {CONVERT_READY_FD}<&-; } 2>/dev/null || true
 
   if [ "$DRY_RUN" = false ]; then
     resume_clear_state

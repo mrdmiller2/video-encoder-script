@@ -4,6 +4,266 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.33B — 2026-07-28
+
+Full E2E code-confidence review of the entire ~13,600-line script, requested
+after the v5.0.33A validation-gap fix — not scoped to any one bug, a ground-up
+audit for anything else lurking. Split into 7 sections and reviewed in
+parallel by independent agents, producing ~30 findings. Critically, **every
+finding was independently re-verified with a direct bash reproduction before
+being fixed** — this caught that several of the audit's own "confirmed"
+findings were false positives (a bare `var="$(cmd)"` that's a *non-final*
+component of an `&&`-chain is exempt from `set -e`, which multiple findings
+misjudged; several `stat`/`file_size_bytes`-style helpers already fail closed
+internally, making their "unguarded" call sites safe in practice). Only
+findings that reproduced empirically were fixed — recorded here by category:
+
+**Real `set -e` abort-risk fixes** (bare assignments that CAN legitimately
+fail in normal, non-bug operation): `resolve_crf_for_encode()`'s VMAF-target
+lookup, reachable via any ambiguous/undetectable profile path — the exact
+same class of path as the Movies/Japanese/Animation guard, just one level
+deeper in the encode pipeline; a `python3`/`pwd` lookup and an `/etc/fstab`
+read in `_runtime_home()`/CIFS mount detection (narrow sudo/no-getent
+scenario); an unguarded `mktemp -d` inside the NVENC tune probe, reachable
+because that probe is called bare from `main()`; `convert_pipeline_ready_pending()`'s
+`wc -l` against a sidecar file that could vanish mid-run, polled in the
+pipeline-mode hot loop. `find_original_source_for_av1()` was also unguarded
+at a call site whose very next line's log message ("no original sibling")
+shows the failure it doesn't handle is an anticipated, normal outcome, not
+an error.
+
+**A real scoping bug**: `pick_av1_encoder()` was missing `local` on
+`hdr_note`, silently reading/writing a global.
+
+**Dead code removed**: a logically-impossible third disjunct in
+`subtitle_matches_video()` (recomputed the same value as the first
+condition) that only added an unconditional extra subprocess spawn per
+subtitle-match attempt.
+
+**An O(n²) performance fix**: `mark_folder_done_if_complete()` ran a full
+recursive re-scan of an entire show's subtree (every season, every episode)
+on *every single per-file completion event*, even when the immediate folder
+had a file still pending — mathematically guaranteed to fail that check
+every time, since the parent-subtree check necessarily re-examines the
+still-pending folder too. Now gated on `still_pending = false`.
+
+**A cross-host safety gap in the orphan reaper**: `_orphan_write_stage_host_marker()`
+previously swallowed write failures with `|| true`. This marker is the
+*only* thing letting one fleet host's reaper recognize "this staging dir
+belongs to a still-live encode on a different host" — a silently-failed
+write (NFS hiccup, ENOSPC — exactly the conditions under which reaping is
+most likely to run soon after) defeats that whole protection, risking
+`rm -rf` of a live encode running on another machine. Now warns loudly
+instead of hiding the failure (matches the "diagnostics must never be
+silently swallowed" convention from the v5.0.33A stderr-blackhole fix).
+
+**Multi-part source merge hardening** (previously only compared video
+codec/resolution/pix_fmt/fps before merging parts, and validated nothing
+about the merge's own result): added an audio-track (codec+channel-count)
+compatibility check with an explicit `ref_a_seen` flag (an empty reference
+value is legitimate here — a silent part — unlike the video check, where
+it only ever means "not yet set"; missing this distinction let a
+silent-Part-1-then-audio-Part-2 mismatch slip through uncaught in an
+earlier draft, caught by team review); a post-merge duration-sum sanity
+check (parts' summed duration vs. merged output duration, 10% tolerance)
+to catch a merge that silently drops content, the same "exit code alone
+isn't proof of real work" class of gap already fixed once this session;
+a part-number contiguity check requiring the sequence start at 1 with no
+gaps (Part 2 + Part 3 with Part 1 missing, or Part 1 + Part 3 with Part 2
+missing, no longer silently "merge" as if complete — the start-at-1 half
+of this check was itself caught by team review after the first draft only
+checked adjacency); using the marker word (Part vs. Disc) to keep
+different naming conventions from being merged together; and a guard
+against a literal `|` in a filename corrupting the pipe-delimited internal
+representation used to pass parts between functions.
+
+**Cache-invalidation efficiency fix**: the per-directory file-list cache's
+mtime-staleness check was walking into and stat-ing internal staging/junk
+directories (`Deferred`, `.convert-stage-*`, etc.) that are already
+excluded from the real video listing — a file moving through one of those
+still bumped its parent's mtime and forced a spurious full re-scan. Now
+excluded from both descent and the mtime computation itself (a residual,
+accepted gap remains: a staging dir being *created or removed* directly
+inside an otherwise-legitimate season folder still bumps that season
+folder's own mtime by ordinary POSIX directory semantics, which this fix
+doesn't and can't fully eliminate without a different invalidation
+mechanism entirely).
+
+**A dead-code + real-gap fix in the orphan reaper**: a
+`-name '.convert-hbprog-*'` `find` clause was searching under the
+NAS-shared library root, but that staging dir (HandBrake's progress-FIFO
+scratch space) is actually created under the machine's own local
+`${TMPDIR:-/tmp}` — the clause could never match anything there (removed).
+A new, local-only cleanup pass was added to actually clean up orphaned
+local hbprog dirs (no cross-host risk since `/tmp` is inherently local,
+unlike the NAS-shared staging dirs). This new function itself first
+shipped with two instances of the exact `set -e`-abort bug class this
+whole review exists to catch — an `&&`-chain ending in a log call that's
+false on the normal "removed 0 dirs" path, and a bare `rm -rf` that can
+genuinely fail (verified directly: a read-only parent directory makes it
+return non-zero) — both caught by team review and fixed before deploy, a
+reminder that writing new code under the same real constraints this
+session spent so much time on is easy to get wrong even while explicitly
+hunting for exactly that mistake elsewhere.
+
+**Strengthened, not redesigned**, the orphan reaper's encoder-liveness
+heuristic: `orphan_size_stable()`'s polling window doubled (~8s → ~16s) to
+reduce (not eliminate) the chance of misjudging a still-growing output as
+stable between writes — deliberately not introducing a new tool dependency
+(`lsof`/`fuser`, unused anywhere else in this fleet script) for what is a
+narrow edge case (requires the *script* process to have segfaulted while
+its encoder child kept running).
+
+**A performance fix**: `_orphan_source_from_flag_for_pid()` was doing its
+own full recursive `find` over the (possibly library-sized, NFS-shared)
+root once per staged candidate needing source resolution, on top of the
+main reaper loop's own identical scan — now memoized per `$root` for the
+life of one reaper run.
+
+Team-reviewed in two full passes (a general-purpose agent and two other
+reviewers for the initial ~20-fix batch; one of those reviewers again for
+the follow-up fixes that batch's own review surfaced) — both passes found real, fixable issues
+in the fixes themselves, not just rubber-stamped the diff.
+
+`convert-v5.0.33B.sh` checksum: `e11f541afad898d71f982b621ec3a0c3ad5bc1f835e1fd0f5a81e04f8bf72955`.
+
+## v5.0.33A — 2026-07-27
+
+Fixes a real, severe validation gap found by the v5.0.32Z fleet-wide
+regression test itself — not a hypothetical. During the Plex machine's
+assigned test (`For Whom the Alchemist Exists (2019)`, 11.85GB anime,
+chosen to exercise the new EBML-fallback ceiling path), the source turned
+out to have severely corrupted/sparse PTS (timestamp) data. ffmpeg's own
+encode log showed `time=` climbing toward the full ~2 hour runtime while
+`frame=` stayed stuck at 1 for most of the run, ultimately encoding only
+**324 real frames (~13.5 seconds)** into an AV1 output whose container
+still reported the full 1:57:54 duration — inherited from the source's
+broken timestamps. This 6.9MB output was accepted: `validate_mkv_output()`
+passed it, `validate_mkv_decode_windows()` passed it, and the folder was
+marked done.
+
+Root cause: `validate_mkv_decode_windows()` bounds-checks the first and
+last `MKV_VALIDATE_WINDOW_SECONDS` (30s) of an output by decoding each
+window to `-f null -` and treating ffmpeg's exit code as the verdict. When
+the last-window probe (`-sseof -30`) seeks into a region the container
+falsely claims has content, ffmpeg finds nothing, exits 0 cleanly, and the
+check "passes" having verified nothing — exit code alone can't distinguish
+"healthy content decoded" from "found nothing here, gave up cleanly."
+
+**Fix**: added `decoded_frame_count()`, which parses the last `frame=N`
+value from ffmpeg's own progress meter (written to stderr independent of
+`-loglevel`, confirmed against real captured logs) after each windowed
+decode, and both decode calls now pass an explicit `-stats` flag they
+previously lacked. Validation now fails with a new `zero_frames_decoded`
+corrupt-reason whenever a window decodes zero real frames.
+
+**Two bugs caught before deployment, both by testing against real fleet
+files rather than trusting the design on paper:**
+
+1. The first draft omitted `-stats`. Verified directly against both the
+   known-bad quarantined file and a known-good file (Crystalight's `Safe
+   Word (2022).AV1.mkv`) — *neither* produced any `frame=` output without
+   `-stats`, which would have made the new check fail universally, a
+   fleet-wide false-positive regression far worse than the bug it was
+   meant to fix. Testing the good file first (not just the bad one) is
+   what caught this before it shipped.
+2. All three reviewers (a general-purpose review agent and two other
+   reviewers, independently) caught that `decoded_frame_count()`'s pipeline exits
+   non-zero under `pipefail` when zero `frame=` matches exist — exactly
+   the corrupt-file case — and the bare `frames="$(decoded_frame_count
+   ...)"` assignment at both call sites would abort the *entire script*
+   under `set -e` right at that moment, rather than gracefully failing
+   validation for just that one file. Fixed by having the helper absorb
+   its own pipeline failure (`|| true`) and always `printf` a value
+   (defaulting to `0`), so the function itself never returns non-zero.
+
+Re-verified after both fixes against real files: known-good (Crystalight's
+Safe Word, docm's Headshot) show hundreds of real frames per window and
+pass; the quarantined Alchemist Exists output shows 0 and correctly fails.
+
+Team-reviewed by a general-purpose agent and two other reviewers in parallel for
+the initial design, then one of those reviewers again for final confirmation of the
+`set -e` fix — all four passes converged independently on the same
+findings without prompting each other.
+
+`convert-v5.0.33A.sh` checksum: `694801308bb29d2e1d7adaa28a879199d992bc3ee7675bc7e71b649a9e65dbbf`.
+
+## v5.0.32Z — 2026-07-27
+
+Fixes a severe, wide-reaching stderr-blackhole bug discovered while launching
+the post-v5.0.32Y regression test plan: the ambiguous-path guard test
+(`Movies/Japanese/Animation/` without `--profile`) exited 1 in under a
+second with none of the expected `err "...is ambiguous..."` message ever
+printed, and `main()` itself appeared to never be entered. Hours of
+bisection (debug markers added at every candidate line in a scratch copy)
+traced the actual failure to a single top-level statement that runs before
+`main()` is ever reached, inside `resolve_job_sidecar_paths()`:
+
+```bash
+exec {MASTER_LOG_FD}>>"$MASTER_LOG_FILE" 2>/dev/null || MASTER_LOG_FD=""
+```
+
+`exec` with only redirections and no command word is a shell builtin that
+applies those redirections **permanently to the current shell process**,
+not just to that one statement — this is documented bash behavior, not a
+malfunction. So `2>/dev/null` here silently and permanently redirected the
+script's own stderr (fd 2) to `/dev/null` for the rest of every run, the
+instant this line succeeded. Every later `err()`/`warn()` call anywhere in
+the script (both write via `>&2`), including `main()`'s ambiguous-path
+error, went silently into the void from that point on — while the process
+still exited with whatever nonzero status the eventual check produced,
+looking exactly like a silent, causeless failure. Confirmed directly: a
+scratch copy with the redirect target changed from `/dev/null` to a capture
+file showed the exec itself succeeding (`rc=0`) — it was never failing, it
+was successfully doing something worse than failing.
+
+This is not cosmetic: since this line runs at the very start of every job
+on every fleet machine, it means **essentially all `err`/`warn` diagnostics
+emitted after this point have likely been silently lost from the terminal**
+on every run since this code was introduced. The `MASTER_LOG_FD`-based log
+file writes themselves were unaffected (a separate fd); only the
+terminal/stderr stream was swallowed.
+
+A codebase-wide audit (independently converged on by two independent reviewers, plus
+a general-purpose review pass) found the identical pattern at **9 sites
+total**: the original `MASTER_LOG_FD` open, `DONE_LOG_FD`,
+`CORRUPT_FILES_LOG_FD`, `BAD_SOURCES_LOG_FD`, `RECONVERT_FILES_LOG_FD`,
+`SHARD_LOG_FD` (one open, two closes), and `CONVERT_READY_FD` (one close).
+All 9 fixed with the same pattern — group-scope the redirect directly onto
+the real `exec` inside a `{ ...; }` command group, which (unlike bare
+`exec`) scopes redirections normally to just that command:
+
+```bash
+if { exec {MASTER_LOG_FD}>>"$MASTER_LOG_FILE"; } 2>/dev/null; then
+  chmod 0666 "$MASTER_LOG_FILE" 2>/dev/null || true
+else
+  MASTER_LOG_FD=""
+fi
+```
+
+An earlier draft used a separate writability probe (`: >>file`) before the
+real `exec`; one reviewer caught that this introduced a narrow regression — if the
+probe succeeded but the real `exec` then failed (race, fd exhaustion,
+permission change), the unguarded `exec` would trip `set -e` and abort the
+whole script instead of falling back to `FD=""` like the original did. The
+single-statement group-scoped form above avoids that: exactly one open
+attempt, one code path, no extra race window.
+
+Team-reviewed by a general-purpose agent and two other reviewers in parallel, all
+three independently confirming the bare-exec-redirect-persistence diagnosis
+against bash's own documented behavior and verifying it live. Both other reviewers
+independently flagged the same 5 additional affected sites
+beyond the one first found — treated as high-confidence since two
+independent reviewers converged on the identical list without prompting.
+
+Re-verified after the fix: the original ambiguous-path guard test now
+prints `[error] Movies/Japanese/Animation is ambiguous; rerun with --profile
+anime or --profile wanime` and exits 1, as originally intended by the
+v5.0.32V fix — confirming that fix (which was itself correct all along) had
+simply never been visible until now.
+
+`convert-v5.0.32Z.sh` checksum: `35babbec90651a4bd09e2a825421b34ca941be05faf659ac8652bfe2ddff2bf7`.
+
 ## v5.0.32Y — 2026-07-27
 
 Retunes v5.0.32X's `MKVALIDATOR_MAX_SIZE_BYTES` and validation-timeout
