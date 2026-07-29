@@ -4,6 +4,81 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.33E — 2026-07-29
+
+Fixes a silent-hang class of bug that killed 3 of 8 fleet machines' jobs
+during the same large-scale production-readiness test, discovered by
+investigating why aiprocessor, gruntbox2, and plex all stopped producing
+log output partway through their batches, hours before anyone noticed.
+
+Root-cause investigation (three genuinely different mechanisms, not one
+shared trigger):
+
+- **GruntBox2**: kernel logs show two separate SVT-AV1 encoder worker
+  threads (`svt-md12`, `svt-md14`) segfaulting 5 seconds apart during a
+  CRF-search sample encode, on this machine's 2009-era dual Xeon X5570
+  (no AVX/AVX2 at all). A genuine encoder crash — but the reason it took
+  down the *entire batch* rather than just failing that one file: the
+  call site (`_vmaf_score_one`, part of the CRF-search sampling path) used
+  bare `run_ffmpeg` with **no timeout**. When SVT-AV1's worker threads died
+  uncleanly, ffmpeg's main thread most likely deadlocked waiting on them
+  instead of exiting, and with no timeout to catch a hung/deadlocked
+  process, the whole script blocked on that one call indefinitely.
+- **Plex**: systemd logs show the SSH login session that had been holding
+  this job open for **1 week 3 days 9h54m of CPU time** was closed, and
+  because the `plex` account has `Linger=no`, systemd tore down that
+  session's cgroup scope ~4 minutes later, killing every process still in
+  it — including the week-plus-running encode job. Unrelated to the
+  GruntBox2 mechanism; this will recur on any long-running job whenever its
+  originating SSH session ends, for any reason.
+- **aiprocessor**: died the same way (silently, mid-CRF-search, zero
+  diagnostic trace) but the SSH session that held it stayed alive 7+ hours
+  after the process died, ruling out Plex's session-teardown mechanism.
+  Consistent with the same unguarded-`run_ffmpeg` hang risk as GruntBox2,
+  though not independently confirmed with the same certainty (no
+  kernel-visible crash trigger was found).
+
+The codebase already had a hardened, timeout-and-retry-wrapped `ffmpeg`
+path (`run_ffmpeg_validation`, added 2026-07-22 specifically because "a
+stalled NFS read... could hang the whole machine indefinitely") — but an
+existing code comment already flagged, undone, that other call sites still
+used "several un-timeout-guarded run_ffmpeg calls" and could suffer the
+same fate. This fix extends that same protection to every short/bounded
+sample-clip `run_ffmpeg` call found in a full sweep of the script:
+`vmaf_crf_search_internal`'s clip extraction, `_vmaf_score_one`'s sample
+encode + VMAF scoring (the confirmed GruntBox2 crash site),
+`vmaf_crf_search_abav1`'s ab-av1 invocation, `upscale_sample_decision`'s 5
+calls (found by one reviewer on the first review pass — the same class of gap,
+missed in the initial fix), `_vmaf_compare_window`, `encoder_ssim_score`,
+the bake-off sample clip extraction, and the AV1-source-sample-point clip
+extraction. The real full-file encode path (which legitimately runs for
+hours on this fleet's slower machines) is deliberately left unbound, same
+as before.
+
+A separate timeout curve (`_remux_timeout_for_args` / `run_ffmpeg_remux`,
+base 300s + 700s/GiB, capped at 36000s/10h) was added specifically for
+`attempt_source_mkv_structure_remux`'s ffmpeg fallback — a full-file stream
+copy, not a short sample. Both independent reviewers caught, on
+the second review round, that reusing the short-probe timeout curve
+(`_validation_timeout_for_args`, capped at 3620s) there would require
+~14 MiB/s sustained throughput just to avoid a false timeout on a 50GiB
+file, which could wrongly flag a perfectly healthy but slow-to-copy source
+as corrupt. The new curve requires only ~1.5 MiB/s up to ~51GiB.
+
+Deliberately left unfixed: `ffmpeg_sample_encode()`, which uses a
+different execution mechanism (`run_tracked_encoder`: background + plain
+`wait`, no timeout at all) shared with the real multi-hour full-file
+encode path. Adding sample-specific timeout handling there requires
+distinguishing sample-callers from real-encode-callers inside a heavily
+shared primitive — judged too risky to rush in this pass; tracked as a
+follow-up in ROADMAP.md rather than fixed under time pressure.
+
+Team-reviewed by two independent reviewers across two full rounds: the first round
+caught one additional unfixed call site (`upscale_sample_decision`) beyond
+the original CRF-search-only fix; the second round (after that expansion)
+caught the remux-repair timeout-curve mismatch above. Both rounds
+confirmed no `set -e`/quoting issues in the new code.
+
 ## v5.0.33D — 2026-07-29
 
 Fixes a false-positive subtitle-corruption deferral found while investigating

@@ -16,6 +16,27 @@ Everything below is in service of building enough confidence in correctness
 and safety to actually do that at scale without a human needing to babysit
 it or discover data loss after the fact.
 
+## Deferred from the v5.0.33E timeout-hardening fix (2026-07-29)
+
+- **`ffmpeg_sample_encode()`'s sample encode is still unbound.** v5.0.33E
+  fixed every short-sample-clip call site that used bare `run_ffmpeg`
+  directly, but `ffmpeg_sample_encode()` goes through a different
+  mechanism entirely (`run_tracked_encoder`: launches the command in the
+  background, then a plain `wait` with no timeout at all), shared with the
+  real multi-hour full-file encode path (which legitimately needs to stay
+  unbound). This function encodes a short, already-locally-extracted
+  sample clip — the same encoder class (SVT-AV1/x265) that caused the
+  GruntBox2 crash this session — so it carries the same theoretical hang
+  risk if an encoder worker thread dies uncleanly mid-sample-encode.
+  Deliberately not fixed under time pressure: adding a timeout here needs
+  a way to distinguish "this caller is doing a short sample" from "this
+  caller is doing the real encode" inside a primitive shared by both,
+  without risking a regression to the real-encode path (which several
+  fleet machines legitimately run for 3-7+ hours). Worth a dedicated
+  design pass — e.g. a `run_tracked_encoder_bounded` variant that accepts
+  an optional timeout, defaulting to none (today's behavior) unless a
+  caller opts in.
+
 ## Deferred from the v5.0.32X retry-on-timeout review (2026-07-27)
 
 Two low-severity, real findings from independent review of `_run_timeout_retry()`
