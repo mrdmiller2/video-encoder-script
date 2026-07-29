@@ -4,6 +4,50 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.33C — 2026-07-29
+
+Fixes an alarming (but functionally harmless) log message found during the
+large-scale 8-machine production-readiness test: Plex's AMD iGPU VAAPI
+`hevc_vaapi` encode capability probe crashed (`SIGABRT`, core dump) instead
+of exiting cleanly when the driver genuinely doesn't support the requested
+profile. This was already safe from a correctness standpoint — the probe
+runs under `set +e`, captures the real exit code, and treats any nonzero
+(or crashed) result as "not available," so hardware detection still fell
+back correctly and no job was affected — but bash itself prints a
+`PID Aborted (core dumped) <command>` line directly to the script's own
+stderr for *any* foreground command that dies by signal, and this specific
+message is not the command's own output — it comes from bash's own
+job-control reporting, so `>/dev/null 2>&1` on the command itself does
+nothing to suppress it (verified empirically). For anyone actually
+depending on working AMD/Intel iGPU hardware, seeing what looks like a
+crash in the logs on every single run would be needlessly alarming, even
+though nothing was actually broken.
+
+**Fix**: route the exact same probe command through a command substitution
+(`probe_err="$(cmd 2>&1 >/dev/null)"`) instead of running it as a bare
+foreground statement. Verified directly via isolated reproduction: an
+identical command dying by `SIGABRT` prints the alarming line when run
+bare in the foreground, and does not print it at all when run inside
+`$(...)` — `$?` still correctly reflects the same exit status (134)
+either way. Applied to both `_probe_amd_vaapi_on_device()` (the original
+crash site) and `_probe_qsv_encode_available()` (Intel QSV path, same
+probe shape, same theoretical risk, no observed crash there yet but fixed
+proactively for consistency). `detect_nvenc_av1_tune()` (the NVENC probe)
+was deliberately left untouched — it already writes to a log file rather
+than `/dev/null`, has a different branching structure (timeout/sudo
+combinations), and has been exercised on every single fleet job all
+session without ever showing this symptom; its failure mode there is a
+clean nonzero exit, not a signal crash.
+
+Team-reviewed by two independent reviewers in parallel — both confirmed the fix
+correct with no issues, and one reviewer specifically confirmed the code avoids
+a classic related bash gotcha: `local var="$(cmd)"` in one statement would
+have masked the command's real exit status with `local`'s own (always 0);
+keeping the `local` declaration and the assignment as separate statements
+(as this code already did) avoids that trap.
+
+`convert-v5.0.33C.sh` checksum: `5539030b1cfd96ef9050814abb7e1bd677c3363b95f5f708b2b02a2232264f40`.
+
 ## v5.0.33B — 2026-07-28
 
 Full E2E code-confidence review of the entire ~13,600-line script, requested
