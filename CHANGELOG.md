@@ -4,6 +4,51 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.33D — 2026-07-29
+
+Fixes a false-positive subtitle-corruption deferral found while investigating
+"bad source" files flagged by the large-scale 8-machine production-readiness
+test. The user tested several deferred files directly and found some played
+back correctly with no visible errors, prompting a root-cause investigation
+rather than accepting the deferral verdict at face value.
+
+Root cause: `validate_mkv_subtitle_tracks()` only ever checked the **first**
+subtitle stream (`s:0`) for cues in a tail window near the end of the file,
+treating a lack of cues there as truncated/mismatched subtitles and
+permanently deferring the source. This assumed the first subtitle stream is
+always the meaningful one to judge — but a source's disposition-`default`
+flag (which usually corresponds to the first subtitle stream) can be
+mis-authored independent of whether that specific track's content is valid.
+
+Confirmed real case: **"The Great Beauty (2013)"**. `ffprobe` showed three
+subtitle streams; the disposition-`default`-flagged track (`s:0`, absolute
+stream index 2) contained only a byte-order-mark — genuinely empty — while a
+different, non-default track (absolute stream index 4) had the complete,
+valid English subtitles running to within about 8 minutes of the film's true
+~2h20m40s runtime. Extracted and confirmed directly via `mkvextract tracks`
+(chosen over `ffprobe -show_entries packet=pts_time`, which requires
+sequentially demuxing large portions of an interleaved MKV container and was
+extremely slow over NFS on this 8.4GB file). Separately, another deferred
+file from the same test batch, "Bad Genius (2017)," was independently
+confirmed by the user to be genuinely corrupt (does not play in VLC) and has
+since been deleted — a true positive, unrelated to this bug.
+
+**Fix**: `validate_mkv_subtitle_tracks()` now loops over every subtitle
+stream on the file (`s:0` through `s:(n-1)`), skipping forced tracks exactly
+as before (still queried per-track via ffprobe's disposition flag, never
+guessed from cue density). It only fails the source if **every** non-forced
+subtitle track lacks cues in the tail window — checking stops early the
+moment any track passes. Ambiguity handling was hardened at the same time: a
+timeout or probe error on any individual track's checks no longer determines
+the outcome by itself; the function keeps examining the remaining tracks,
+and only soft-fails (`return 124`, retryable) rather than confirming
+corruption if no track passed and at least one was ambiguous. A hard failure
+(`return 1`, permanent `Deferred/` move) now only fires when every non-forced
+track gave a clean, unambiguous "no cues" result. Team-reviewed by two independent reviewers in parallel — both independently traced all four flag-combination
+cases (all-forced, all-clean-fail, mixed-ambiguous, one-passes-early) and
+confirmed the logic and `set -e` safety of the new per-track loop; no issues
+found in the new code itself.
+
 ## v5.0.33C — 2026-07-29
 
 Fixes an alarming (but functionally harmless) log message found during the
