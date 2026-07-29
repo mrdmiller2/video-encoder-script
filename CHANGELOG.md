@@ -4,6 +4,72 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.33F — 2026-07-29
+
+Fixes a fleet-wide, long-standing x265 quality bug found while doing a
+deep-dive log review of all 8 fleet machines' output after the v5.0.33E
+restart (user request: "do a deepdive into the logs... to ensure no
+failures, premature endings, aborts, or other issues"). The audit itself
+found no failures on any machine — but investigating one specific
+non-fatal warning ("Unknown option: tune.", seen on MacFedora and
+GruntBox2's animation-profiled content) surfaced a real, previously
+unknown bug.
+
+**Root cause**: `X265_PARAMS_WANIME`, `_ANIME`, `_CANIME`, and `_VINTAGE`
+all embedded `tune=animation` or `tune=grain` directly inside the
+colon-separated `-x265-params` string. x265's own parameter parser
+(`x265_param_parse()` — what ffmpeg's `-x265-params`, HandBrake's
+`--encopts`, and ab-av1's `--enc x265-params=` all call under the hood)
+does **not** accept `tune` as an individually settable key — tune is a
+whole-preset convenience applied by a completely different function
+(`x265_param_default_preset()`) that none of these interfaces invoke.
+Every encode using one of these four profiles has been silently printing
+`Unknown option: tune.` to stderr and getting **no tuning applied at
+all** — for as long as this script has existed. Confirmed this is not a
+fleet-version-divergence issue: reproduced identically via direct manual
+testing on docm's own build, which never even exercised this code path in
+the test batch, ruling out "some machines have an older/different x265."
+
+Directly verified the fix by comparing x265's own reported internal
+config with and without a correctly-applied `-tune animation`: `psy-rd`
+shifted from the untuned default of `2.00` down to animation-tune's
+`0.40`, and deblock parameters changed too — proof the tuning is now
+genuinely reaching the encoder, which it silently never did before.
+
+**Fix**: extracted tune into a new `profile_x265_tune()` helper
+(`wanime`/`anime`/`canime` → `animation`, `vintage` → `grain`, everything
+else → none), removed `tune=...` from all four `X265_PARAMS_*` constants,
+and updated every call site to pass it through the correct native
+mechanism instead of folding it into the params string:
+- `ffmpeg_encode()`'s real hevc encode — `-tune "$x265_tune"` added to
+  `FF_VIDEO_ARGS`.
+- `_vmaf_score_one()`'s CRF-search sample encode (the scorer used to pick
+  a CRF) — `${x265_tune:+-tune "$x265_tune"}` inline, empirically verified
+  this parameter expansion produces exactly two argv words when set and
+  zero when empty.
+- HandBrake's real encode path — new `EP_ENCODER_TUNE` variable, passed
+  via `--encoder-tune` in `build_handbrake_args()`; also fixed the
+  `--dry-run` log line, which one reviewer caught was still missing this flag in
+  its printed preview even though the real invocation was already correct.
+- `vmaf_crf_search_abav1()`'s ab-av1 invocation — a **separate** `--enc
+  "tune=$x265_tune"` entry (confirmed via ab-av1's own docs that `--enc
+  key=value` passes straight through as ffmpeg's own `-key value` option,
+  not folded into the existing `x265-params=` value).
+
+Team-reviewed by two independent reviewers in parallel; both independently
+confirmed `profile_x265_tune()`'s case coverage is complete across all 8
+content profiles and found no `set -e` issues in the
+`x265_tune="$(profile_x265_tune ...)" || x265_tune=""` pattern used at
+every call site. One reviewer additionally caught the dry-run logging gap noted
+above.
+
+**Note on past encodes**: this bug means every wanime/anime/canime/vintage
+x265 encode this script has ever produced was missing its intended
+animation/grain tuning. This is a real quality-improvement question (worth
+considering whether past x265 encodes under these profiles should be
+flagged for re-encoding) but is a policy decision, not something addressed
+automatically by this fix — the fix only changes behavior going forward.
+
 ## v5.0.33E — 2026-07-29
 
 Fixes a silent-hang class of bug that killed 3 of 8 fleet machines' jobs
