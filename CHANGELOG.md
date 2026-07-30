@@ -4,6 +4,70 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.33G — 2026-07-30
+
+Fixes a real gap found during the final production-readiness test: legacy
+container formats (avi, ogm, ts, m2ts, vob, disc images -- and now also
+mpg/mpeg/m2v, rm/rmvb, divx, wmv, flv, asf, which were missing from the
+`is_must_eliminate_format()` list) could get permanently stuck in their
+original container if both AV1 and x265 transcode attempts failed, since
+the only prior fallback (`must_eliminate_fallback_or_fail()`) just deferred
+the file for human review with nothing else attempted.
+
+**Trigger**: investigating a genuine dual-codec validation failure on
+Crystalight during the final test ("Four Sisters And A Wedding (2013)", an
+`.mp4` with a variable frame rate — `avg_frame_rate` an unreduced
+non-standard fraction rather than a clean ratio) led to confirming the
+existing safety net (reject both bad outputs, keep the original, log to
+`corrupt_files.txt`) worked correctly there. But the user flagged the
+broader requirement directly: legacy containers specifically must never be
+left as-is when re-encoding is skipped — they should at least get a plain
+container change to MKV.
+
+**Fix**: `must_eliminate_fallback_or_fail()` now falls back to a lossless
+stream-copy remux (reusing the existing `remux_copy_to_mkv` +
+`validate_mkv_output` primitives) before giving up, scoped strictly to
+must-eliminate-format sources — an ordinary file that simply doesn't
+compress well or fails validation for unrelated reasons is untouched by
+this change and behaves exactly as before.
+
+This required real depth, not just the fallback itself. Three rounds of
+independent team review, each catching real issues:
+- **Round 1**: a timeout-handling bug (a validation timeout on the new
+  remux would have deleted it instead of preserving it for retry, unlike
+  every other validation path in the file) and missing collision/symlink
+  guards on the new output path.
+- **Round 2**: the codebase's resume/skip-detection logic
+  (`find_complete_canonical_output`, `clear_incomplete_canonical_outputs`,
+  `inspect_existing_outputs_for_queue`) had no awareness of the new plain
+  `.mkv` remux output at all — a successfully-remuxed source would never
+  be recognized as "done" and would silently retry the entire (doomed)
+  AV1/x265 pipeline on every future scan, forever. Fixed via a new
+  `must_eliminate_remux_path()` helper wired into all three functions,
+  plus the orphaned-staging-file crash-recovery detection
+  (`orphan_gate0_provenance`, `orphan_canonical_dst_for_candidate`).
+- **Round 3**: `find_complete_canonical_output`'s early-return still
+  short-circuited before the new check; `_orphan_collect_candidates_for_flag`
+  (a *different* function from the two fixed in round 2) still didn't
+  collect the remux path for orphan recovery; two folder-completion
+  checks (`_dir_subtree_all_video_files_done`, `mark_folder_done_if_complete`)
+  still keyed only on AV1/x265 outputs, which would have kept re-scanning
+  a folder containing only successful remuxes forever. All fixed. This
+  round also caught a real bug in my own first-draft fix: an attempt to
+  inject a `find` predicate via `%q`-quoted command substitution, which
+  doesn't word-split the way `eval` would — replaced with a proper bash
+  array (`local -a name_preds=(...)`).
+
+**Accepted residual risk, documented rather than fixed**: `flag_bad_processed_output`'s
+ownership check for a bare `Title.mkv` (no codec suffix to verify, unlike
+`.AV1.mkv`/`.x265.mkv`) relies only on the existing mtime-newer-than-source
+guard, not a positive ownership proof. Closing this fully would mean adding
+`mkvextract` as a new fleet-wide dependency just to read the
+`VES_PROCESSED` tag for this one narrow case (a same-titled, newer,
+structurally-valid-but-unrelated file coexisting with a legacy-format
+source) — judged not worth it for a low-probability edge case; documented
+in a code comment for future reference instead.
+
 ## v5.0.33F — 2026-07-29
 
 Fixes a fleet-wide, long-standing x265 quality bug found while doing a
