@@ -16,6 +16,50 @@ Everything below is in service of building enough confidence in correctness
 and safety to actually do that at scale without a human needing to babysit
 it or discover data loss after the fact.
 
+## Deferred from the v5.0.33G E2E team review (2026-07-30)
+
+Full team E2E review of the v5.0.33G release (7-way parallel section review
+plus a consolidated independent-review pass) found and fixed several real bugs
+(bare `mktemp -d`/`rm -rf`/`rm -f` abort risks, a `compare_shard_snapshots`
+resume-bookkeeping bug, a subtitle-probe ambiguity gap, and an orphan
+staged-name recognition gap for the new remux path — see CHANGELOG.md's
+v5.0.33G entry for the full fixed list). Three items were deferred as
+real-but-architectural, not spot-fixes:
+
+- **`remux_copy_to_mkv()` is unbounded (uses `run_tracked_encoder`, not the
+  timeout-wrapped `run_ffmpeg_remux`).** This is the SAME class of "silent
+  hang" bug already fixed for CRF-search sample encodes in v5.0.33E, just
+  in a different function. `remux_copy_to_mkv` is used by 3+ call sites
+  (the pre-existing HEVC-in-MKV remux shortcut, the must-eliminate-format
+  container-elimination shortcut, and the new v5.0.33G remux-floor
+  fallback) — not something introduced by the v5.0.33G work, a pre-existing
+  gap surfaced by reviewing it fresh. Fixing it isn't a simple swap:
+  `run_tracked_encoder` provides heartbeat-based in-progress-flag touching
+  (so other fleet hosts don't think a legitimately-long remux was
+  abandoned), which `run_ffmpeg_remux`'s timeout-and-retry model doesn't
+  have. Needs either a heartbeat-aware timeout wrapper, or accepting the
+  loss of heartbeat protection for this specific operation (stream-copy
+  remuxes are usually much faster than a real encode, so orphan-flag
+  staleness may be less of a real risk here — needs judgment, not a rushed
+  fix).
+- **A finalized plain-`.mkv` remux (must_eliminate_remux_path output)
+  relies on a non-fatal `VES_PROCESSED` tag write to avoid being rescanned
+  as a fresh source on a future run.** If tagging fails (rare, but
+  `write_ves_processed_tag` only warns, doesn't fail the job) or if
+  validation timed out before `finalize_mkv_output` ran, the file could be
+  requeued as an ordinary source next scan. Would need `is_derived_output`/
+  `find_videos_under`'s exclusion logic extended to recognize a bare
+  `.mkv` sitting next to a must-eliminate-format source as already-derived,
+  not just `.AV1.mkv`/`.x265.mkv` suffixes.
+- **Quick-scan validation (`inspect_existing_outputs_for_queue`'s
+  `quick=true` mode) skips subtitle/audio/decode checks**, which is
+  correct/intentional for the common case, but means a remux output whose
+  full validation previously timed out specifically during subtitle
+  checking could get permanently quick-accepted on a later scan without
+  ever re-running the check that timed out. Same risk profile as the
+  pre-existing AV1/x265 quick-scan path (not unique to the new remux
+  floor), just newly surfaced by extending quick-scan to cover it too.
+
 ## Deferred from the v5.0.33E timeout-hardening fix (2026-07-29)
 
 - **`ffmpeg_sample_encode()`'s sample encode is still unbound.** v5.0.33E

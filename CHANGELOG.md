@@ -4,6 +4,76 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.33H — 2026-07-30
+
+Full end-to-end team review of the entire v5.0.33G file (not just the new
+code): 7 parallel section-review agents covering the whole 14,000+ line
+script, plus two other reviewers reviewing all of this session's changed
+functions together as a consolidated set (to catch interaction bugs a
+piecemeal review would miss). One reviewer reported "100% stable, zero bugs";
+the other reviewer and one section agent independently found real issues, so — per this
+project's established practice — the empirically-verified findings were
+trusted over that clean bill of health.
+
+Nine real bugs fixed, all `bash -n`-verified and empirically reasoned
+through rather than pattern-matched:
+
+- **`resume_check_shard_changes`**: a bare `cp -f` and a bare
+  `changes="$(compare_shard_snapshots ...)"` could abort the entire script
+  under `set -e` on a transient NFS hiccup during ordinary resume
+  bookkeeping. Guarded both (`|| true` / `|| changes=""`).
+- **`optimize_mkv_for_streaming`**: a bare trailing `rm -rf` cleanup could
+  abort mid-finalize on a permission/NFS race. Added `|| true`.
+- **`upscale_sample_decision`, `pick_av1_encoder`, the multi-point encoder
+  comparison function, `vmaf_crf_search_internal`**: each had a bare
+  `mktemp -d` that didn't match the rest of its own function's established
+  `|| return 1` convention on every other failure path — one failed
+  `mktemp` (e.g. full /tmp) would have aborted the whole script instead of
+  falling back gracefully. Fixed all four; also added `|| true` to
+  `upscale_sample_decision`'s trailing cleanup.
+- **`_orphan_clear_flag`**: a bare `rm -f` reachable unprotected from
+  `main()` via `reap_orphaned_encoders()` — a stale flag the reaper
+  couldn't remove would have aborted the entire fleet run instead of being
+  retried next pass. Added `|| true`.
+- **`_orphan_source_from_staged_basename`**: didn't recognize the new
+  bare `Title.mkv` staged output name (no codec suffix) from v5.0.33G's
+  remux floor at all — added a third reverse-lookup pattern, gated so it's
+  only trusted when the resolved source is genuinely a must-eliminate
+  format (never ambiguous with a real pre-existing `.mkv` source, since
+  `.mkv` sources are never must-eliminate).
+  - **Follow-up gap, found on the final verification pass**: the fix above
+    was dead code as first written — `_orphan_staged_candidates_in_dir()`,
+    the directory enumerator that feeds it, only matched
+    `<pid>.Title.AV1.mkv` / `<pid>.Title.x265.mkv` basenames and never
+    listed the bare `<pid>.Title.mkv` file at all. A dead-owner staging
+    directory containing only a bare-mkv candidate would have had its
+    whole directory `rm -rf`'d as unresolvable debris instead of being
+    salvaged. Fixed by adding a third regex alternative to the enumerator.
+    Also widened the reverse-lookup's extension-reconstruction loop, which
+    only tried `mkv mp4 avi ts m4v` — far short of the full
+    `is_must_eliminate_format()` list (m2ts, vob, ogm, mpg, mpeg, m2v, rm,
+    rmvb, divx, wmv, flv, asf) — so a source like `Title.mpg` still
+    couldn't reverse-resolve by basename. Traced every downstream consumer
+    (`_orphan_dispose_stage_dir_candidates`, `orphan_canonical_dst_for_candidate`,
+    `derived_output_codec_claim_matches`) to confirm each already handles a
+    bare-mkv candidate correctly now that it's actually reachable.
+- **`validate_mkv_subtitle_tracks`**: the top-level subtitle-probe
+  ambiguity check only treated `rc -eq 124` (timeout) as ambiguous; a
+  genuine non-timeout ffprobe error was silently treated the same as
+  "confirmed no subtitle tracks", which could pass a file that actually
+  needed a retry. Widened to `rc -ne 0` (any probe failure).
+
+**Deferred, not fixed** (documented in ROADMAP.md as architectural, not
+spot-fixable): `remux_copy_to_mkv()` itself is still unbounded (uses
+`run_tracked_encoder`, not the timeout-wrapped `run_ffmpeg_remux`) across
+3+ call sites, sharing the same "silent hang" bug class already fixed
+elsewhere in v5.0.33E — needs a heartbeat-aware timeout wrapper, not a
+one-line fix; a finalized bare-`.mkv` remux depends on a non-fatal
+`VES_PROCESSED` tag write to avoid being rescanned as a fresh source; and
+quick-scan validation mode skips the subtitle check entirely, so an output
+whose full validation previously timed out during subtitle checking could
+get permanently quick-accepted later without ever re-running that check.
+
 ## v5.0.33G — 2026-07-30
 
 Fixes a real gap found during the final production-readiness test: legacy
