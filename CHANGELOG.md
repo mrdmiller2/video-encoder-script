@@ -4,6 +4,43 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.33I — 2026-07-30
+
+Found during the final production-readiness test (all 8 fleet machines
+running a mixed-format regression pass on v5.0.33H): asked "are we actually
+using the RAMDISK staging path fleet-wide?" and checked directly rather
+than assuming — 7 of 8 machines confirmed genuine RAM-backed staging
+(`/tmp`/`/dev/shm` tmpfs), but **Crystalight (macOS) was silently falling
+back to writing straight to the NFS destination**, despite having a
+correctly-provisioned 12GB RAM disk mounted at `/Volumes/ConvertRAMDisk`.
+
+**Root cause**: `_is_tmpfs_dir()`'s macOS branch grepped `diskutil info`
+for `"Virtual Interface.*Yes"` or `"Device Node.*disk.*Virtual"` — neither
+pattern exists in real `diskutil` output, so the check has silently never
+worked since RAMDISK support was added. The real signal
+(`Virtual: Yes`) only appears on the disk's *parent whole-disk* record, not
+the mounted partition the old code queried, and even that alone isn't
+sufficient — every APFS volume (including the real boot disk) reports
+`VirtualOrPhysical=Virtual` at the container layer.
+
+**Fix**: rewrote the macOS detection to scan `hdiutil info`'s own
+attached-image list for the block whose `system-entities` mount our target
+directory, and only trust it if that same block's `image-path` is
+genuinely `ram://` (not a file path) — this is the same signal macOS
+itself uses to distinguish a real RAM disk from an ordinary mounted `.dmg`.
+Team review caught that an earlier draft of this fix — walking
+APFS container → physical store → `BusProtocol=Disk Image` — would have
+misclassified any file-backed disk image mounted from real SSD storage as
+RAM-backed too; the `hdiutil info` / `ram://` check is the more precise
+signal that reviewer suggested. Empirically verified on Crystalight: RAM disk →
+detected true, real boot volume → false, home directory → false,
+nonexistent directory → false.
+
+**Deploy scope**: this fix is deployed to Crystalight only for now. The
+other 7 fleet machines are mid-run on the final production-readiness test
+and were deliberately left undisturbed on v5.0.33H — full fleet sync to
+v5.0.33I happens once that test completes.
+
 ## v5.0.33H — 2026-07-30
 
 Full end-to-end team review of the entire v5.0.33G file (not just the new
