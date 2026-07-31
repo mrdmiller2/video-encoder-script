@@ -4,6 +4,26 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.33K — 2026-07-31
+
+User feedback during fleet triage: "ISO's (and other disk structures) should
+be handled by HandBrake" — found on PRINCE, "Zu Warriors (2001).iso" got
+skipped ("Unable to Determine which title you wish to convert, process this
+manually") because its two feature-length titles (1:44:01 and 1:20:21) were
+only ~29% apart, under the existing `DISK_TITLE_DOMINANCE_PCT` (40%)
+duration-ratio threshold used to auto-pick a disc's main title. Rather than
+tune that threshold (which would just move the ambiguity boundary, not
+resolve it), added `handbrake_scan_main_feature_title()`: runs
+`HandBrakeCLI --main-feature --scan` and reads which title HandBrake itself
+marks `+ Main Feature` — its detection uses real disc-structure signals
+(VTS/angle layout), not just a duration comparison. Wired into
+`select_dominant_disk_title()` as the first thing tried; falls through to
+the existing duration-dominance heuristic unchanged if HandBrake doesn't
+mark anything. Empirically verified against the real ISO: HandBrake
+correctly and immediately identified title 1 (1:44:01) as the main feature.
+Team-reviewed: PASS — POSIX-portable awk, correct fallthrough,
+`set -euo pipefail` safe.
+
 ## v5.0.33J — 2026-07-31
 
 Found during the fleet-wide final production-readiness test (resumed after a
