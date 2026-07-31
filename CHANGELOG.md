@@ -4,6 +4,25 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.33M — 2026-07-31
+
+Team E2E confidence review of the full script (requested by the user
+after v5.0.33L shipped) found one real bug: `orphan_gate1_duration()`
+always failed for disc-derived (ISO/BDMV) orphan candidates, since ffprobe
+can't derive a duration from a raw disc path -- meaning after a crash
+mid-job, the orphan reaper would delete a possibly hours-of-work AV1/x265
+candidate instead of salvaging or deferring it for review, every time,
+for every disc source. Fixed by skipping Gate 1 outright for disc sources
+(`is_disk_source "$source" && return 0`), relying on Gates 2/3 (structure
++ tail decode) as the safety net instead. Team-reviewed: correct
+fix for the deletion bug, though noted as a "salvage-over-delete
+tradeoff" rather than a fully equivalent duration check, since there's no
+recorded expected-title-duration to compare against without a full
+HandBrake re-scan (too expensive for the orphan reaper's per-pass cost
+budget) -- worth a proper disc-specific duration check as a future
+improvement if this proves insufficient in practice. Another reviewer's independent
+pass hit repeated external API errors and did not complete.
+
 ## v5.0.33L — 2026-07-31
 
 Follow-up user direction after v5.0.33K's HandBrake main-feature fix:
