@@ -4,6 +4,64 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.33J — 2026-07-31
+
+Found during the fleet-wide final production-readiness test (resumed after a
+session interruption on docm): "KanColle The Movie (2016)" (93min anime movie,
+1080p h264 source, ASS subtitle + 4 font attachments) had BOTH its AV1 and its
+x265 fallback attempts independently fail post-encode validation with "zero
+frames decoded in last 30s" — a real, previously-undiscovered failure class,
+not the same false-positive bug already fixed in `audio_track_reaches_near_eof`
+earlier this project. Confirmed the source itself decodes cleanly (719 real
+frames in its own last 30s via direct ffprobe/ffmpeg); the defect is in the
+OUTPUT only, on both codec paths independently. Root-caused as far as a 5-minute
+clip reproduction could take it: extracting the source's last 5 minutes and
+running the exact same final-encode command construction (video+audio+subs+
+attachments mapped, libsvtav1, max_muxing_queue_size 8192) reproduced NO stall
+— completed cleanly with matching frame counts whether or not subtitles/
+attachments were mapped. So the defect is specific to sustained long-duration
+(~90+ min) real encodes, not simply an artifact of subtitle/attachment mapping
+in isolation. Consulted the team: one reviewer proposed a demuxer-lookahead/
+muxing-queue-overflow theory (silently dropping video packets during long
+sparse-subtitle seeks); another reviewer was skeptical of that specific mechanism
+(`-max_muxing_queue_size` normally fails loudly rather than silently dropping)
+and, after reading the actual validation code, pointed out a real *gap*
+regardless of root cause: the existing tail-decode check (`validate_mkv_decode_windows`)
+seeks from the OUTPUT's own reported EOF, which only caught this case because
+the output's container duration happened to still match the source's — a
+future case where the output's own duration also shrinks (following the
+truncated video) could pass this check falsely. Root mechanism for why the
+video stream itself stalls is **not fully proven** — this is a defense-in-depth
+fix, not a confirmed root-cause fix:
+
+- **New `validate_mkv_video_reaches_source_eof()`** (called from
+  `validate_mkv_output` after the existing duration-drift check): seeks from
+  the SOURCE's duration (not the destination's) and verifies real video frames
+  decode near where the file OUGHT to end regardless of what the destination
+  container claims about itself. Complements, doesn't replace, the existing
+  decode-window checks.
+- **`-fps_mode passthrough`** added to both the primary encode and the
+  subtitle-stripped retry, as a low-risk mitigation in case ffmpeg's default
+  frame-duplication/drop timestamp resync logic is implicated — not confirmed,
+  but no downside to passing source frame timing straight through.
+- Both changes verified: unit-tested the new validation function standalone
+  against a real encoded clip (legitimate full-duration file passes; a
+  simulated-truncation case correctly fails and records `video_truncated`).
+  Team-reviewed: PASS, with one documented caveat — an unusual source
+  where audio/container duration legitimately extends past the last real video
+  frame by more than the validation window could false-fail this new check;
+  not observed in practice, worth revisiting if it ever surfaces.
+
+Also fixed the same session: Plex was the only fleet machine where `worker`
+(the actual job-running account) lacked `loginctl` linger — a gap in the
+2026-07-29 fix, which enabled linger for the legacy `plex` account instead.
+With `RemoveIPC` defaulting to `yes`, this let systemd-logind silently wipe
+`worker`'s `/dev/shm` RAM-disk staging directory whenever the launching SSH
+session ended, mid-encode — ffmpeg's detached process kept running and
+"succeeded" writing into a directory that no longer existed. Fixed via
+`loginctl enable-linger worker` on Plex (no code change; config-only, verified
+fleet-wide that no other machine has this gap).
+
 ## v5.0.33I — 2026-07-30
 
 Found during the final production-readiness test (all 8 fleet machines
