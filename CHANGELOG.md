@@ -4,6 +4,73 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.33L — 2026-07-31
+
+Follow-up user direction after v5.0.33K's HandBrake main-feature fix:
+"Ideally ISO's and other disk-based sources are 'extracted' by HandBrake
+into some cheap lossless format so that the normal processing can then
+take place... this would unify the encoding process because all files are
+encoded the same way." Previously, disc sources (ISO/BDMV) had HandBrake do
+the entire final AV1/x265 encode itself via a separate special-cased path
+(`bakeoff_encoder_for_src`/`handbrake_encode`), never going through the
+same VMAF-CRF-search ffmpeg pipeline every other library file uses.
+
+Redesigned `process_disk()`: HandBrake now only extracts the selected
+title into a private, local-disk-only scratch file (explicitly NOT the
+RAM-disk/tmpfs staging path -- a losslessly re-encoded Blu-ray can be tens
+of GB), which is then symlinked into the real media directory under the
+disc's own name and run through the *exact same* `try_av1_convert`
+pipeline as any other file. The symlink is what makes this work with zero
+changes needed to `canonical_title_from_source`/`media_content_dir`/
+`av1_output_path`/`profile_for_source`/ffprobe-based codec detection --
+they all just see an ordinary `.mkv` (ffmpeg/ffprobe/HandBrake all follow
+read-side symlinks transparently).
+
+Extraction encoder is x264 at `-q 0` (true lossless), not FFV1 --
+empirically tested FFV1 first (the more obvious "true lossless" choice)
+but HandBrakeCLI 1.11.0 segfaults immediately inside `encavcodecInit` for
+the FFV1 encoder on real hardware, reproduced independent of
+source/quality/subtitles. x264 `-q 0` is genuinely lossless (QP 0) and
+was verified working end-to-end.
+
+New `logical_source` parameter threaded through `try_av1_convert`/
+`try_x265_convert`/`must_eliminate_fallback_or_fail`/
+`record_conversion_result`/`done_log_append` (design + implementation
+reviewed, two real bugs caught before shipping: the override
+needed to cover `is_must_eliminate_format` checks and `flag_bad_source_for_human`
+targeting, not just size accounting; and `JOB_LOGICAL_SOURCE` needed an
+explicit reset at both per-file entry points to prevent it leaking a
+disc job's identity into the next unrelated file's accounting) -- keeps
+size-guardrail/must-eliminate-format/done-log accounting anchored on the
+TRUE original disc, not the temporary symlink, while output naming stays
+derived from the symlink (so it lands with the disc's real title). A disc
+job with no salvageable AV1/x265 candidate has no valid cheap remux floor
+(unlike avi/mpg, ffmpeg can't stream-copy a raw disc structure -- that's
+exactly why the lossless extraction step exists) -- `must_eliminate_fallback_or_fail`
+now skips that floor specifically for disc sources and flags for manual
+review instead.
+
+`ramdisk_job_teardown`'s EXIT trap (already relied on by every run) now
+also owns disc-extraction scratch-file/symlink cleanup, composed into the
+same trap rather than installing a second one (which would silently
+clobber it) -- and is now registered unconditionally at the top of
+`ramdisk_job_start` rather than only on its ramdisk-found success path,
+so the cleanup fires even on machines with no ramdisk at all.
+
+Verified end-to-end on real infrastructure (PRINCE, a WSL-hybrid machine
+running HandBrake via its Windows .exe) against the actual "Zu Warriors
+(2001).iso" from the v5.0.33K investigation: title selection, lossless
+extraction, symlink handoff, the real VMAF-CRF-search AV1 encode, correct
+final output naming/placement, correct guardrail-size accounting against
+the true 7.25GB disc, and clean cleanup all confirmed working. One real
+bug found only through this live test: the scratch directory's `chmod 700`
+caused the Windows-side HandBrake process to fail with
+`avio_open2 failed, errno -13` (EACCES) when writing via
+`\\wsl.localhost\` interop, since that process reaches WSL paths under a
+different UID mapping than the Linux-side owner -- fixed to `chmod 1777`
+(team review: sticky bit over plain 777, since this scratch dir is
+local-machine-only, never NFS/network-shared).
+
 ## v5.0.33K — 2026-07-31
 
 User feedback during fleet triage: "ISO's (and other disk structures) should
