@@ -4,6 +4,39 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.33N — 2026-08-01
+
+The recurring "zero frames decoded near end" validation failure (KanColle,
+Last Bullet, and now a third independent hit -- "Dont Make Me Go (2022)"
+on AI-PROCESSOR) got a fresh team investigation after confirming a much
+stronger pattern: the two most recent hits have 34 and 38 subtitle tracks
+respectively (streaming-release, one-per-language style), vs KanColle's
+1 track + 4 attachments -- all three are long (93-113 min). A fresh 5-minute
+clip repro test using the FULL 34-track subtitle set from "Dont Make Me Go"
+still did not reproduce the stall, confirming this needs sustained long
+duration to manifest, not just a high subtitle-track count in isolation.
+
+Two independent reviewers disagreed on the mechanism: one theorized
+`-max_muxing_queue_size` exhaustion from sparse subtitle-stream
+interleaving; the other was skeptical (queue exhaustion is documented as a
+hard error, not a silent stall) and pointed instead at
+`ffmpeg-formats.html`'s own `max_interleave_delta` documentation, which
+explicitly calls out sparse streams causing excessive buffering -- a
+different, more specific mechanism. Neither is confirmed; a real repro
+would need an actual 60-90+ minute encode, too expensive to iterate on
+blindly.
+
+Rather than guess at a fix, added `capture_validation_failure_evidence()`:
+fires only for `video_truncated`/`zero_frames_decoded` validation
+failures (the two reasons behind this exact bug class), preserving the
+rejected output plus ffprobe/mkvmerge metadata and a packet-level trace
+of the final 2 minutes of both source and output -- into a
+`.convert-v5-validation-failures/` sidecar dir -- BEFORE the existing
+code deletes the evidence, so the next real occurrence leaves an actual
+artifact to inspect instead of forcing another blind live-reproduction
+attempt. Purely diagnostic: no change to encode/validation logic or
+success-path behavior. Implemented and reviewed.
+
 ## v5.0.33M — 2026-07-31
 
 Team E2E confidence review of the full script (requested by the user
