@@ -182,12 +182,8 @@ enabled for network shares, not just the local staging dirs.
   the same hardware, on the exact machines that invested the most
   engineering effort into fscache. This needs to be measured, not
   assumed away, before the port is called a performance win.
-- **AMD hardware encode is a genuine platform break, not a port.**
-  MacFedora's `hevc_vaapi` path is Linux-only (VAAPI doesn't exist on
-  Windows); Windows AMD encode goes through AMF (`hevc_amf`/`av1_amf`)
-  instead, a different ffmpeg backend with different rate-control
-  parameters. All VAAPI-specific tuning needs to be redone fresh for
-  AMF, not translated.
+- **AMD hardware encode is a genuine platform break, not a port** — see
+  the dedicated AMF section below for the full researched picture.
 - **Smaller items worth tracking but not blocking**: NVENC's
   driver-enforced concurrent-session cap (historically 2-3 on consumer
   GeForce cards) is silicon/driver-level and follows to native Windows
@@ -197,7 +193,60 @@ enabled for network shares, not just the local staging dirs.
   specifically, since it manifests as a driver-reset event rather than a
   clean process error.
 
-### 7. Suggested phasing (avoid a monolithic 14,000-line rewrite attempt)
+### 7. AMD's NVENC/CUDA equivalent (AMF) — researched, aim for as close to parity as possible
+
+Per explicit user direction: investigate AMD's actual hardware-encode
+and GPU-compute stack in the same depth as NVIDIA's, rather than
+treating it as an afterthought. Researched findings (2026-08-02):
+
+- **SDK/library**: Advanced Media Framework (**AMF**), currently
+  **v1.5.2**. No separate SDK install needed for end users — the AMF
+  runtime (`amfrt64.dll`/`amfrt32.dll`) ships inside standard AMD Radeon
+  GPU drivers already. The public SDK on GitHub/GPUOpen is only needed
+  for compiling against it directly, not for running ffmpeg's
+  AMF-backed encoders.
+- **AV1 hardware support by GPU generation** (directly answers whether
+  MacFedora's hardware could ever get AV1 hw encode): **RDNA1 (RX 5000
+  series, including MacFedora's RX5500) has NO AV1 support at all,
+  encode or decode — permanently HEVC/H.264-only via VCN 2.0.** This
+  matches its current VAAPI ceiling on Linux exactly; the Windows port
+  doesn't change or improve this, it's a real silicon limit. RDNA2 (RX
+  6000) adds AV1 *decode* only (except the lowest-end Navi 24 SKUs,
+  which have none at all). RDNA3 (RX 7000, VCN 4.0) adds AV1
+  *encode+decode* but the AV1 encoder lacks B-frame support. RDNA4 (RX
+  9000, VCN 5.0) is the first generation with full AV1 encode+decode
+  including B-frames. Relevant if the fleet ever adds a newer AMD card.
+- **ffmpeg `hevc_amf`/`av1_amf` vs. NVENC — genuinely comparable core
+  feature set, not a crippled alternative**: rate control offers `cqp`
+  (constant QP), `vbr_peak`, `cbr`, and `qvbr` (quality-based VBR) — no
+  direct `-crf` equivalent, unlike libx265/libsvtav1. Quality presets
+  are simpler than NVENC's `p1`-`p7` scale, mapping to `quality`/
+  `balanced`/`speed`. `-vbaq true` (Variance-Based AQ) is AMF's
+  equivalent to NVENC's spatial-AQ; `-preanalysis true` gives
+  lookahead-style optimization comparable to NVENC's multipass. Close
+  enough in capability that a real parity-tuning pass (analogous to the
+  VAAPI tuning MacFedora already has) is worthwhile, not a lost cause.
+- **GPU-compute equivalent to CUDA**: AMD's real equivalent is **HIP**
+  (part of ROCm), but ffmpeg has **no native `scale_hip` filter
+  upstream** — so there's no direct AMD equivalent to `scale_cuda` via
+  that path. The actual working equivalent for hardware-accelerated
+  scaling/color-conversion is **`vpp_amf`** (AMF's own scaling filter),
+  plus `sr_amf` for FidelityFX Super Resolution upscaling specifically.
+  `scale_vulkan` and `scale_opencl` are also available as cross-vendor
+  options on Windows if AMF-specific filters prove insufficient.
+- **Reliability/compatibility notes for Windows specifically**: AMD's
+  "Minimal"/"Driver Only" installer is recommended over the full
+  Adrenalin suite (avoids background overlays/telemetry contributing to
+  driver resets). A real known failure mode: Windows Update can silently
+  overwrite a manually-installed driver with an older certified version,
+  breaking `amfrt64.dll` integration — Group Policy should disable
+  Windows-managed driver updates on any machine running this. Older
+  architectures (Polaris/Vega, pre-dating MacFedora's RDNA1 card) are
+  prone to regressions on newer driver branches; pinning to an older
+  stable Adrenalin branch is the documented workaround if that hardware
+  is ever in the fleet.
+
+### 8. Suggested phasing (avoid a monolithic 14,000-line rewrite attempt)
 
 1. **Phase 0 — tooling spike**: confirm every binary dependency above
    actually works standalone on a real Windows box (GruntBox2's Windows
