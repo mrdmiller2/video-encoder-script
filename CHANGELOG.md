@@ -4,6 +4,21 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.33P — 2026-08-02
+
+Bug found while building a small synthetic test to validate 33O's new
+`subtitle_stream_has_real_content()` fleet-wide: an ASS subtitle cue
+containing only an override block (e.g. `{\an5}`, a position tag with no
+dialogue) survived the original cue-number/timing-only markup strip,
+because ffmpeg's SRT muxer wraps styled ASS text in `<font ...>...</font>`
+-- the leftover `<font size="20">{\an5}</font>` line passed the "is this
+non-empty" check as if it were real text, a false negative that would
+have kept a functionally-empty track. Fixed by stripping ASS override
+blocks (`{\...}`) and any `<tag>`/`</tag>` wrapper before the emptiness
+check. Verified directly against a constructed ASS-track test file
+(override-only cue correctly now strips; a track with genuine dialogue
+text still correctly survives).
+
 ## v5.0.33O — 2026-08-02
 
 Four changes bundled into this version, in order of dependency:
