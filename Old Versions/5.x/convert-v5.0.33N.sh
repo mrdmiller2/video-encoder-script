@@ -7709,7 +7709,7 @@ validate_source_media() {
 # mid-check, and is sufficient to answer the only question that matters --
 # "is someone else actively working this title right now?"
 #
-# Second re-review caught that a plain existence check treats a
+# A second re-review caught that a plain existence check treats a
 # genuinely stale/abandoned lock (the real owner crashed) the same as a
 # live one -- that title would then never even reach place_in_progress_flag,
 # so its own junk_flag_is_stale reclaim never runs either, silently
