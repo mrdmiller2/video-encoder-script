@@ -16,6 +16,156 @@ Everything below is in service of building enough confidence in correctness
 and safety to actually do that at scale without a human needing to babysit
 it or discover data loss after the fact.
 
+## Native-Windows PowerShell fork — scoped, not started (2026-08-02)
+
+**Goal**: a PowerShell 7+ port that runs natively on Windows with no WSL
+layer at all — eliminates the whole class of WSL-specific pain this
+project has already hit repeatedly (PRINCE's full WSL2 rebuild after
+filesystem corruption; GruntBox2's NAT-mode networking/portproxy/
+firewall dance; WSL2 auto-suspend killing SSH access; the
+`\\wsl.localhost\` UNC-path interop permission bug that forced the
+disc-extraction scratch dir to `chmod 1777`). **Fork relationship**: the
+bash/zsh script on Linux/macOS/WSL remains the single authoritative
+source of truth for behavior and design decisions. The PowerShell fork
+derives its functionality from the primary version and is tested for
+behavioral parity against it (same real test files, same expected
+outcomes) — it does not make independent design calls. New features and
+bugfixes land in the primary script first; the PowerShell fork stays in
+sync afterward, not the other way around.
+
+**Scope explicitly includes** (per user direction): binary
+strategy (native Windows builds vs. compiling from source where needed),
+a genuine RAM-disk-equivalent staging mechanism, and both NFS and SMB
+mount support (the NAS serves both protocols).
+
+### 1. External tool binaries — mostly solved, needs confirmation
+
+- **ffmpeg/ffprobe**: BtbN's ffmpeg-builds project already ships
+  full-featured static Windows builds (libsvtav1, libx265, libvmaf,
+  libplacebo included) — same source PRINCE already uses today via its
+  WSL-side ffmpeg. No compilation needed; just point at the Windows
+  `.exe` instead of the Linux binary.
+- **HandBrakeCLI**: official Windows builds already exist and are
+  already in active use today (PRINCE's WSL-hybrid setup calls
+  `/mnt/c/Program Files/HandBrake/HandBrakeCLI.exe` directly). Directly
+  reusable, zero porting work.
+- **mkvmerge / mkvpropedit**: MKVToolNix ships official Windows
+  installers — should be a straight binary swap.
+  **mkvalidator**: unconfirmed whether a prebuilt Windows binary exists
+  (on Linux/macOS fleet members it was hand-copied as a binary between
+  machines rather than installed from a package manager, per
+  [[feedback_fleet_tool_parity_optional_tools]]) — may need building
+  from source with MSVC/MinGW, or the PowerShell fork may need to
+  degrade gracefully without it (mkvalidator is already optional/
+  degrades-gracefully in the primary script, per that same memory's
+  caution against treating "optional" as a reason to skip parity
+  checks — the degrade path itself still needs to actually work, not
+  just be assumed to).
+- **ab-av1**: Rust binary, has official Windows release builds on its
+  GitHub releases page — should be a straight download, no compile step.
+
+### 2. RAM-disk-equivalent staging — needs a real decision, no Windows-native tmpfs
+
+Linux/WSL2 fleet members stage encode output on `/dev/shm` or `/tmp`
+(tmpfs, RAM-backed, no disk I/O during the two-stage encode's temp-file
+window). Windows has no built-in equivalent. Candidates to evaluate:
+- **ImDisk Toolkit** (free, open-source, scriptable via `imdisk.exe`) —
+  creates a RAM-backed virtual disk with a drive letter; most likely
+  candidate given it's free and scriptable from PowerShell.
+- **OSFMount** (free for personal/eval use) — similar capability,
+  different licensing terms worth checking for this use case.
+- Fallback: stage on real (fast, local SSD) disk instead of RAM if no
+  RAM-disk solution proves reliable — slower but not a correctness
+  blocker; the two-stage encode's temp-file disk-space-pressure gap
+  (see the v5.0.33R team-review deferred items above) applies here too
+  and would need the same "estimate for two staged outputs" fix.
+
+### 3. NFS vs. SMB mounts — NAS supports both, need a decision + both paths tested
+
+- **SMB is the more natively-Windows-idiomatic choice** — `New-SmbMapping`/
+  `net use` needs no optional Windows feature enabled, works on every
+  Windows SKU including Home, and is what a typical Windows user would
+  expect. Likely the primary/default path.
+- **Windows NFS client** ("Services for NFS") is a genuine alternative —
+  built into Windows but only on Pro/Enterprise/Server SKUs (not Home),
+  enabled via `Enable-WindowsOptionalFeature`. Worth supporting since the
+  NAS already serves NFS to the rest of the fleet and the user
+  explicitly wants both covered, but can't be the only path given the
+  SKU restriction.
+- Either way, this needs the same category of fix already hit
+  repeatedly on the Linux/WSL2 side of the fleet (PRINCE's
+  `noresvport` NFS mount requirement, GruntBox2's WSL2-NAT mount-
+  recovery gap, the NFS root_squash owner-mismatch issue hit multiple
+  times this session during test cleanup) — Windows SMB/NFS have their
+  own analogous permission/credential quirks (SMB credential caching,
+  UNC path length limits, NFS UID mapping without a domain controller)
+  that need discovering empirically on real hardware, not assumed away.
+
+### 4. Process/execution model — genuine redesign, not a mechanical translation
+
+- **Detached/survives-session execution** (this session's `systemd-run
+  --unit=... --uid=worker` pattern, used constantly for real fleet
+  tests): Windows equivalent is most likely a Scheduled Task
+  (`Register-ScheduledTask`) for one-shot detached runs, or a proper
+  Windows Service for the always-on fleet-agent role GruntBox2 already
+  approximates today via its `VES-WSL-Keepalive` Scheduled Task +
+  `.wslconfig` idle-timeout workaround (a workaround this whole port
+  would eliminate the NEED for, ironically).
+- **Signal handling / cleanup traps** (`trap ... EXIT`,
+  `ramdisk_job_teardown`, `resume_on_signal`, `ACTIVE_FFMPEG_STAGE1_FILE`
+  cleanup): PowerShell's nearest equivalents are `try/finally`,
+  `Register-EngineEvent -SourceIdentifier PowerShell.Exiting`, and
+  `[Console]::CancelKeyPress` — different enough from bash trap
+  semantics that this needs a genuine redesign of the cleanup-
+  composition pattern (the primary script composes stage-1-temp-file
+  cleanup into 3 existing cleanup functions rather than adding a new
+  raw trap, per [[project_truncation_bug_resolved_2026_08_02]] — the
+  PowerShell fork needs its own equivalent single source of truth for
+  "what must always run on exit," not three independently-maintained
+  copies).
+- **`pipefail`-dependent idioms**: a meaningful fraction of the
+  subtitle-content-filter and validation code added this session
+  (`subtitle_stream_has_real_content()`'s ambiguous-vs-confirmed-empty
+  logic, `validate_mkv_subtitle_tracks()`) depends on bash's
+  `set -o pipefail` semantics to distinguish "the probe genuinely found
+  nothing" from "the probe failed/timed out." PowerShell's pipeline
+  error semantics are different enough that this logic needs to be
+  reasoned through fresh per case, not transliterated line-by-line — get
+  this wrong and it reintroduces exactly the ambiguous-failure-treated-
+  as-confirmed-empty data-loss bug the 2026-08-02 team review just
+  fixed in the primary script.
+
+### 5. Suggested phasing (avoid a monolithic 14,000-line rewrite attempt)
+
+1. **Phase 0 — tooling spike**: confirm every binary dependency above
+   actually works standalone on a real Windows box (GruntBox2's Windows
+   host is already fleet hardware and a natural test target once its
+   WSL2 layer is no longer the point) before writing any port logic.
+2. **Phase 1 — core encode/VMAF/subtitle-filter logic**: the parts with
+   the most real test coverage right now (two-stage encode+remux, VMAF
+   CRF search, `subtitle_stream_has_real_content()`/
+   `build_real_subtitle_map_args()`, the mov_text fix) — mostly portable
+   reasoning, least Windows-specific redesign needed.
+3. **Phase 2 — mount/staging infrastructure**: RAM-disk equivalent, SMB
+   +NFS mount handling, credential management.
+4. **Phase 3 — fleet infrastructure**: resume state, orphan reaper,
+   sharded directory scanning, detached/scheduled execution model.
+5. **Phase 4 — parity test suite**: run the same synthetic test files
+   already built for the primary script's subtitle-filter/two-stage
+   verification (real+empty SRT/ASS/mov_text tracks, legacy-container
+   sources) through the PowerShell fork and confirm identical
+   strip/keep/manifest outcomes, not just "it runs without erroring."
+
+**Not yet decided**: repo structure (separate repo vs. a `windows/`
+subdirectory in this same repo — the latter keeps the "PowerShell
+derives from primary" relationship more visible, but the former keeps
+release/tag history cleaner per-platform); minimum supported Windows
+version/PowerShell version; whether GruntBox2 specifically becomes the
+first machine migrated off WSL2 once this exists (its dual 2009 Xeons/
+no-AVX2 hardware is already the fleet's slowest member on movie-length
+content regardless of OS layer, so migrating it first would isolate the
+WSL-removal benefit from any hardware-driven change).
+
 ## Deferred from the v5.0.33O/P/Q truncation-bug + subtitle-filter work (2026-08-02)
 
 1. **PRINCE and GruntBox2 are missing the `convert-current.sh` wrapper.**
