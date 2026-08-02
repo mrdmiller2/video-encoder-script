@@ -16,6 +16,45 @@ Everything below is in service of building enough confidence in correctness
 and safety to actually do that at scale without a human needing to babysit
 it or discover data loss after the fact.
 
+## Deferred from the v5.0.33O/P/Q truncation-bug + subtitle-filter work (2026-08-02)
+
+1. **PRINCE and GruntBox2 are missing the `convert-current.sh` wrapper.**
+   Found while launching the fleet subtitle-filter test: both machines'
+   deploy directories only have `convert-current.target` (the marker file)
+   and the versioned script itself, but not the stable
+   `convert-current.sh` wrapper the other 6 machines have (which reads the
+   marker and `exec`s the target script, so callers never need to know the
+   current version filename). PRINCE lost it in the 2026-07-24/25 WSL2
+   rebuild; GruntBox2 apparently never got it during its 2026-07-30
+   rsync-post-xfer onboarding despite the onboarding note claiming full
+   parity. Worked around by invoking the versioned script directly for
+   this test; the wrapper should be recreated on both (copy GruntVM's or
+   AI-PROCESSOR's `convert-current.sh` verbatim, it's host-agnostic) so
+   future scripted/detached launches don't need the version-specific
+   workaround.
+
+2. **Orphan reaper aborts the entire script on an unrelated permission
+   error instead of warning and continuing.** Found on GruntVM: a stray
+   pre-existing `.convert-stage-*` directory under an unrelated title
+   ("Timestalker (2024)") that the reaper lacked permission to remove
+   caused the *whole run* to exit before ever reaching the actual convert
+   queue — 10 minutes wasted on a full-library scan, zero files
+   processed. The reaper's `rm` failure should warn and skip that one
+   orphan rather than letting the failure propagate to a full script
+   abort. Not yet fixed — needs the reaper's cleanup loop reviewed for
+   unguarded failing commands under `set -e`, same class of issue as the
+   `rc=0; cmd || rc=$?` pattern already applied elsewhere in the script.
+
+3. **Library-wide audit for existing outputs with flagged-but-empty
+   subtitle tracks — deferred, not started.** v5.0.33O/P/Q's
+   `subtitle_stream_has_real_content()` filter only applies going forward
+   (new encodes); it does not retroactively fix already-produced outputs
+   in the library that may carry the same "flagged but empty" subtitle
+   tracks the user originally reported ("a number of movies (sources and
+   output) that have subtitles 'defined' but there is no actual content").
+   No scope/priority decision made yet on whether/when to run a dedicated
+   scan-and-remux pass across existing library outputs.
+
 ## Deferred from the v5.0.33G E2E team review (2026-07-30)
 
 Full team E2E review of the v5.0.33G release (7-way parallel section review

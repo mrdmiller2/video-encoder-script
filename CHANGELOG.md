@@ -4,6 +4,38 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.33Q — 2026-08-02
+
+Added a durable per-folder manifest, `stripped_subtitles.txt` (same
+append-log convention as `corrupt_files.txt`/`bad_sources.txt`), recording
+every subtitle stream `build_real_subtitle_map_args()` strips for having
+no renderable content: timestamp, source path, stream index, language
+tag, and track title. Without this, the only record of a stripped track
+was a transient warn() line in the console/log -- there was no durable
+list of which titles lost which language tracks to go source replacement
+subtitles for. Deduplicated per source+stream-index within a run (the
+same check re-fires once per encoder attempt -- AV1, then an x265
+fallback -- which would otherwise double-log every stripped track).
+Verified end-to-end on a real single-file test run: the manifest was
+created with exactly one correctly-deduplicated line, correctly carrying
+the stream's `title` tag through from the source.
+
+Full fleet subtitle-filter test (5 idle machines: PRINCE, GruntVM,
+AI-PROCESSOR, Plex, GruntBox2) completed clean on 33P/33Q: every run
+across both codec attempts (AV1, x265 fallback) correctly stripped the
+synthetic empty subtitle track and kept the real one; the two-stage
+encode/remux pipeline completed without crashes or truncation on every
+machine. ("Job failed" results in that test were expected and correct --
+the synthetic test video is incompressible noise, so both encode attempts
+came out larger than the tiny original and were correctly rejected by
+the existing size-check logic, keeping the original.)
+
+Also found (not yet fixed, see ROADMAP.md): PRINCE and GruntBox2 are
+both missing the `convert-current.sh` wrapper other fleet machines have;
+the orphan reaper aborts the entire script run on an unrelated
+permission error instead of warning and continuing (cost ~10 wasted
+minutes on GruntVM during this test, no files processed).
+
 ## v5.0.33P — 2026-08-02
 
 Bug found while building a small synthetic test to validate 33O's new
