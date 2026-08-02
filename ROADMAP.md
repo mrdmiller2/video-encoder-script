@@ -156,14 +156,25 @@ window). Windows has no built-in equivalent. Candidates to evaluate:
    sources) through the PowerShell fork and confirm identical
    strip/keep/manifest outcomes, not just "it runs without erroring."
 
-**Not yet decided**: repo structure (separate repo vs. a `windows/`
-subdirectory in this same repo — the latter keeps the "PowerShell
-derives from primary" relationship more visible, but the former keeps
-release/tag history cleaner per-platform); minimum supported Windows
-version/PowerShell version; whether GruntBox2 specifically becomes the
-first machine migrated off WSL2 once this exists (its dual 2009 Xeons/
-no-AVX2 hardware is already the fleet's slowest member on movie-length
-content regardless of OS layer, so migrating it first would isolate the
+**Repo structure — decided (2026-08-02): same repo, not a separate one.**
+The PowerShell fork lives in a `windows/` subdirectory of this repo, not
+a standalone project. Rationale (explicit user direction): the Linux/
+macOS version drives essentially all feature and roadmap decisions
+going forward — the Windows fork only pulls in features already proven
+on the primary version, plus fixes that are genuinely Windows-specific.
+A separate repo would let the two drift into independent roadmaps by
+default; keeping them in one repo makes "the primary decides, Windows
+follows" the structurally obvious default rather than something that
+has to be manually maintained by convention across two places. Version
+tags continue to track the primary script's version numbers
+(`v5.0.33x`-style); the Windows fork does not get its own independent
+version-number track.
+
+**Not yet decided**: minimum supported Windows version/PowerShell
+version; whether GruntBox2 specifically becomes the first machine
+migrated off WSL2 once this exists (its dual 2009 Xeons/no-AVX2
+hardware is already the fleet's slowest member on movie-length content
+regardless of OS layer, so migrating it first would isolate the
 WSL-removal benefit from any hardware-driven change).
 
 ## Deferred from the v5.0.33O/P/Q truncation-bug + subtitle-filter work (2026-08-02)
