@@ -285,16 +285,43 @@ treating it as an afterthought. Researched findings (2026-08-02):
   stable Adrenalin branch is the documented workaround if that hardware
   is ever in the fleet.
 
-### 8. Suggested phasing (avoid a monolithic 14,000-line rewrite attempt)
+### 8. Two separate workstreams — different risk profiles, don't conflate them
+
+Explicit user direction (2026-08-02): this is genuinely two different
+kinds of work, not one migration applied three times.
+
+- **Workstream A — fresh onboarding of an untouched native-Windows
+  machine (the HPE laptop, once it's actually added to the fleet).**
+  Greenfield: no prior WSL2 setup to preserve, no legacy resume-state/
+  done-markers/logs to migrate, no risk of breaking an already-working
+  machine. This is the natural place to prove the PowerShell fork works
+  at all — standard onboarding (VES directory layout, rsyncd-equivalent
+  deploy mechanism, the usual push/pull tooling) done in native
+  PowerShell form for the first time ever. Lower risk, should come
+  first: it's the cleanest possible test bed and doubles as the fork's
+  initial real-world validation.
+- **Workstream B — converting existing fleet members (PRINCE,
+  GruntBox2) from their current WSL2-hybrid setup to pure native
+  Windows.** Fundamentally a migration, not a fresh install: both
+  machines have real queued/in-progress work, resume-state files,
+  done-markers, and logs under their existing WSL2-side `~/VES/<host>/`
+  layout that a cutover must not silently lose or duplicate-process.
+  Needs a real rollback plan — run the native version side-by-side and
+  prove parity against the same real files before decommissioning each
+  machine's WSL2 layer, not a hard cutover on day one. Should only start
+  once Workstream A has proven the fork works at all; don't risk two
+  already-productive fleet members on an unproven port.
+
+### 9. Suggested phasing (avoid a monolithic 14,000-line rewrite attempt)
 
 1. **Phase 0 — tooling spike**: confirm every binary dependency above
-   actually works standalone on a real Windows box (GruntBox2's Windows
-   host is already fleet hardware and a natural test target once its
-   WSL2 layer is no longer the point) before writing any port logic.
-   Must also produce real data on item 6's open questions (WSL2-vs-native
-   hardware-encoder reliability comparison, fscache-loss performance
-   impact) — Phase 1 shouldn't start until those are answered with
-   measurements, not assumptions.
+   actually works standalone on real Windows hardware (the HPE laptop,
+   once onboarded, is the natural target — greenfield, no existing WSL2
+   setup at risk) before writing any port logic. Must also produce real
+   data on item 6's open questions (WSL2-vs-native hardware-encoder
+   reliability comparison, fscache-loss performance impact, Windows
+   Server 2022 vs. Windows 11 feature parity) — Phase 1 shouldn't start
+   until those are answered with measurements, not assumptions.
 2. **Phase 1 — core encode/VMAF/subtitle-filter logic**: the parts with
    the most real test coverage right now (two-stage encode+remux, VMAF
    CRF search, `subtitle_stream_has_real_content()`/
@@ -309,6 +336,14 @@ treating it as an afterthought. Researched findings (2026-08-02):
    verification (real+empty SRT/ASS/mov_text tracks, legacy-container
    sources) through the PowerShell fork and confirm identical
    strip/keep/manifest outcomes, not just "it runs without erroring."
+6. **Phase 5 — Workstream A**: onboard the HPE laptop fresh, native
+   PowerShell only, no WSL2 at any point. First real-world proof the
+   fork works end-to-end on real hardware.
+7. **Phase 6 — Workstream B**: convert PRINCE, then GruntBox2 (in that
+   order — PRINCE is desktop-OS Windows 11, lower unknown-risk than
+   GruntBox2's Server 2022), each run side-by-side against its existing
+   WSL2 setup until parity is proven before that machine's WSL2 layer is
+   decommissioned.
 
 **Repo structure — decided (2026-08-02): same repo, not a separate one.**
 The PowerShell fork lives in a `windows/` subdirectory of this repo, not
