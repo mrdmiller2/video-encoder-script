@@ -44,7 +44,17 @@ mount support (the NAS serves both protocols).
   full-featured static Windows builds (libsvtav1, libx265, libvmaf,
   libplacebo included) — same source PRINCE already uses today via its
   WSL-side ffmpeg. No compilation needed; just point at the Windows
-  `.exe` instead of the Linux binary.
+  `.exe` instead of the Linux binary. **Version parity is a hard
+  requirement, not a nice-to-have**: the fleet has a standing constant
+  pinning SVT-AV1 to a specific version (v4.1.0, see
+  [[feedback_svtav1_version_constant]]) specifically so encode behavior
+  stays consistent across every machine. Whatever Windows ffmpeg build
+  gets used must have its bundled SVT-AV1/x265 version (and SIMD build
+  flags — AVX2/AVX-512 support) checked against that pin before use, not
+  just whatever BtbN's latest build happens to include — otherwise the
+  Windows fork could silently diverge in encode output from day one,
+  which directly undermines "Windows follows the primary, doesn't make
+  independent decisions."
 - **HandBrakeCLI**: official Windows builds already exist and are
   already in active use today (PRINCE's WSL-hybrid setup calls
   `/mnt/c/Program Files/HandBrake/HandBrakeCLI.exe` directly). Directly
@@ -135,12 +145,68 @@ window). Windows has no built-in equivalent. Candidates to evaluate:
   as-confirmed-empty data-loss bug the 2026-08-02 team review just
   fixed in the primary script.
 
-### 5. Suggested phasing (avoid a monolithic 14,000-line rewrite attempt)
+### 5. Windows Defender exclusions — required, not optional
+
+Real-time scanning adds meaningful I/O overhead on the exact pattern
+this script hammers hardest: repeated large multi-GB reads/writes for
+encode temp files and staged output. **Both** the RAM-disk-equivalent
+staging area (item 2 above) **and** any on-disk staging/fallback
+directory need to be added as Defender exclusion paths
+(`Add-MpPreference -ExclusionPath`) as a required part of setup, not an
+optional tuning step — this should be baked into whatever install/setup
+script accompanies the Windows fork, not left as a manual step a user
+might skip and then silently eat the performance loss without knowing
+why. Applies to the source/library mount paths too if scan-on-read is
+enabled for network shares, not just the local staging dirs.
+
+### 6. Other concerns surfaced in scoping discussion (2026-08-02), needs Phase 0 data
+
+- **Whether WSL2's GPU virtualization is actually the cause of hardware-
+  encoder flakiness already observed on the existing fleet** (PRINCE's
+  "NVENC AV1 tune probe encode failed rc=2", AI-PROCESSOR's rc=3 failure
+  that silently fell back to software) is currently an assumption, not a
+  finding. Native Windows only fixes this if WSL2's virtualization layer
+  is the actual cause — if it's a driver version issue, VRAM contention
+  (AI-PROCESSOR's `stockanalyzer-vllm` service already holds ~13.9GB of
+  its Tesla T4's VRAM), or something else entirely, native Windows
+  changes nothing and the "full hardware access" premise for THAT
+  specific problem doesn't hold. Needs direct comparison testing (same
+  GPU, same driver, WSL2 vs. native) before claiming this as a benefit.
+- **Losing `fscache`/`cachefilesd` is a plausible performance
+  *regression*, not just a missing nice-to-have.** PRINCE and GruntBox2
+  both run custom-built WSL2 kernels specifically for `CONFIG_CACHEFILES`
+  persistent NFS caching. Windows has no built-in equivalent. Unless a
+  replacement caching strategy is found (a third-party caching proxy, or
+  accepting slower cold-cache network reads), network-mount-heavy
+  workloads on native Windows could end up slower than they are today on
+  the same hardware, on the exact machines that invested the most
+  engineering effort into fscache. This needs to be measured, not
+  assumed away, before the port is called a performance win.
+- **AMD hardware encode is a genuine platform break, not a port.**
+  MacFedora's `hevc_vaapi` path is Linux-only (VAAPI doesn't exist on
+  Windows); Windows AMD encode goes through AMF (`hevc_amf`/`av1_amf`)
+  instead, a different ffmpeg backend with different rate-control
+  parameters. All VAAPI-specific tuning needs to be redone fresh for
+  AMF, not translated.
+- **Smaller items worth tracking but not blocking**: NVENC's
+  driver-enforced concurrent-session cap (historically 2-3 on consumer
+  GeForce cards) is silicon/driver-level and follows to native Windows
+  unchanged, not something WSL was ever the cause of; GPU driver TDR (a
+  ~2-second watchdog timeout with no Linux equivalent) is a Windows-only
+  failure mode worth knowing about for hardware troubleshooting
+  specifically, since it manifests as a driver-reset event rather than a
+  clean process error.
+
+### 7. Suggested phasing (avoid a monolithic 14,000-line rewrite attempt)
 
 1. **Phase 0 — tooling spike**: confirm every binary dependency above
    actually works standalone on a real Windows box (GruntBox2's Windows
    host is already fleet hardware and a natural test target once its
    WSL2 layer is no longer the point) before writing any port logic.
+   Must also produce real data on item 6's open questions (WSL2-vs-native
+   hardware-encoder reliability comparison, fscache-loss performance
+   impact) — Phase 1 shouldn't start until those are answered with
+   measurements, not assumptions.
 2. **Phase 1 — core encode/VMAF/subtitle-filter logic**: the parts with
    the most real test coverage right now (two-stage encode+remux, VMAF
    CRF search, `subtitle_stream_has_real_content()`/
