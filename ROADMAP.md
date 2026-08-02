@@ -38,6 +38,35 @@ strategy (native Windows builds vs. compiling from source where needed),
 a genuine RAM-disk-equivalent staging mechanism, and both NFS and SMB
 mount support (the NAS serves both protocols).
 
+**Machine scope — corrected (2026-08-02): this affects exactly three
+machines, not the whole 8-machine fleet.** Crystalight is macOS,
+MacFedora/GruntVM/AI-PROCESSOR/Plex/docm are Linux — none of those are
+touched by this port at all. The actual targets:
+- **PRINCE** — currently Windows 11 (host) + WSL2 Ubuntu (where the
+  script actually runs today). Native port removes the WSL2 layer
+  entirely on this machine.
+- **GruntBox2** — currently **Windows Server 2022** (host) + WSL2
+  Ubuntu, NAT-mode networking. **Server SKU, not desktop** — some
+  Windows features this port might lean on (e.g. certain "Services for
+  NFS" client components, or desktop-oriented GPU driver packaging) may
+  behave differently or be unavailable on Server 2022 vs. Windows 11.
+  This needs to be verified per-feature during Phase 0, not assumed to
+  match PRINCE/the HPE laptop's desktop-OS behavior. Likely candidate
+  for the "first machine migrated off WSL2" question below, given it's
+  also the fleet's slowest member and has the most WSL2-specific pain
+  already (NAT/portproxy, auto-suspend, the one unattended-restart mount
+  recovery gap).
+- **A new, not-yet-onboarded machine — an "HPE" gaming laptop, Windows
+  11, believed to have an AMD GPU (exact model/generation not yet
+  confirmed).** Not currently in [[reference_video_encoder_fleet_inventory]]
+  at all; needs proper onboarding (specs, connection method) whenever
+  it's actually added as a fleet member. Its GPU generation matters a
+  lot for the AMF research above — if it turns out to be RDNA3 or newer,
+  it would be the fleet's first real AV1-hardware-encode-capable AMD
+  card (MacFedora's RDNA1 RX5500 has none at all, see section 7) and a
+  much better test target for AMF parity-tuning than MacFedora is.
+  Confirm the exact GPU model before relying on this.
+
 ### 1. External tool binaries — mostly solved, needs confirmation
 
 - **ffmpeg/ffprobe**: BtbN's ffmpeg-builds project already ships
@@ -184,6 +213,16 @@ enabled for network shares, not just the local staging dirs.
   assumed away, before the port is called a performance win.
 - **AMD hardware encode is a genuine platform break, not a port** — see
   the dedicated AMF section below for the full researched picture.
+- **Windows Server 2022 (GruntBox2) vs. Windows 11 (PRINCE, the HPE
+  laptop) feature parity is unverified.** GruntBox2 is the only Server-
+  SKU target; Server editions sometimes package or expose Windows
+  features differently than desktop editions (GPU driver packaging,
+  optional-feature availability for things like "Services for NFS").
+  Don't assume anything verified on PRINCE/the HPE laptop's Windows 11
+  automatically holds on GruntBox2's Server 2022 — check each
+  Windows-specific mechanism (RAM-disk tool, NFS client, Defender
+  exclusion cmdlets, scheduled-task/service model) on both editions
+  during Phase 0.
 - **Smaller items worth tracking but not blocking**: NVENC's
   driver-enforced concurrent-session cap (historically 2-3 on consumer
   GeForce cards) is silicon/driver-level and follows to native Windows
