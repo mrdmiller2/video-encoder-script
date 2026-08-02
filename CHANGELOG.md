@@ -898,7 +898,7 @@ life of one reaper run.
 
 Team-reviewed in two full passes (a general-purpose agent and two other
 reviewers for the initial ~20-fix batch; one of those reviewers again for
-the follow-up fixes that batch's own review surfaced) — both passes found real, fixable issues
+the follow-up fixes the follow-up fixes that batch's own review surfaced) — both passes found real, fixable issues
 in the fixes themselves, not just rubber-stamped the diff.
 
 `convert-v5.0.33B.sh` checksum: `e11f541afad898d71f982b621ec3a0c3ad5bc1f835e1fd0f5a81e04f8bf72955`.
