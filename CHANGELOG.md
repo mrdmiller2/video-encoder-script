@@ -4,6 +4,78 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.33O — 2026-08-02
+
+Four changes bundled into this version, in order of dependency:
+
+1. **`remux_copy_to_mkv()` mov_text fix**: this shared remux-shortcut
+   function (must-eliminate-format floor, HEVC-in-MKV shortcut, legacy-
+   container "x265 remux to MKV" path) used a blanket `-map 0 -c copy`,
+   which fails outright when the source is MP4 carrying `mov_text`
+   subtitles -- Matroska cannot hold that codec, so the WHOLE remux
+   failed with "Could not write header", not just the subtitle track.
+   Found on "Under the Microscope (2023) S01E11.mp4". Fixed by splitting
+   to `-c:v copy -c:a copy -c:s "$sub_codec"` with the same mp4/m4v/mov
+   -> srt exception the full encode path already applies. Verified
+   directly against the real failing file (rc=0 after fix, rc=234
+   before).
+
+2. **Two-stage encode + remux** (`ffmpeg_encode()`): the recurring "zero
+   frames decoded" truncation bug (KanColle, Last Bullet, Dont Make Me
+   Go) was root-caused via packet-level evidence captured by 33N's
+   diagnostic function to be genuine mid-encode video-stream starvation
+   at a non-fixed point, NOT a near-the-end issue as the validation
+   failure name implied. One reviewer's minimal mitigation
+   (`-max_interleave_delta 1000000 -flush_packets 1` alone) was
+   implemented and live-tested against the real KanColle file -- it
+   FAILED, truncating identically at frame=324. Replaced with a two-stage
+   restructure: stage 1 encodes video+audio only (no subtitle/attachment
+   mapping, so the sparse-stream interleaving that likely triggers the
+   starvation never happens during the expensive encode); stage 2 does a
+   cheap stream-copy remux adding the source's subtitles/attachments back
+   in. The old "retry without subtitles" logic is now a stage-2-only
+   fallback. Implemented. **Live-tested against the real
+   KanColle file end-to-end (2026-08-02) and confirmed fixed**: output
+   duration (5585.596s) matches the source (5585.590s) exactly, a full
+   `-count_frames` decode reached the genuine end of the file (133920
+   frames, time=01:33:05.58) instead of stopping at frame=324, VMAF 95.3,
+   kept AV1 at 12.1% of original size, encode ran at 1.16x realtime.
+
+3. **Subtitle content filtering** (new `subtitle_stream_has_real_content()`
+   / `build_real_subtitle_map_args()`): a source can flag a subtitle
+   stream (present in the container, selectable in a player) while
+   carrying zero actual renderable content -- no packets, or packets
+   whose text is empty once cue-timing markup is stripped. Every place
+   that produces final output was mapping subtitles blanket (`"?:s?"` /
+   `-map 0`), carrying these meaningless tracks straight through. Added
+   a per-stream check (packet count, then for text codecs an actual
+   decode-and-strip-markup check, then for bitmap/other codecs a
+   packet-count + decode-error-grep proxy) and wired an explicit,
+   filtered `-map` list into every final-output-producing path: the
+   two-stage remux (stage 2), both AMD VAAPI hardware-encode paths
+   (`ffmpeg_encode_hw`, the `hevc_vaapi` remux path), and
+   `remux_copy_to_mkv()`. Transient VMAF-sample-clip test encodes were
+   deliberately left on blanket subtitle mapping since they're discarded
+   test artifacts, not player-facing output.
+
+4. **Upscale sample-test clip extraction fix**: `upscale_sample_decision()`'s
+   clip-extraction step (`-ss <point> -t 10 -i "$src" -map 0:v:0 -c copy`)
+   failed with "Can't write packet with unknown timestamp" on legacy AVI
+   sources with irregular timestamps at the seek point, silently falling
+   back to the conservative default instead of a real tested upscale
+   decision -- likely why "Divorce American Style (1967)" upscaled only
+   to 720p instead of the expected 1080p. Fixed by adding
+   `-fflags +genpts -avoid_negative_ts make_zero` to the extraction
+   command. Verified directly against the real file (rc=234 before,
+   rc=0 after).
+
+**Status**: all four items implemented and live-verified against real
+files (KanColle for item 2, "Under the Microscope" for item 1, "Divorce
+American Style" for item 4). Item 3 (subtitle content filtering) verified
+via the KanColle live test -- its one real subtitle track and 4
+attachments survived the filter untouched, confirming the filter doesn't
+false-positive on genuine content.
+
 ## v5.0.33N — 2026-08-01
 
 The recurring "zero frames decoded near end" validation failure (KanColle,
