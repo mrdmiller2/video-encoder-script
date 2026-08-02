@@ -4,6 +4,65 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.33R — 2026-08-02
+
+Fixes from a full independent E2E confidence/code review of the
+33O-33Q subtitle-filter and two-stage-encode bundle (both reviewed the
+diff independently and converged on the same core bug class):
+
+1. **Ambiguous ffprobe/ffmpeg probe failures were silently treated as
+   "confirmed empty subtitle", a real data-loss risk.**
+   `subtitle_stream_has_real_content()`'s packet-presence check, its
+   text-decode check, and `build_real_subtitle_map_args()`'s stream-
+   enumeration check all previously collapsed "the probe failed/timed
+   out" into the same result as "genuinely no content" -- on a flaky NAS
+   read or a transient timeout, a perfectly real subtitle track could get
+   silently stripped. Now tri-state: confirmed-empty (strip),
+   confirmed-real (keep), or ambiguous/probe-error (keep, with a warning)
+   -- never treat a subprocess failure as proof of absence, same
+   principle as [[feedback_verify_before_delete]]. The packet-presence
+   check also switched from `| grep -c .` (scans every packet in the
+   whole file) to `| head -1` (stops at the first packet, same idiom
+   `validate_mkv_subtitle_tracks` already used) -- on a dense
+   multi-subtitle-track file over NAS this avoids dozens of near-full-file
+   ffprobe passes per title.
+2. **Aggressive bitmap-subtitle stripping removed.** The non-text-codec
+   branch (dvd_subtitle, hdmv_pgs_subtitle) used to strip a track if
+   ffmpeg's stderr contained the words "error" or "invalid" anywhere --
+   PGS/DVD tracks pulled from physical media routinely produce benign,
+   non-fatal decode warnings containing those exact words, which was
+   silently discarding perfectly viewable subtitle tracks. Packet
+   presence (already confirmed) is now the only signal for these codecs.
+3. **Both AMD VAAPI hardware-encode paths** (`ffmpeg_encode_hw()`,
+   `vaapi_hevc_encode()`) **hardcoded `-c:s copy` for subtitles**, missing
+   the mp4/m4v/mov -> srt exception every other final-output path already
+   has -- any MP4 source with subtitles taking a hardware-encode path
+   would fail outright ("Could not write header"). Fixed to match.
+4. **`av1_source_reencode_sample_decision()`'s clip-extraction step** had
+   the same mp4 mov_text gap -- a blanket `-c copy` into a Matroska clip
+   would fail the whole sample-clip extraction on an MP4 source with
+   subtitles, silently falling back to a less-accurate size prediction
+   instead of a real tested sample. Same mp4/m4v/mov -> srt fix applied.
+5. **`remux_copy_to_mkv()`'s `-map 0:v` (no `?`) would fail outright on
+   an audio-only source** (no video stream at all) instead of losslessly
+   remuxing the audio -- changed to `-map "0:v?"`. Also made
+   `-map_chapters 0 -map_metadata 0` explicit rather than relying on
+   ffmpeg's default behavior, now that every other map in that command is
+   explicit too.
+
+All fixes re-verified: the tri-state logic was directly unit-tested
+against a real ffprobe failure (nonexistent file -> correctly kept
+rather than stripped) plus the existing real/empty ASS and mov_text test
+files (unchanged correct results), and a full end-to-end single-file run
+through the real script confirmed the same correct strip/keep/manifest
+behavior as before the fix.
+
+Deferred to ROADMAP.md as lower-priority hardening (not correctness
+bugs): per-run caching of subtitle-content-check results to reduce
+redundant ffprobe/ffmpeg calls across the AV1-then-x265 fallback
+sequence, and strengthening `record_stripped_subtitle()`'s dedup key
+beyond source-path + stream-index.
+
 ## v5.0.33Q — 2026-08-02
 
 Added a durable per-folder manifest, `stripped_subtitles.txt` (same

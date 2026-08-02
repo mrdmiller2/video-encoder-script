@@ -55,6 +55,25 @@ it or discover data loss after the fact.
    No scope/priority decision made yet on whether/when to run a dedicated
    scan-and-remux pass across existing library outputs.
 
+## Deferred from the v5.0.33R team review (2026-08-02)
+
+1. **Cache subtitle-content-check results per run.** `build_real_subtitle_
+   map_args()` re-runs the full per-stream ffprobe/ffmpeg checks on every
+   call, and it's called once per final-output-producing attempt (the
+   two-stage remux, plus a repeat on the x265 fallback if AV1 fails) --
+   on a source with many subtitle tracks (up to 38 seen on real library
+   files) this means dozens of ffprobe/ffmpeg passes run twice per title.
+   Not a correctness bug (results are stable across attempts on the same
+   unmodified source), just wasted work -- a per-run cache keyed on
+   source path + stream index would remove the duplication.
+2. **`record_stripped_subtitle()`'s dedup key is weak.** Keyed only on
+   source path + subtitle stream index; safe for the normal repeated-
+   encoder-attempt case this was built for, but not robust if the same
+   pathname is reused with a different file underneath during a long run
+   (unlikely but not impossible). Worst case is a stale-suppressed
+   manifest line, not output corruption. A stronger key (source
+   size/mtime, or an ffprobe stream signature) would close this.
+
 ## Deferred from the v5.0.33G E2E team review (2026-07-30)
 
 Full team E2E review of the v5.0.33G release (7-way parallel section review
