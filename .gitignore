@@ -9,3 +9,8 @@
 orchestration/
 __pycache__/
 
+# Session handoff docs are local-only working notes for picking up a
+# session cold — never committed to GitHub. Content that's actually worth
+# keeping long-term belongs in CHANGELOG.md/ROADMAP.md instead.
+SESSION-HANDOFF*.md
+
