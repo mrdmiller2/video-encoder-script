@@ -350,6 +350,49 @@ project's "verify before trusting a review finding" convention.
 testing stays out of scope for this pass (no fixture available on ELVIS);
 tracked as an explicit follow-up, not silently dropped.
 
+## Item 5 (HandBrake/hardware) built and verified (2026-08-03)
+
+`VesHwDetect.psm1` (ffmpeg-based real-encode probes + fixed
+NVIDIA > Intel QSV > AMD VCE > software priority resolution) and
+`VesHandBrake.psm1` (HandBrakeCLI discovery, arg building, JSON-progress
+invocation, HandBrake-based probe for the disc/explicit-engine path)
+built and tested with 15 real tests on ELVIS, including actual hardware:
+
+- **Real HEVC NVENC probe: True. Real AV1 NVENC probe: False.** This
+  exactly reproduces the Phase 0 finding
+  ([[project_elvis_phase0_findings_2026_08_02]]) that ELVIS's GTX 1650
+  (Turing) has HEVC NVENC but no AV1 hardware encode -- the first time
+  this port's own hardware-detection code (not the earlier ad hoc
+  HandBrakeCLI probe from Phase 0) has confirmed that finding.
+- AMD AMF HEVC probe: **True** (ELVIS's AMD iGPU) -- first real
+  confirmation this port can detect AMD hardware encode too, not just
+  NVIDIA.
+- Priority resolution verified for all-available, NVIDIA-unavailable
+  fallthrough, nothing-available software fallback, and explicit
+  `-PreferIntelQsv` override.
+- A real short end-to-end HandBrake encode (software x264) succeeded,
+  proving the invocation plumbing genuinely works, not just the
+  argument-building logic in isolation.
+- Real bug found and fixed: HandBrakeCLI only emits parseable
+  `Progress: {...}` JSON lines with an explicit `--json` flag --
+  confirmed via `--help` and by a real test that succeeded but produced
+  zero progress lines until the flag was added to
+  `Build-VesHandBrakeArgs`'s base argument set.
+- `Test-VesHandBrakeEncoderAvailable` (the disc/explicit-engine
+  HandBrake-based probe, distinct from `VesHwDetect.psm1`'s ffmpeg-based
+  probes, per the team review's "probe the tool that will actually run"
+  finding) also correctly confirmed HEVC NVENC via a real HandBrake
+  invocation, not just via ffmpeg.
+- Also found and fixed during testing (not a review finding): the
+  probe function's first draft called `Invoke-VesTrackedProcess`, which
+  is deliberately UNBOUNDED (real-encode use only, no timeout parameter
+  at all, per its own module header) and requires a mandatory
+  `-ErrorLogPath` -- wrong tool for a bounded probe. Fixed by using
+  `Invoke-VesWithTimeoutRetry` for the probe path and reserving
+  `Invoke-VesTrackedProcess` for the real encode path
+  (`Invoke-VesHandBrakeWithProgress`), matching this port's existing
+  bounded-probe-vs-unbounded-real-encode convention used everywhere else.
+
 ## Real bug found building item 3 (resume-state, 2026-08-03), fixed and verified
 
 `VesResumeState.psm1` built and tested with 10 real tests on ELVIS,
