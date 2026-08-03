@@ -90,9 +90,16 @@ function Test-VesSvtAv1SupportsSharpness {
     Port of svtav1_supports_sharpness(). Cached per-process runtime probe
     (one real ffmpeg invocation), not assumed from a version string.
     #>
-    param([Parameter(Mandatory)][string]$FfmpegPath)
+    param(
+        [Parameter(Mandatory)][string]$FfmpegPath,
+        [int]$TimeoutSeconds = 30
+    )
     if ($null -ne $script:SvtAv1SupportsSharpness) { return $script:SvtAv1SupportsSharpness }
 
+    # Timeout-bounded (2026-08-02) -- a sibling probe with no timeout
+    # left its caller blocked indefinitely (climbing memory) when the
+    # child process stalled; every probe call in this port needs the
+    # same bound, not just the ones that hit it first in testing.
     $args = @('-hide_banner', '-f', 'lavfi', '-i', 'color=c=black:s=64x64:d=1',
         '-c:v', 'libsvtav1', '-svtav1-params', 'sharpness=0', '-f', 'null', '-')
     $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -105,7 +112,12 @@ function Test-VesSvtAv1SupportsSharpness {
     $proc.StartInfo = $psi
     $proc.Start() | Out-Null
     $stderrTask = $proc.StandardError.ReadToEndAsync()
-    $proc.WaitForExit()
+    if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
+        try { $proc.Kill($true) } catch { }
+        $proc.WaitForExit()
+        $script:SvtAv1SupportsSharpness = $true
+        return $script:SvtAv1SupportsSharpness
+    }
     $stderrTask.Wait()
     $out = $stderrTask.Result
 

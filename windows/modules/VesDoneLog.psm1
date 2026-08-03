@@ -48,8 +48,19 @@ $script:DoneSetLoaded = $false
 $script:SvtAv1MajorMinor = $null
 $script:X265MajorMinor = $null
 
+# Timeout-bounded, matching every other subprocess call in this port
+# (VesTimeoutRetry.psm1's Invoke-VesWithTimeoutRetry) -- found via
+# direct testing (2026-08-02) that these two probes had no timeout at
+# all, unlike everywhere else, and a stalled ffmpeg child process left
+# WaitForExit() (and the caller) blocked indefinitely while the parent
+# pwsh process's memory climbed into the gigabytes over several
+# minutes. A short bounded wait plus a hard Kill() on timeout is
+# required here just like every validation-probe call elsewhere.
 function Get-VesCurrentSvtAv1MajorMinor {
-    param([Parameter(Mandatory)][string]$FfmpegPath)
+    param(
+        [Parameter(Mandatory)][string]$FfmpegPath,
+        [int]$TimeoutSeconds = 30
+    )
     if ($null -ne $script:SvtAv1MajorMinor) { return $script:SvtAv1MajorMinor }
     $args = @('-hide_banner', '-f', 'lavfi', '-i', 'color=c=black:s=64x64:d=1', '-c:v', 'libsvtav1', '-f', 'null', '-')
     $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -60,7 +71,12 @@ function Get-VesCurrentSvtAv1MajorMinor {
     $proc.StartInfo = $psi
     $proc.Start() | Out-Null
     $stderrTask = $proc.StandardError.ReadToEndAsync()
-    $proc.WaitForExit()
+    if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
+        try { $proc.Kill($true) } catch { }
+        $proc.WaitForExit()
+        $script:SvtAv1MajorMinor = 'unknown'
+        return $script:SvtAv1MajorMinor
+    }
     $stderrTask.Wait()
     $out = $stderrTask.Result
     $m = [regex]::Match($out, 'SVT \[version\][^\n]*v(\d+\.\d+)', 'IgnoreCase')
@@ -69,7 +85,10 @@ function Get-VesCurrentSvtAv1MajorMinor {
 }
 
 function Get-VesCurrentX265MajorMinor {
-    param([Parameter(Mandatory)][string]$FfmpegPath)
+    param(
+        [Parameter(Mandatory)][string]$FfmpegPath,
+        [int]$TimeoutSeconds = 30
+    )
     if ($null -ne $script:X265MajorMinor) { return $script:X265MajorMinor }
     $args = @('-hide_banner', '-f', 'lavfi', '-i', 'color=c=black:s=64x64:d=1', '-c:v', 'libx265', '-f', 'null', '-')
     $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -80,7 +99,12 @@ function Get-VesCurrentX265MajorMinor {
     $proc.StartInfo = $psi
     $proc.Start() | Out-Null
     $stderrTask = $proc.StandardError.ReadToEndAsync()
-    $proc.WaitForExit()
+    if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
+        try { $proc.Kill($true) } catch { }
+        $proc.WaitForExit()
+        $script:X265MajorMinor = 'unknown'
+        return $script:X265MajorMinor
+    }
     $stderrTask.Wait()
     $out = $stderrTask.Result
     $m = [regex]::Match($out, 'HEVC encoder version (\d+\.\d+)')
@@ -160,10 +184,18 @@ function Import-VesDoneLog {
     $script:DoneSetLoaded = $true
     if (-not (Test-Path $DoneLogDir)) { return }
 
+    # [System.IO.Directory]::GetFiles() + [System.IO.File]::ReadAllText(),
+    # not Get-ChildItem/Get-Content -- found via direct timing (2026-08-02)
+    # that the cmdlet pair took 23+ seconds to enumerate and read just 2
+    # small files on this NAS (not hung, genuinely that slow per-call),
+    # consistent with the FileSystem-provider-cmdlet overhead already
+    # found elsewhere this session. The raw .NET APIs are fast here.
     $n = 0
     $entryMTimes = @{}
-    foreach ($file in (Get-ChildItem -Path $DoneLogDir -File -Force -ErrorAction SilentlyContinue)) {
-        $line = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction SilentlyContinue
+    foreach ($filePath in [System.IO.Directory]::GetFiles($DoneLogDir)) {
+        $line = $null
+        try { $line = [System.IO.File]::ReadAllText($filePath) } catch { }
+        $file = [PSCustomObject]@{ LastWriteTimeUtc = [System.IO.File]::GetLastWriteTimeUtc($filePath) }
         if (-not $line) { continue }
         $fields = $line.TrimEnd("`r", "`n") -split "`t"
         if ($fields.Count -lt 4) { continue }
@@ -194,6 +226,18 @@ function Add-VesDoneLogEntry {
     layout: creates one new, uniquely-named file (atomic exclusive
     create, never a reopen/append) rather than appending to a shared
     file. No mutex needed -- each writer's filename can't collide.
+
+    .PARAMETER DoneLogDir
+    Must already exist -- this function deliberately does NOT create
+    it (no New-Item/mkdir-equivalent call anywhere in this module).
+    Matches the bash version's own resolve_job_sidecar_paths(): the
+    done-log lives directly at the job root (the library scan path
+    itself), which by construction always already exists before any
+    conversion work starts. Auto-creating a fresh directory here would
+    walk straight into the Phase 2/3 broken-new-folder-ACL bug --
+    confirmed unfixable even via icacls immediately after creation
+    (Access Denied despite the ACL listing showing Full Control), so
+    this is a real constraint, not a missing convenience.
     #>
     param(
         [Parameter(Mandatory)][ValidateSet('done', 'skip')][string]$Status,
@@ -201,12 +245,15 @@ function Add-VesDoneLogEntry {
         [Parameter(Mandatory)][string]$DoneLogDir,
         [Parameter(Mandatory)][string]$FfmpegPath
     )
+    if (-not (Test-Path $DoneLogDir -PathType Container)) {
+        Write-Warning "Done-log: directory does not exist and won't be auto-created (see New-VesLocalStageDir's new-folder-ACL note) -- $DoneLogDir"
+        return
+    }
     $key = Get-VesMkvStructureStatKey -Path $Source
     if (-not $key) { return }
     $fp = Get-VesCurrentToolsFingerprint -FfmpegPath $FfmpegPath
     $size, $mtime = $key -split '\|', 2
 
-    New-Item -ItemType Directory -Path $DoneLogDir -Force -ErrorAction SilentlyContinue | Out-Null
     $token = [System.IO.Path]::GetRandomFileName() -replace '[.]', ''
     $entryPath = Join-Path $DoneLogDir "$env:COMPUTERNAME-$PID-$token.tsv"
     $line = "$Status`t$size`t$mtime`t$Source`t$fp`n"

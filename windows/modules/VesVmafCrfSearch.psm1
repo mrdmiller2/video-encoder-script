@@ -26,8 +26,13 @@ $script:VmafCrfCache = @{}
 function Get-VesVideoHeight {
     param(
         [Parameter(Mandatory)][string]$Source,
-        [Parameter(Mandatory)][string]$FfprobePath
+        [Parameter(Mandatory)][string]$FfprobePath,
+        [int]$TimeoutSeconds = 30
     )
+    # Timeout-bounded (2026-08-02) -- found a sibling probe in
+    # VesDoneLog.psm1 with no timeout at all blocked its caller
+    # indefinitely (with climbing memory) when the child process
+    # stalled; every probe call in this port needs the same bound.
     $args = @('-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=height', '-of', 'default=noprint_wrappers=1:nokey=1', $Source)
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $FfprobePath
@@ -36,8 +41,14 @@ function Get-VesVideoHeight {
     $psi.RedirectStandardError = $true
     $psi.UseShellExecute = $false
     $proc = [System.Diagnostics.Process]::Start($psi)
-    $out = $proc.StandardOutput.ReadToEnd()
-    $proc.WaitForExit()
+    $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+    if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
+        try { $proc.Kill($true) } catch { }
+        $proc.WaitForExit()
+        return 0
+    }
+    $stdoutTask.Wait()
+    $out = $stdoutTask.Result
     $h = 0
     [int]::TryParse($out.Trim(), [ref]$h) | Out-Null
     return $h
