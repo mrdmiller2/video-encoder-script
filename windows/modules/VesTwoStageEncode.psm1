@@ -14,14 +14,12 @@
 #     upscale targeting) -- this function takes already-built video args,
 #     matching how the bash version's ffmpeg_encode() itself consumes
 #     build_ffmpeg_video_args()'s output rather than inlining it.
-#   - Ramdisk/staging path redirection (resolve_encode_stage_path/
-#     finalize_staged_encode_output) -- Phase 2 (mount/staging infra).
-#     This port writes directly to $Destination for now.
 #   - CRF resolution (VMAF search) -- ported separately, CRF is a required
 #     parameter here.
 
 Import-Module (Join-Path $PSScriptRoot 'VesTrackedProcess.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'VesSubtitleFilter.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'VesStaging.psm1') -Force
 
 function Get-VesAudioFilterChain {
     <#
@@ -79,7 +77,8 @@ function Invoke-VesTwoStageEncode {
         [double]$AudioDrc = 1.0,
         [double]$AudioGainDb = 0.0,
         [Parameter(Mandatory)][string]$ErrorLogDir,
-        [string]$StrippedSubtitlesLogPath
+        [string]$StrippedSubtitlesLogPath,
+        [string]$RamdiskDir
     )
 
     $titleTag = [System.IO.Path]::GetFileNameWithoutExtension($Source)
@@ -90,7 +89,19 @@ function Invoke-VesTwoStageEncode {
     $remuxErrFile = "$errBase.remux.stderr.log"
     $retryErrFile = "$errBase.remux-nosubs.stderr.log"
 
-    $stage1 = "$Destination.video-audio-only.$pidTag"
+    # Stage to a private, unpredictable path (ramdisk if available and it
+    # fits, else local disk) rather than writing straight to the final,
+    # predictable $Destination -- closes the same symlink/reparse-point
+    # race the bash version's own external review flagged. $writeDst is
+    # what the encoder actually opens; the real $Destination is only
+    # touched at the very end via Complete-VesStagedEncodeOutput.
+    $realDst = $Destination
+    $writeDst = Resolve-VesEncodeStagePath -Source $Source -Destination $realDst -RamdiskDir $RamdiskDir
+    if (-not $writeDst) {
+        return [PSCustomObject]@{ Success = $false; ExitCode = 1; Stage = 'stage-path' }
+    }
+
+    $stage1 = "$writeDst.video-audio-only.$pidTag"
 
     try {
         # --- Stage 1: video + audio only ---
@@ -109,10 +120,12 @@ function Invoke-VesTwoStageEncode {
         $encodeResult = Invoke-VesTrackedProcess -FilePath $FfmpegPath -ArgumentList $stage1Args -ErrorLogPath $encodeErrFile
         if ($encodeResult.ExitCode -ne 0) {
             Write-Warning "ffmpeg stage-1 encode failed (rc=$($encodeResult.ExitCode)) -- stderr: $encodeErrFile"
+            if ($writeDst -ne $realDst) { Remove-VesStagedFileDir -StagedPath $writeDst -RamdiskJobStageDir $RamdiskDir }
             return [PSCustomObject]@{ Success = $false; ExitCode = $encodeResult.ExitCode; Stage = 'encode' }
         }
         if (-not (Test-Path $stage1) -or (Get-Item $stage1).Length -eq 0) {
             Write-Warning "ffmpeg stage-1 encode reported success but output is missing/empty: $stage1"
+            if ($writeDst -ne $realDst) { Remove-VesStagedFileDir -StagedPath $writeDst -RamdiskJobStageDir $RamdiskDir }
             return [PSCustomObject]@{ Success = $false; ExitCode = 1; Stage = 'encode' }
         }
 
@@ -134,7 +147,7 @@ function Invoke-VesTwoStageEncode {
         $remuxArgs += @('-c:a', 'copy')
         $remuxArgs += $subArgs
         $remuxArgs += @('-max_muxing_queue_size', '8192', '-fps_mode', 'passthrough',
-            '-max_interleave_delta', '1000000', '-flush_packets', '1', '-f', 'matroska', $Destination)
+            '-max_interleave_delta', '1000000', '-flush_packets', '1', '-f', 'matroska', $writeDst)
 
         Write-Host "ffmpeg remux stage 2/2 (copying encoded video/audio plus source subtitles/attachments): $([System.IO.Path]::GetFileName($Source))"
         $remuxResult = Invoke-VesTrackedProcess -FilePath $FfmpegPath -ArgumentList $remuxArgs -ErrorLogPath $remuxErrFile
@@ -146,16 +159,24 @@ function Invoke-VesTwoStageEncode {
                 '-map', '0:v:0', '-map', '0:a?', '-map_chapters', '0', '-c:v', 'copy')
             $retryArgs += $ColorArgs
             $retryArgs += @('-c:a', 'copy', '-max_muxing_queue_size', '8192', '-fps_mode', 'passthrough',
-                '-max_interleave_delta', '1000000', '-flush_packets', '1', '-f', 'matroska', $Destination)
+                '-max_interleave_delta', '1000000', '-flush_packets', '1', '-f', 'matroska', $writeDst)
             $remuxResult = Invoke-VesTrackedProcess -FilePath $FfmpegPath -ArgumentList $retryArgs -ErrorLogPath $retryErrFile
             if ($remuxResult.ExitCode -ne 0) {
                 Write-Warning "ffmpeg subtitle-stripped remux retry also failed (rc=$($remuxResult.ExitCode)) -- stderr: $retryErrFile"
+                if ($writeDst -ne $realDst) {
+                    Remove-Item $writeDst -Force -ErrorAction SilentlyContinue
+                    Remove-VesStagedFileDir -StagedPath $writeDst -RamdiskJobStageDir $RamdiskDir
+                }
                 return [PSCustomObject]@{ Success = $false; ExitCode = $remuxResult.ExitCode; Stage = 'remux' }
             }
         }
 
-        if (-not (Test-Path $Destination) -or (Get-Item $Destination).Length -eq 0) {
-            Write-Warning "ffmpeg reported success but output is missing/empty: $Destination"
+        if (-not (Test-Path $writeDst) -or (Get-Item $writeDst).Length -eq 0) {
+            Write-Warning "ffmpeg reported success but output is missing/empty: $writeDst"
+            if ($writeDst -ne $realDst) {
+                Remove-Item $writeDst -Force -ErrorAction SilentlyContinue
+                Remove-VesStagedFileDir -StagedPath $writeDst -RamdiskJobStageDir $RamdiskDir
+            }
             return [PSCustomObject]@{ Success = $false; ExitCode = 1; Stage = 'remux' }
         }
 
@@ -164,6 +185,16 @@ function Invoke-VesTwoStageEncode {
         foreach ($f in @($encodeErrFile, $remuxErrFile, $retryErrFile)) {
             if ((Test-Path $f) -and (Get-Item $f).Length -eq 0) {
                 Remove-Item $f -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        if ($writeDst -ne $realDst) {
+            if (Complete-VesStagedEncodeOutput -StagedPath $writeDst -FinalDestination $realDst) {
+                Write-Host "Staging: moved finished output to $realDst"
+                Remove-VesStagedFileDir -StagedPath $writeDst -RamdiskJobStageDir $RamdiskDir
+            } else {
+                Write-Warning "Staging: failed to move staged output to $realDst"
+                return [PSCustomObject]@{ Success = $false; ExitCode = 1; Stage = 'finalize' }
             }
         }
 
