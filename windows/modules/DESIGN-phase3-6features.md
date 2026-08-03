@@ -411,6 +411,27 @@ including RAM disk staging, VMAF CRF search, two-stage encode, and
 title-lock claim/release -- the first genuine proof this port's Phase
 1-3 modules work correctly composed together, not just individually.
 
+**Update 2026-08-03, same day: mkvalidator crash root-caused and fixed at
+the source, not just worked around.** ELVIS's `mkvalidator.exe` had NO
+embedded Windows version resource at all (blank FileVersion/ProductName/
+CompanyName) -- the signature of an ad-hoc custom compile, not an
+official release build; several `build-mkvalidator*.sh`/`fix-cmakelists.ps1`/
+`patch-and-build.ps1` scripts found during the deployment-hygiene cleanup
+confirm it was produced by an earlier from-source build attempt. Swapped
+in the official Matroska-project prebuilt `mkvalidator-0.6.0-win64.zip`
+binary (SourceForge blocks scripted downloads with a Cloudflare
+challenge -- the user downloaded it manually) -- same version number,
+genuine PE32+ x86-64 build, 244224 bytes vs. the old custom build's
+521078. Old binary kept as `mkvalidator.exe.old-custom-build` rather than
+deleted. Re-ran BOTH the single-file and 3-file queue tests from scratch
+against the same real episodes: **all 4 files validated cleanly with the
+official binary, zero crashes** -- confirms the crash was specific to
+ELVIS's custom build, not an upstream mkvalidator bug, and the earlier
+ambiguous-on-crash fix in `Test-VesMkvStructureValid` (still correct and
+kept, since a bad build could recur on some future machine) was masking
+a real, now-resolved tool-provisioning gap rather than papering over an
+inherent tool limitation.
+
 ## Item 5 (HandBrake/hardware) built and verified (2026-08-03)
 
 `VesHwDetect.psm1` (ffmpeg-based real-encode probes + fixed

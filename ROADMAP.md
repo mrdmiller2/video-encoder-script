@@ -508,13 +508,15 @@ kinds of work, not one migration applied three times.
    (expected, not a bug), and `mkvalidator.exe` on Windows can crash
    (0xC0000005 ACCESS_VIOLATION) on genuinely valid files -- fixed by
    treating negative exit codes as ambiguous, never as proof of
-   corruption. **New known gap, worth tracking**: this Windows
-   mkvalidator build may have real quality issues beyond version number
-   parity (v0.6.0 matches the fleet pin, but crashed on a real file the
-   Linux/macOS builds would very likely have validated cleanly) --
-   structure validation now silently degrades to duration+decode-only
-   confidence whenever it crashes, which is safe but worth a second look
-   at a better Windows mkvalidator build if this recurs often. Full
+   corruption. **Resolved same day**: the crashing binary was a custom
+   from-source build (no embedded Windows version resource -- a real
+   tell), not an upstream mkvalidator bug. Swapped in the official
+   Matroska-project prebuilt `mkvalidator-0.6.0-win64.zip` (manual
+   download -- SourceForge blocks scripted downloads); re-ran both tests
+   from scratch against the same real files, all 4 validated cleanly
+   with zero crashes. The ambiguous-on-crash fix in
+   `Test-VesMkvStructureValid` is kept regardless (a bad build could
+   recur on a future machine), but this specific gap is closed. Full
    detail in `windows/modules/DESIGN-phase3-6features.md`'s "Phase 4/5"
    section.
    - The mutex uses atomic exclusive file creation
