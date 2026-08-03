@@ -103,21 +103,65 @@ touched by this port at all. The actual targets:
 - **ab-av1**: Rust binary, has official Windows release builds on its
   GitHub releases page — should be a straight download, no compile step.
 
-### 2. RAM-disk-equivalent staging — needs a real decision, no Windows-native tmpfs
+### 2. RAM-disk-equivalent staging — local-disk fallback shipped and verified; RAM disk itself blocked on interactive access
 
 Linux/WSL2 fleet members stage encode output on `/dev/shm` or `/tmp`
 (tmpfs, RAM-backed, no disk I/O during the two-stage encode's temp-file
-window). Windows has no built-in equivalent. Candidates to evaluate:
-- **ImDisk Toolkit** (free, open-source, scriptable via `imdisk.exe`) —
-  creates a RAM-backed virtual disk with a drive letter; most likely
-  candidate given it's free and scriptable from PowerShell.
-- **OSFMount** (free for personal/eval use) — similar capability,
-  different licensing terms worth checking for this use case.
-- Fallback: stage on real (fast, local SSD) disk instead of RAM if no
-  RAM-disk solution proves reliable — slower but not a correctness
-  blocker; the two-stage encode's temp-file disk-space-pressure gap
-  (see the v5.0.33R team-review deferred items above) applies here too
-  and would need the same "estimate for two staged outputs" fix.
+window). Windows has no built-in equivalent.
+
+- **ImDisk Toolkit attempted on ELVIS (2026-08-02), genuinely blocked —
+  needs the user's interactive session.** Downloaded from the author's
+  official CDN (SourceForge itself blocks automated downloads with a
+  Cloudflare challenge, same as the earlier mkvalidator issue; ELVIS's
+  Windows Schannel TLS stack also separately fails to negotiate with
+  static.ltr-data.se directly over both IPv4 and IPv6 for unrelated
+  reasons — downloaded on docm, `scp`'d across). The installer itself
+  then hangs indefinitely over a non-interactive SSH session (Session
+  0) — tried NSIS-style (`/S`) and Inno-style
+  (`/VERYSILENT /SUPPRESSMSGBOXES /NORESTART`) silent flags, plus one
+  attempt with `/LOG=` added that never even created a log file
+  (strong signal it's stuck on invisible UI before logging starts, not
+  a flag problem). Kernel driver installation via SetupAPI often
+  requires real interactive consent that can't be scripted around.
+  **Needs the user to RDP or sit at ELVIS directly and click through it
+  once** — tracked, not silently skipped.
+- **Local-disk staging fallback: implemented, and real bugs found+fixed
+  by testing against the actual production NAS** (not just local
+  disk), all now shipped in `windows/modules/VesStaging.psm1`:
+  - Freshly-created directories on the real NAS get a broken ACL
+    (`Everyone: RX` instead of inheriting the parent's `Modify`) that
+    even the creating session can't write into afterward — a Samba
+    ACL-inheritance misconfiguration server-side, confirmed via
+    `icacls`, not fixable from the Windows client. This makes "stage a
+    new folder next to the destination" (the bash version's own
+    strategy) unsafe as a Windows default whenever the destination is
+    a network path. Fixed by staging on a known-good local disk
+    location instead, and by redesigning the finalize step to use a
+    private temp *filename* inside the final destination's
+    *already-existing* directory rather than a new temp subdirectory —
+    same TOCTOU protection, no new-folder dependency.
+  - `Copy-Item` can silently produce no destination file at all on this
+    NAS without throwing, even with `-ErrorAction Stop`. Use
+    `[System.IO.File]::Copy()` instead.
+  - `Remove-Item` is unreliable for both files and directories on this
+    NAS — fails "Access is denied" on paths `icacls` confirms grant
+    delete rights, while `cmd /c del`/`[System.IO.File]::Delete()`/
+    `[System.IO.Directory]::Delete()` succeed on the identical path
+    immediately after. Use the raw .NET deletion APIs, never
+    `Remove-Item`, for anything that might live on a network share.
+  - This NAS's Samba config hides dot-prefixed names over SMB (a
+    common `hide dot files = yes` default) — `Get-ChildItem` needs
+    `-Force` to see them; the bash version's dot-prefixed temp-naming
+    convention (`.convert-stage-XXXXXX`) is a Unix idiom that actively
+    backfires here. Dropped the leading dot from the Windows port's
+    temp-naming scheme entirely rather than fight it.
+  All four were caught specifically by testing against the real
+  production NAS share instead of trusting local-disk-only tests —
+  worth remembering for any future Windows-fork module that touches
+  network paths: local-disk tests passing is not sufficient evidence.
+- **OSFMount** (free for personal/eval use) remains an alternative RAM-
+  disk candidate if ImDisk's interactive-install requirement proves too
+  disruptive, not yet evaluated.
 
 ### 3. NFS vs. SMB mounts — decided empirically on ELVIS: SMB is primary
 
