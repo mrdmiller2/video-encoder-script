@@ -350,6 +350,24 @@ project's "verify before trusting a review finding" convention.
 testing stays out of scope for this pass (no fixture available on ELVIS);
 tracked as an explicit follow-up, not silently dropped.
 
+## Real bug found building item 3 (resume-state, 2026-08-03), fixed and verified
+
+`VesResumeState.psm1` built and tested with 10 real tests on ELVIS,
+including a real round-trip against the production NAS
+(`\\10.10.10.150\Media\holding\...`). One real bug: `[System.IO.File]::Replace($tmp, $Path, $null)`
+threw `"The path is empty"` for the required (but supposed to be
+nullable) backup-filename argument -- PowerShell's method-overload
+binding doesn't pass a bare `$null` through to that parameter the way
+plain C# would. Fixed by switching to the simpler 3-arg
+`[System.IO.File]::Move($tmp, $Path, $true)` overload (.NET Core
+3.0+/PS7+, fine since this fork targets PS7+), which handles both
+create and atomic-overwrite without a backup-filename parameter at
+all. Also verified: refuses to write through a reparse point (same
+guard as the orphan reaper), the sidecar-path fallback chain correctly
+falls through to `%LOCALAPPDATA%` when the job root can't be used as a
+directory, and `Get-VesResumeState` returns `$null` (not a thrown
+error) for a missing/corrupt sidecar file.
+
 ## Real bug found building item 6 (2026-08-03), fixed and verified
 
 `VesTitleLock.psm1`'s first working draft had a genuine race, caught by an
