@@ -495,6 +495,28 @@ kinds of work, not one migration applied three times.
    predated this pass (both **ported and verified against the real NAS,
    2026-08-02**), with two required Windows-specific redesigns, not
    mechanical translations, follow below for historical context:
+
+   **Update 2026-08-03 (Phase 4/5): real orchestration script built, ELVIS
+   onboarded, real end-to-end proof completed.** `windows/convert.ps1` is
+   the first actual runnable entry point wiring every Phase 1-3 module
+   together (scan/orphan-reap/claim/encode/validate/finalize/done-log/
+   resume-state), deployed to ELVIS at `D:\VES-ELVIS\script\convert.ps1`.
+   A real single-file test and a real 3-file queue test (genuine TV
+   episodes) both succeeded end-to-end after fixing two real bugs the
+   test itself found (not review): profile auto-detection needs
+   `-ForceProfile` for content outside the real library folder structure
+   (expected, not a bug), and `mkvalidator.exe` on Windows can crash
+   (0xC0000005 ACCESS_VIOLATION) on genuinely valid files -- fixed by
+   treating negative exit codes as ambiguous, never as proof of
+   corruption. **New known gap, worth tracking**: this Windows
+   mkvalidator build may have real quality issues beyond version number
+   parity (v0.6.0 matches the fleet pin, but crashed on a real file the
+   Linux/macOS builds would very likely have validated cleanly) --
+   structure validation now silently degrades to duration+decode-only
+   confidence whenever it crashes, which is safe but worth a second look
+   at a better Windows mkvalidator build if this recurs often. Full
+   detail in `windows/modules/DESIGN-phase3-6features.md`'s "Phase 4/5"
+   section.
    - The mutex uses atomic exclusive file creation
      (`FileMode.CreateNew`) instead of bash's `mkdir`, since directory
      creation hits the same broken-ACL bug found in Phase 2. Also found
