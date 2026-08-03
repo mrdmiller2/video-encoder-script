@@ -473,3 +473,33 @@ encode run) plus an explicit `# TODO(season-retry-integration):` comment
 at the future call site once the sample-test-prediction mechanism is
 ported, so the dependency is discoverable in code, not just in this
 document.
+
+## All 6 features built and tested (2026-08-03)
+
+1. **Telegram** (`VesTelegram.psm1`) -- 4 real tests including an
+   actual network round trip to Telegram's real API with intentionally
+   invalid credentials.
+2. **Organize phase** (`VesOrganize.psm1`) -- 6 real tests including
+   real folder creation, file+subtitle moves, a real collision refusal,
+   and a full library pass with correct largest-first ordering.
+3. **Live HandBrake progress** (`VesHandBrake.psm1`, rewritten) -- a
+   real bug found via actual output capture: HandBrake's JSON spans
+   multiple lines per block, not one line as first assumed. Fixed with
+   brace-depth accumulation; verified with 12 real incremental progress
+   callbacks across a real encode.
+4. **Season-retry** (`VesSeasonRetry.psm1`) -- 6 real tests, tracking/
+   retry logic only per scope decision, not wired into any real
+   `convert.ps1` path yet (marked with explicit TODO comments).
+5. **Pipeline-vs-batch mode** (`VesPipelineScan.psm1`) -- 4 real tests,
+   including the make-or-break claim (a PowerShell runspace, not
+   Start-Job, can write to the real NAS without the documented
+   Access-Denied failure) verified directly: 12/12 real files found via
+   a real runspace scan against a real NAS fixture tree.
+6. **Disc-source handling** (`VesDiscSource.psm1`) -- detection/scan/
+   title-selection verified against a REAL 22GB Blu-ray ISO on the NAS
+   (`The Lazarus Effect (2015).ISO`): a real 24.5-second HandBrake scan
+   correctly selected the main feature (title 6, 83.6 min -- a plausible
+   runtime for this real film). Full lossless-extraction + VMAF-search +
+   AV1-encode end-to-end proof is a genuinely long-running job (tracked
+   separately, results to follow once complete -- extracting and
+   re-encoding an 84-minute Blu-ray title takes real hours, not minutes).
