@@ -217,6 +217,19 @@ window). Windows has no built-in equivalent.
   arbitrary folders (worked around via `mklink /D` to match the fleet's
   path convention); SMB auth needed the same domain credentials as SSH,
   not anonymous.
+- **Cross-protocol visibility gap, found while building Phase 3's
+  done-log (2026-08-02): a directory created via NFS from a Linux
+  fleet machine was still not visible over SMB from ELVIS more than a
+  minute later** (`icacls` kept reporting "the system cannot find the
+  file specified" on the exact same path). Not a short client-side
+  cache TTL (already known to be ~10s) -- genuinely persistent over the
+  test window. Real implication for the port: **any NAS-side directory
+  the Windows fork depends on must be created via the same protocol
+  (SMB) it will actually use, not assumed to appear promptly just
+  because a Linux machine created it moments earlier over NFS.** Don't
+  design cross-machine coordination that has a Linux machine
+  provisioning a directory a Windows machine then immediately depends
+  on seeing.
 
 ### 4. Process/execution model — genuine redesign, not a mechanical translation
 
@@ -434,6 +447,37 @@ kinds of work, not one migration applied three times.
    +NFS mount handling, credential management.
 4. **Phase 3 — fleet infrastructure**: resume state, orphan reaper,
    sharded directory scanning, detached/scheduled execution model.
+   **Shared cross-host mutex and done-log ported and verified against
+   the real NAS (2026-08-02)**, with two required Windows-specific
+   redesigns, not mechanical translations:
+   - The mutex uses atomic exclusive file creation
+     (`FileMode.CreateNew`) instead of bash's `mkdir`, since directory
+     creation hits the same broken-ACL bug found in Phase 2. Also found
+     mid-build: reopening a file for write immediately after
+     `CreateNew`+`Close` fails (an SMB oplock-break timing issue) --
+     write the token directly to the still-open handle instead.
+   - **The done-log itself can't be one shared flat file appended to by
+     every machine, which is how the bash version does it.** Direct
+     testing found reopening an existing file for write/append on this
+     NAS fails *persistently* (10 retries over 3+ seconds, reproduced
+     from a completely different process/session, not just the
+     original writer) -- `icacls` showed newly-created files get the
+     same broken `Everyone: R`-only ACL already found for directories,
+     and the one ACL entry with write access is tied to a session
+     identity not guaranteed to match across separate connections. A
+     mutex can't fix an ACL that denies the write outright. Fixed by
+     storing the done-log as **one small file per entry** in a
+     directory (unique filename via `CreateNew`, the one operation
+     proven reliable everywhere this session) instead of appending to
+     a shared file -- no reopen, no append, and no mutex even needed
+     for the write itself. `windows/modules/VesDoneLog.psm1`.
+   - The done-log's entry *directory* itself must be pre-created via
+     SMB (the same protocol the Windows fork will use) -- creating it
+     via NFS from a Linux machine and expecting it to appear promptly
+     over SMB does not work reliably (see item 3's cross-protocol
+     visibility note). Treat this as a one-time setup precondition, not
+     something the Windows fork should try to provision itself from
+     scratch against a brand-new NAS location.
 5. **Phase 4 — parity test suite**: run the same synthetic test files
    already built for the primary script's subtitle-filter/two-stage
    verification (real+empty SRT/ASS/mov_text tracks, legacy-container
