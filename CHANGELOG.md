@@ -4,6 +4,37 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.33S — 2026-08-02
+
+Added optional Telegram job-completion notifications, requested after a
+comparison against Tdarr surfaced remote-visibility as the one genuinely
+useful gap in this project's design (everything else Tdarr does
+differently is either already covered by this project's per-title VMAF
+targeting and safety-first architecture, or would require the kind of
+UI/plugin-runtime re-engineering explicitly not wanted).
+
+`notify_telegram()` sends one message per job (success or failure),
+tagged with the sending machine's hostname so a single shared bot/chat
+works across the whole fleet. Opt-in only via `CONVERT_TELEGRAM_BOT_TOKEN`/
+`CONVERT_TELEGRAM_CHAT_ID` environment variables -- deliberately never a
+CLI flag, since a flag's value is visible to any local user via `ps aux`
+while an env var isn't (same reasoning as the existing `CONVERT_SMB_USER`/
+`CONVERT_SMB_PASSWORD` pattern). Silently disabled (instant no-op) if
+either variable is unset. Fires in the background with a short timeout
+and never blocks or fails the actual encode job even if Telegram is
+unreachable -- notification delivery is best-effort, not load-bearing,
+same principle as every other auxiliary path in this script. Uses
+`--data-urlencode` rather than string-concatenating into the URL so a
+title containing spaces/parens/unicode can't produce a malformed
+request. Hooked into `end_convert_job()`, the single existing function
+that already handles both success and failure uniformly, rather than
+adding separate notification calls scattered across the codebase.
+
+Verified in isolation: no-op path returns in ~0ms when unset; the
+firing path also returns in ~1ms (correctly backgrounded/disowned, not
+blocking) when sending a message containing spaces, parens, and
+unicode. `bash -n` passes.
+
 ## v5.0.33R — 2026-08-02
 
 Fixes from a full independent E2E confidence/code review of the
