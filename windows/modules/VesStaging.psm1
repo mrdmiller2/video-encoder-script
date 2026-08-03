@@ -21,20 +21,95 @@
 # predictable path between a pre-flight check and the encoder actually
 # opening it, same class of race the bash version's own external
 # review flagged.
+#
+# Found via direct testing against the real NAS share (2026-08-02):
+# PowerShell's Remove-Item cmdlet is UNRELIABLE for both files and
+# directories over this SMB share -- fails with "Access is denied" on
+# paths whose ACLs genuinely grant delete rights (confirmed via icacls),
+# while `cmd /c del`/[System.IO.File]::Delete()/[System.IO.Directory]::Delete()
+# succeed on the identical path immediately after. A known class of
+# PowerShell-over-SMB provider-layer quirk on some NAS implementations,
+# not a real permissions problem. All cleanup in this module therefore
+# uses the raw .NET deletion APIs, never Remove-Item, for anything that
+# might live on a network share (which is the common case here --
+# without a ramdisk, the "local" staging directory is a sibling of the
+# real destination, i.e. ON the network share itself).
+#
+# Also found the same session: Copy-Item can silently produce no
+# destination file on this share without throwing, even with
+# -ErrorAction Stop -- switched to [System.IO.File]::Copy(). And
+# separately: this NAS's Samba config hides dot-prefixed names over SMB
+# (a common "hide dot files = yes" default) -- Get-ChildItem needs
+# -Force to see a dot-prefixed name at all (Test-Path/Get-Item already
+# do by default; Test-Path has no -Force parameter for this purpose --
+# confirmed directly, don't add it there). Fixed by dropping the
+# leading dot from this port's temp-naming scheme entirely (it's a
+# Unix/bash idiom this NAS's SMB layer actively works against, not a
+# convention Windows needs) and using -Force on Get-Item/Get-ChildItem
+# as defense-in-depth.
+
+function Remove-VesFileRobust {
+    param([Parameter(Mandatory)][string]$Path)
+    try {
+        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+            [System.IO.File]::Delete($Path)
+        }
+    } catch { }
+}
+
+function Remove-VesDirectoryRobust {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [switch]$Recurse
+    )
+    try {
+        if (Test-Path -LiteralPath $Path -PathType Container) {
+            [System.IO.Directory]::Delete($Path, [bool]$Recurse)
+        }
+    } catch { }
+}
 
 function New-VesLocalStageDir {
     <#
     .SYNOPSIS
     Port of _local_stage_dir_for(). Creates a private, unpredictable
-    staging directory as a sibling of $Destination's own directory.
-    Returns $null if it couldn't be created (caller must fail closed,
-    never fall back to writing the final path directly).
-    #>
-    param([Parameter(Mandatory)][string]$Destination)
+    staging directory. Prefers -PreferredParentDir (a known-writable
+    local disk location) when supplied; otherwise falls back to a
+    sibling of $Destination's own directory, matching the bash
+    version's original behavior. Returns $null if it couldn't be
+    created (caller must fail closed, never fall back to writing the
+    final path directly).
 
-    $parentDir = Split-Path -Parent $Destination
+    .PARAMETER PreferredParentDir
+    Windows-specific deviation from the bash version, not an oversight:
+    found via direct testing against the real NAS (2026-08-02) that
+    freshly-created directories on this share get a broken ACL
+    (Everyone: RX instead of inheriting the parent's Modify) that even
+    the creating session can't write into afterward -- a Samba
+    ACL-inheritance misconfiguration on the NAS side, not fixable from
+    the Windows client. "Stage next to the destination" is therefore
+    unsafe as a default on Windows whenever the destination is a
+    network path. Callers should supply a known-good local disk
+    directory (e.g. a fixed path on the machine's fastest local drive)
+    here; this function still falls back to sibling-of-destination if
+    omitted, for parity with the bash version and for genuinely local
+    (non-network) destinations where the NAS quirk doesn't apply.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Destination,
+        [string]$PreferredParentDir
+    )
+
+    if ($PreferredParentDir) {
+        try {
+            New-Item -ItemType Directory -Path $PreferredParentDir -Force -ErrorAction Stop | Out-Null
+        } catch {
+            $PreferredParentDir = $null
+        }
+    }
+    $parentDir = if ($PreferredParentDir) { $PreferredParentDir } else { Split-Path -Parent $Destination }
     $token = [System.IO.Path]::GetRandomFileName() -replace '[.]', ''
-    $stageDir = Join-Path $parentDir ".convert-stage-$token"
+    $stageDir = Join-Path $parentDir "convert-stage-$token"
     try {
         New-Item -ItemType Directory -Path $stageDir -ErrorAction Stop | Out-Null
         return $stageDir
@@ -49,23 +124,27 @@ function Resolve-VesEncodeStagePath {
     Port of resolve_encode_stage_path(). Decides where the encoder
     should actually write for this one file: a RAM-disk path if
     -RamdiskDir is supplied and has enough free space for the source
-    size (plus margin), else a private local staging directory next to
-    the real destination. Returns $null (caller must skip the file,
-    never encode straight to the predictable final path) if even the
-    local staging directory couldn't be created.
+    size (plus margin), else a private local staging directory --
+    preferring -LocalFallbackDir (a known-writable local disk location,
+    see New-VesLocalStageDir's -PreferredParentDir doc for why this
+    isn't just "next to the real destination" on Windows) over a
+    sibling of the real destination. Returns $null (caller must skip
+    the file, never encode straight to the predictable final path) if
+    even the local staging directory couldn't be created.
     #>
     param(
         [Parameter(Mandatory)][string]$Source,
         [Parameter(Mandatory)][string]$Destination,
         [string]$RamdiskDir,
+        [string]$LocalFallbackDir,
         [int]$SizeEstimateMarginPct = 20
     )
 
     if ($RamdiskDir -and (Test-Path $RamdiskDir)) {
-        $srcSize = (Get-Item $Source -ErrorAction SilentlyContinue).Length
+        $srcSize = (Get-Item $Source -Force -ErrorAction SilentlyContinue).Length
         if ($srcSize -gt 0) {
             $needBytes = $srcSize + [long]($srcSize * $SizeEstimateMarginPct / 100)
-            $drive = (Get-Item $RamdiskDir).PSDrive
+            $drive = (Get-Item $RamdiskDir -Force).PSDrive
             $freeBytes = $drive.Free
             if ($freeBytes -ge $needBytes) {
                 $pidTag = $PID
@@ -76,9 +155,9 @@ function Resolve-VesEncodeStagePath {
         }
     }
 
-    $localDir = New-VesLocalStageDir -Destination $Destination
+    $localDir = New-VesLocalStageDir -Destination $Destination -PreferredParentDir $LocalFallbackDir
     if (-not $localDir) {
-        Write-Warning "Could not create a private staging directory next to $Destination -- refusing to encode directly to the final path (would reopen the race window)"
+        Write-Warning "Could not create a private staging directory for $Destination -- refusing to encode directly to the final path (would reopen the race window)"
         return $null
     }
     $pidTag = $PID
@@ -103,7 +182,7 @@ function Remove-VesStagedFileDir {
     }
     try {
         if ((Get-ChildItem -Path $stagedDir -Force -ErrorAction SilentlyContinue | Measure-Object).Count -eq 0) {
-            Remove-Item -Path $stagedDir -Force -ErrorAction SilentlyContinue
+            Remove-VesDirectoryRobust -Path $stagedDir
         }
     } catch { }
 }
@@ -113,33 +192,49 @@ function Complete-VesStagedEncodeOutput {
     .SYNOPSIS
     Port of finalize_staged_encode_output(). Moves a staged output into
     place on its real (possibly network) destination via a private,
-    unpredictable temp directory + size-verified copy + rename -- never
-    reopening the final path by name mid-copy (the same TOCTOU class the
-    bash version's own review fixed: a plain "copy to $final_dst.tmp
-    then rename" still lets another writer swap that predictable name
-    for a reparse point between the two steps).
+    unpredictable temp FILENAME (not a temp directory -- see below) in
+    the final destination's own existing directory, size-verified copy,
+    then a same-directory rename -- never reopening the final path by
+    name mid-copy (the same TOCTOU class the bash version's own review
+    fixed: a plain "copy to $final_dst.tmp then rename" still lets
+    another writer swap that predictable name for a reparse point
+    between the two steps).
+
+    Deliberate Windows deviation from the bash version, not an
+    oversight: the bash version (and this port's first draft) used a
+    private temp DIRECTORY here, mirroring the staging-side design. But
+    the real NAS this was tested against (2026-08-02) has a Samba
+    ACL-inheritance bug where freshly-created directories get a broken
+    ACL (Everyone: RX instead of inheriting the parent's Modify) that
+    even the creating session can't write into -- confirmed via icacls
+    comparison and reproduced consistently. Since the final
+    destination's directory already exists (the working case, proven
+    repeatedly), using a private temp FILENAME there instead of a new
+    subdirectory keeps the same TOCTOU protection (the name is still
+    unpredictable, so nothing can pre-position a reparse point at it)
+    while never touching the broken directory-creation path.
     #>
     param(
         [Parameter(Mandatory)][string]$StagedPath,
         [Parameter(Mandatory)][string]$FinalDestination
     )
     if ($StagedPath -eq $FinalDestination) { return $true }
-    if (-not (Test-Path $StagedPath) -or (Get-Item $StagedPath).Length -eq 0) { return $false }
+    if (-not (Test-Path $StagedPath) -or (Get-Item $StagedPath -Force).Length -eq 0) { return $false }
 
     $parentDir = Split-Path -Parent $FinalDestination
     $token = [System.IO.Path]::GetRandomFileName() -replace '[.]', ''
-    $tmpDir = Join-Path $parentDir ".convert-finalize-$token"
-    try {
-        New-Item -ItemType Directory -Path $tmpDir -ErrorAction Stop | Out-Null
-    } catch {
-        return $false
-    }
+    $tmpOnDst = Join-Path $parentDir "convert-finalize-$token-$([System.IO.Path]::GetFileName($FinalDestination))"
 
-    $tmpOnDst = Join-Path $tmpDir ([System.IO.Path]::GetFileName($FinalDestination))
+    # [System.IO.File]::Copy(), not Copy-Item -- found via direct testing
+    # against the real NAS (2026-08-02) that Copy-Item can silently
+    # produce no file at all on this SMB share without throwing (even
+    # with -ErrorAction Stop), the same class of PowerShell-provider-
+    # layer unreliability already found for Remove-Item. The raw .NET
+    # API is the reliable one in both cases.
     $copyOk = $false
     try {
-        Copy-Item -Path $StagedPath -Destination $tmpOnDst -ErrorAction Stop
-        if ((Get-Item $tmpOnDst).Length -eq (Get-Item $StagedPath).Length) {
+        [System.IO.File]::Copy($StagedPath, $tmpOnDst, $true)
+        if ((Test-Path $tmpOnDst) -and (Get-Item $tmpOnDst -Force).Length -eq (Get-Item $StagedPath -Force).Length) {
             $copyOk = $true
         }
     } catch { }
@@ -147,13 +242,13 @@ function Complete-VesStagedEncodeOutput {
     if ($copyOk) {
         try {
             Move-Item -Path $tmpOnDst -Destination $FinalDestination -Force -ErrorAction Stop
-            Remove-Item -Path $StagedPath -Force -ErrorAction SilentlyContinue
-            Remove-Item -Path $tmpDir -Force -Recurse -ErrorAction SilentlyContinue
+            Remove-VesFileRobust -Path $StagedPath
             return $true
         } catch { }
     }
-    Remove-Item -Path $tmpDir -Force -Recurse -ErrorAction SilentlyContinue
+    Remove-VesFileRobust -Path $tmpOnDst
     return $false
 }
 
-Export-ModuleMember -Function New-VesLocalStageDir, Resolve-VesEncodeStagePath, Remove-VesStagedFileDir, Complete-VesStagedEncodeOutput
+Export-ModuleMember -Function New-VesLocalStageDir, Resolve-VesEncodeStagePath, Remove-VesStagedFileDir, `
+    Complete-VesStagedEncodeOutput, Remove-VesFileRobust, Remove-VesDirectoryRobust

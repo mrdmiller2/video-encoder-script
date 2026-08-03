@@ -78,7 +78,8 @@ function Invoke-VesTwoStageEncode {
         [double]$AudioGainDb = 0.0,
         [Parameter(Mandatory)][string]$ErrorLogDir,
         [string]$StrippedSubtitlesLogPath,
-        [string]$RamdiskDir
+        [string]$RamdiskDir,
+        [string]$LocalFallbackDir
     )
 
     $titleTag = [System.IO.Path]::GetFileNameWithoutExtension($Source)
@@ -96,7 +97,7 @@ function Invoke-VesTwoStageEncode {
     # what the encoder actually opens; the real $Destination is only
     # touched at the very end via Complete-VesStagedEncodeOutput.
     $realDst = $Destination
-    $writeDst = Resolve-VesEncodeStagePath -Source $Source -Destination $realDst -RamdiskDir $RamdiskDir
+    $writeDst = Resolve-VesEncodeStagePath -Source $Source -Destination $realDst -RamdiskDir $RamdiskDir -LocalFallbackDir $LocalFallbackDir
     if (-not $writeDst) {
         return [PSCustomObject]@{ Success = $false; ExitCode = 1; Stage = 'stage-path' }
     }
@@ -164,7 +165,7 @@ function Invoke-VesTwoStageEncode {
             if ($remuxResult.ExitCode -ne 0) {
                 Write-Warning "ffmpeg subtitle-stripped remux retry also failed (rc=$($remuxResult.ExitCode)) -- stderr: $retryErrFile"
                 if ($writeDst -ne $realDst) {
-                    Remove-Item $writeDst -Force -ErrorAction SilentlyContinue
+                    Remove-VesFileRobust -Path $writeDst
                     Remove-VesStagedFileDir -StagedPath $writeDst -RamdiskJobStageDir $RamdiskDir
                 }
                 return [PSCustomObject]@{ Success = $false; ExitCode = $remuxResult.ExitCode; Stage = 'remux' }
@@ -174,7 +175,7 @@ function Invoke-VesTwoStageEncode {
         if (-not (Test-Path $writeDst) -or (Get-Item $writeDst).Length -eq 0) {
             Write-Warning "ffmpeg reported success but output is missing/empty: $writeDst"
             if ($writeDst -ne $realDst) {
-                Remove-Item $writeDst -Force -ErrorAction SilentlyContinue
+                Remove-VesFileRobust -Path $writeDst
                 Remove-VesStagedFileDir -StagedPath $writeDst -RamdiskJobStageDir $RamdiskDir
             }
             return [PSCustomObject]@{ Success = $false; ExitCode = 1; Stage = 'remux' }
@@ -184,7 +185,7 @@ function Invoke-VesTwoStageEncode {
         # per-title clutter doesn't (same policy as the bash version).
         foreach ($f in @($encodeErrFile, $remuxErrFile, $retryErrFile)) {
             if ((Test-Path $f) -and (Get-Item $f).Length -eq 0) {
-                Remove-Item $f -Force -ErrorAction SilentlyContinue
+                Remove-VesFileRobust -Path $f
             }
         }
 
@@ -204,7 +205,7 @@ function Invoke-VesTwoStageEncode {
         # ACTIVE_FFMPEG_STAGE1_FILE's trap-composition role in the bash
         # version (see ROADMAP.md item 4 -- PowerShell's try/finally is
         # the direct equivalent here, not a raw trap).
-        Remove-Item $stage1 -Force -ErrorAction SilentlyContinue
+        Remove-VesFileRobust -Path $stage1
     }
 }
 
