@@ -148,6 +148,23 @@ function Get-VesOrphanFlagCandidates {
                 Source                = $fields.source
             }
         }
+    # Deliberately a plain "return $candidates", NOT "return ,$candidates".
+    # PowerShell's output stream unrolls an array with exactly one
+    # element, so DIRECT ASSIGNMENT ($x = Get-VesOrphanFlagCandidates ...)
+    # can receive a bare scalar instead of a 1-element array when there's
+    # only one match. A leading comma "fixes" that case but BREAKS direct
+    # piping (Get-VesOrphanFlagCandidates ... | Where-Object {...}) for
+    # the 2+-element case instead -- confirmed via a real, reproducible
+    # test bug (2026-08-03): piping a comma-wrapped multi-element result
+    # delivers the WHOLE array as a single pipeline object rather than
+    # one candidate at a time, and PowerShell's array-member-access +
+    # "-eq acts as an element-wise filter" semantics on that single
+    # object made Where-Object's filter condition evaluate as truthy
+    # regardless of which candidate was intended, silently returning the
+    # wrong candidate. The standard, correct fix lives at the CALL SITE,
+    # not here: wrap with @(...) when capturing into a variable for
+    # indexing/Count ($all = @(Get-VesOrphanFlagCandidates -Root $x)),
+    # and pipe directly (no wrapping needed) when enumerating.
     return $candidates
 }
 
@@ -339,6 +356,9 @@ function Invoke-VesRamDiskOrphanRecovery {
         }
         Remove-VesRamDiskJob -DriveLetter $leftover.DriveLetter -SkipOwnerCheck | Out-Null
     }
+    # Plain return -- see Get-VesOrphanFlagCandidates's comment above for
+    # why a comma-wrap is deliberately NOT used here; wrap with @(...)
+    # at the call site instead if capturing into a variable.
     return $disposed
 }
 

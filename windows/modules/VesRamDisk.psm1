@@ -233,6 +233,13 @@ function Get-VesRamDiskLeftovers {
             } catch { }
         }
     }
+    # Deliberately a plain "return $leftovers", not a comma-wrapped one --
+    # see VesOrphanReaper.psm1's Get-VesOrphanFlagCandidates comment for
+    # the full explanation: a comma-wrap fixes direct-assignment
+    # scalar-collapse for a 1-element result but BREAKS direct piping for
+    # a 2+-element result (confirmed via a real reproduced bug). Wrap
+    # with @(...) at the CALL SITE when capturing into a variable for
+    # indexing/Count; pipe directly (no wrapping) when enumerating.
     return $leftovers
 }
 

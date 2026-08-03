@@ -418,6 +418,60 @@ just review:
    path, so this test isolates the duration gate instead of asserting a
    flawed fixture should pass structure validation.
 
+## Real bugs found building item 4 (sharded scan, 2026-08-03), fixed and verified -- including a self-correction
+
+`VesShardedScan.psm1` built with Cursor's reviewed exact-depth walk
+pattern and bash's directory exclusions (`ffmpeg-logs`, `Deferred`,
+dot-prefixed), tested with 7 real tests on ELVIS against a real nested
+fixture tree.
+
+**First bug (real):** a plain `return @($SearchPath)` silently
+collapsed to a **bare string** instead of a 1-element array whenever
+the result had exactly one shard -- PowerShell unrolls arrays emitted
+to a function's output stream, so a 1-element array becomes
+indistinguishable from a scalar to a caller that captures it via direct
+assignment (`$result.Count` still read `1`, but `$result[0]` returned a
+single CHARACTER of the string, since string indexing was silently
+substituted for array indexing).
+
+**First fix attempt (wrong, self-corrected):** added a unary-comma
+guard (`return , @(...)`) at every array-returning site across
+`VesShardedScan.psm1`, `VesRamDisk.psm1`'s `Get-VesRamDiskLeftovers`,
+and `VesOrphanReaper.psm1`'s `Get-VesOrphanFlagCandidates`/`$disposed`/
+`$reclaimed` (an earlier version of this doc incorrectly claimed the
+latter two were "safe by construction" -- that claim was never actually
+verified and turned out to be wrong; a direct test proved the identical
+collapse happens for a bare `return $arrayVariable` too, not just
+`return @(expr)`). This comma-wrap DID fix direct-assignment capture,
+but a full regression pass across all three modules' existing test
+suites caught that it broke **direct piping**
+(`Get-VesOrphanFlagCandidates ... | Where-Object {...}`) for the
+2+-element case instead: a comma-wrapped multi-element array flows
+through the pipe as a SINGLE object rather than one element at a time,
+and PowerShell's array-member-access-plus-`-eq`-as-element-wise-filter
+semantics on that single object made `Where-Object`'s condition
+evaluate as truthy regardless of which element was intended --
+silently returning the WRONG candidate (three previously-passing
+orphan-reaper tests started reporting `cross_host` for same-host
+flags). This is why re-running each affected module's full existing
+test suite after any change -- not just the new module's own tests --
+caught a regression the new tests alone would have missed.
+
+**Actual fix:** reverted all five sites back to plain `return $x` /
+`return @($x)` (no comma). The correct, standard PowerShell convention
+is to guarantee array-ness at the **call site** instead --
+`$vars = @(Get-VesXxx ...)` when capturing into a variable for
+indexing/`.Count`, with no wrapping needed when piping directly for
+per-element enumeration. Updated the affected test-script call sites
+(`Get-VesScanRoots -NoShard`/zero-subdirectory-fallback assignments in
+`test-shardedscan.ps1`, `Get-VesOrphanFlagCandidates` in
+`test-orphanreaper.ps1`'s Test 5) to wrap accordingly. All three
+modules' full test suites (RAM disk: 8, orphan reaper: 13, sharded
+scan: 7) pass cleanly with this fix. This convention -- comma-wrapping
+inside a function is the WRONG fix for the single-element collapse
+problem; `@(...)` at the call site is the right one -- is now the
+standing rule for every module in this port.
+
 ---
 
 ## Cross-cutting notes for reviewers
