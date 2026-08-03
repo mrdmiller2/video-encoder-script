@@ -9,16 +9,17 @@ detection -> VMAF CRF search -> two-stage encode+remux -> validate ->
 finalize -> done-log -> resume-state), plus orphan-reap-before-claiming-
 new-work and RAM-disk job lifecycle.
 
-Deliberately NOT ported in this pass (see ROADMAP.md's Phase 4/5 notes):
-organize phase, dry-run library inspection report, pipeline-vs-batch dual
-mode (this script always processes files one at a time, matching bash's
-"batch" mode -- the "pipeline" mode exists in bash purely as a large-
-library performance optimization, not a behavioral difference), season-
-retry shrink heuristic, Telegram notifications, disc-source (ISO/BDMV)
-handling. All of these are real, scoped gaps, not oversights -- adding
-them is straightforward once this core loop is proven, per the project's
-own incremental-verification convention (don't build untested surface
-area ahead of a real need).
+Deliberately NOT yet ported (see ROADMAP.md's Phase 4/5 notes and
+DESIGN-remaining6features.md): organize phase, dry-run library inspection
+report, pipeline-vs-batch dual mode (this script always processes files
+one at a time, matching bash's "batch" mode -- the "pipeline" mode exists
+in bash purely as a large-library performance optimization, not a
+behavioral difference), season-retry shrink heuristic, disc-source
+(ISO/BDMV) handling. All of these are real, scoped gaps, not oversights.
+
+Telegram notifications ARE ported (VesTelegram.psm1, 2026-08-03) -- env
+var config only (VES_TELEGRAM_BOT_TOKEN/VES_TELEGRAM_CHAT_ID), never a
+CLI flag, matching bash's own stated security reasoning.
 
 .PARAMETER SearchPath
 Library root to scan (a real folder or a single file's parent directory).
@@ -63,7 +64,8 @@ foreach ($m in @(
         'VesTimeoutRetry', 'VesTrackedProcess', 'VesStaging', 'VesValidation',
         'VesSharedMutex', 'VesTitleLock', 'VesDoneLog', 'VesResumeState',
         'VesRamDisk', 'VesOrphanReaper', 'VesShardedScan',
-        'VesSubtitleFilter', 'VesProfileDecision', 'VesVmafCrfSearch', 'VesTwoStageEncode'
+        'VesSubtitleFilter', 'VesProfileDecision', 'VesVmafCrfSearch', 'VesTwoStageEncode',
+        'VesTelegram'
     )) {
     Import-Module (Join-Path $ModuleDir "modules\$m.psm1") -Force
 }
@@ -193,10 +195,13 @@ foreach ($src in $allFiles) {
     } | Out-Null
 
     $ok = $false
+    $jobSw = [System.Diagnostics.Stopwatch]::StartNew()
+    $srcDurationForSpeed = $null
     try {
         $profile = if ($ForceProfile) { $ForceProfile } else { Get-VesDetectedProfileForPath -Path $src }
         $hdrMode = Resolve-VesHdrMode -Source $src -FfprobePath $FfprobePath
         $isHdr = $hdrMode -in @('pq', 'pq_reconstruct', 'hlg')
+        $srcDurationForSpeed = Get-VesMediaDurationSeconds -Path $src -FfprobePath $FfprobePath
         $upscaleTarget = Resolve-VesUpscaleTarget -Source $src -FfprobePath $FfprobePath
         $fixedCrf = Get-VesProfileFixedCrf -Codec av1 -Profile $profile -IsHdr $isHdr
         $svtParams = Get-VesProfileSvtParams -Profile $profile -FfmpegPath $FfmpegPath
@@ -260,6 +265,20 @@ foreach ($src in $allFiles) {
             path = $SearchPath; shard_depth = "$ShardDepth"; no_shard = "$([bool]$NoShard)"
             last_source = $src; last_index = "$idx"; last_status = $(if ($ok) { 'completed' } else { 'failed' }); queue_total = "$total"
         } | Out-Null
+
+        $jobSw.Stop()
+        $elapsedSecs = $jobSw.Elapsed.TotalSeconds
+        $elapsedHms = '{0:00}h {1:00}m {2:00}s' -f $jobSw.Elapsed.Hours, $jobSw.Elapsed.Minutes, $jobSw.Elapsed.Seconds
+        if ($ok) {
+            if ($srcDurationForSpeed -and $srcDurationForSpeed -gt 0 -and $elapsedSecs -gt 0) {
+                $speed = [math]::Round($srcDurationForSpeed / $elapsedSecs, 2)
+                Send-VesTelegramNotification -Message "OK Job $idx/$total complete: $(Split-Path -Leaf $src) -- $elapsedHms (${speed}x realtime)"
+            } else {
+                Send-VesTelegramNotification -Message "OK Job $idx/$total complete: $(Split-Path -Leaf $src) -- $elapsedHms"
+            }
+        } else {
+            Send-VesTelegramNotification -Message "FAILED Job $idx/$total`: $(Split-Path -Leaf $src)"
+        }
     }
 
     $processed++
