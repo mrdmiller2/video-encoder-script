@@ -56,16 +56,16 @@ touched by this port at all. The actual targets:
   also the fleet's slowest member and has the most WSL2-specific pain
   already (NAT/portproxy, auto-suspend, the one unattended-restart mount
   recovery gap).
-- **A new, not-yet-onboarded machine — an "HPE" gaming laptop, Windows
-  11, believed to have an AMD GPU (exact model/generation not yet
-  confirmed).** Not currently in [[reference_video_encoder_fleet_inventory]]
-  at all; needs proper onboarding (specs, connection method) whenever
-  it's actually added as a fleet member. Its GPU generation matters a
-  lot for the AMF research above — if it turns out to be RDNA3 or newer,
-  it would be the fleet's first real AV1-hardware-encode-capable AMD
-  card (MacFedora's RDNA1 RX5500 has none at all, see section 7) and a
-  much better test target for AMF parity-tuning than MacFedora is.
-  Confirm the exact GPU model before relying on this.
+- **ELVIS (the "HPE" gaming laptop), Windows 11 — onboarded 2026-08-02
+  as the Phase 0 testbed.** Turned out to be a **hybrid laptop**, not
+  AMD-only as first assumed: has both an **AMD Radeon integrated GPU**
+  and a real **NVIDIA GeForce GTX 1650 dGPU**. The GTX 1650 is Turing
+  generation — no AV1 hardware encode (see section 6's AI-PROCESSOR
+  finding) — so it doesn't help the AMD AMF/AV1 parity-tuning goal
+  directly; that still needs a genuinely newer AMD card (RDNA3+) to be
+  a good test target, which the AMD iGPU here is not confirmed to be.
+  The NVIDIA side did prove directly useful for the WSL2-vs-native
+  NVENC investigation (section 6) despite not helping the AMD research.
 
 ### 1. External tool binaries — mostly solved, needs confirmation
 
@@ -189,33 +189,58 @@ window). Windows has no built-in equivalent. Candidates to evaluate:
   as-confirmed-empty data-loss bug the 2026-08-02 team review just
   fixed in the primary script.
 
-### 5. Windows Defender exclusions — required, not optional
+### 5. AV real-time-scan exclusions — required, not optional (Defender OR third-party)
 
 Real-time scanning adds meaningful I/O overhead on the exact pattern
 this script hammers hardest: repeated large multi-GB reads/writes for
 encode temp files and staged output. **Both** the RAM-disk-equivalent
 staging area (item 2 above) **and** any on-disk staging/fallback
-directory need to be added as Defender exclusion paths
-(`Add-MpPreference -ExclusionPath`) as a required part of setup, not an
-optional tuning step — this should be baked into whatever install/setup
-script accompanies the Windows fork, not left as a manual step a user
-might skip and then silently eat the performance loss without knowing
-why. Applies to the source/library mount paths too if scan-on-read is
-enabled for network shares, not just the local staging dirs.
+directory need real-time-scan exclusions as a required part of setup,
+not an optional tuning step. Applies to the source/library mount paths
+too if scan-on-read is enabled for network shares, not just the local
+staging dirs.
+
+**Not always Defender** (found on ELVIS, 2026-08-02): a machine may run
+a third-party AV instead, which disables Defender's own real-time
+engine (`WinDefend` service present but `Stopped`/`Manual`) and makes
+`Add-MpPreference -ExclusionPath` a no-op — ELVIS runs **ESET Endpoint
+Security, centrally managed via an ERA agent**. On a centrally-managed
+install, even the local `ecmd.exe` CLI can be policy-locked (every
+subcommand including `/help` fails with a generic "Error executing
+command", even from a full-Administrators SSH token, no UAC
+restriction) — matches the same class of issue already hit on
+Crystalight's ESET firewall. **Any setup script for this port must
+detect which AV product is actually active** (`Get-CimInstance
+-Namespace root/SecurityCenter2 -ClassName AntiVirusProduct`) and
+either configure exclusions for whichever product it finds, or fail
+loudly with instructions rather than silently assuming Defender.
+Centrally-managed exclusions likely need the user's console access,
+not remote CLI — treat as a manual setup step to document, not
+something the install script can always automate away.
 
 ### 6. Other concerns surfaced in scoping discussion (2026-08-02), needs Phase 0 data
 
-- **Whether WSL2's GPU virtualization is actually the cause of hardware-
-  encoder flakiness already observed on the existing fleet** (PRINCE's
-  "NVENC AV1 tune probe encode failed rc=2", AI-PROCESSOR's rc=3 failure
-  that silently fell back to software) is currently an assumption, not a
-  finding. Native Windows only fixes this if WSL2's virtualization layer
-  is the actual cause — if it's a driver version issue, VRAM contention
-  (AI-PROCESSOR's `stockanalyzer-vllm` service already holds ~13.9GB of
-  its Tesla T4's VRAM), or something else entirely, native Windows
-  changes nothing and the "full hardware access" premise for THAT
-  specific problem doesn't hold. Needs direct comparison testing (same
-  GPU, same driver, WSL2 vs. native) before claiming this as a benefit.
+- **AI-PROCESSOR's rc=3 NVENC-AV1 failure: SOLVED, not WSL2-related.**
+  ELVIS turned out to be a hybrid laptop with a real NVIDIA GTX 1650
+  dGPU (not AMD-only as first assumed). Running the script's exact
+  NVENC AV1 tune-probe encode natively on it, 10/10 times, failed
+  identically with `av1_nvenc: No capable devices found` — a clean
+  silicon limitation, not intermittent. GTX 1650 is Turing generation;
+  Turing's NVENC has no AV1 encode support at all (AV1 hw encode only
+  arrived with Ada Lovelace/RTX 40-series). AI-PROCESSOR's GPU is a
+  Tesla T4 — also Turing — so its rc=3 failure is almost certainly the
+  same fundamental hardware ceiling, confirmed native, nothing to do
+  with WSL2 virtualization. No fix needed or possible there; AI-PROCESSOR
+  should simply never be offered the AV1-NVENC path (software SVT-AV1
+  is correct for it either way).
+- **PRINCE's rc=2 NVENC-AV1 failure remains genuinely open.** PRINCE's
+  RTX 4070 Laptop is Ada Lovelace and does have real AV1 hardware
+  encode, and it fails with a different code than AI-PROCESSOR/ELVIS —
+  ELVIS's Turing GPU can't reproduce or rule anything in/out for
+  capable hardware. Needs an actual WSL2-vs-native comparison on PRINCE
+  itself (deferred to Phase 6, when PRINCE is converted) — driver
+  version and VRAM contention both remain plausible causes, not yet
+  tested.
 - **Losing `fscache`/`cachefilesd` is a plausible performance
   *regression*, not just a missing nice-to-have.** PRINCE and GruntBox2
   both run custom-built WSL2 kernels specifically for `CONFIG_CACHEFILES`
