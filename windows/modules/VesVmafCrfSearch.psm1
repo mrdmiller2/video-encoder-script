@@ -15,11 +15,24 @@
 # warning (never a silently-uncorrected-for-grain VMAF score), tracked
 # as a real gap until the internal search gets ported.
 #
-# Also NOT ported: the profile system that supplies VmafTarget/FixedCrf/
-# SVT-or-x265 params (profile_for_source, profile_svt_params,
-# profile_fixed_crf, VMAF_TARGET_* per-profile constants -- task #31).
-# This module takes those as caller-supplied parameters, same layering
-# as VesTwoStageEncode.psm1 taking pre-built video args.
+# VmafTarget/FixedCrf/SVT-or-x265 params still come in as caller-supplied
+# parameters (same layering as VesTwoStageEncode.psm1 taking pre-built
+# video args) -- but Resolve-VesCrfForEncode imports VesProfileDecision.psm1
+# specifically to derive the grain-synthesis safety check from $Profile
+# itself rather than trusting a caller-supplied override (see the
+# 2026-08-02 team-review fix in that function).
+#
+# Deliberately NOT -Force here (found via direct testing, 2026-08-02):
+# if a caller has already imported VesProfileDecision.psm1 into the
+# global scope, a -Force reimport from inside THIS module's own script
+# scope silently orphans the caller's already-bound functions --
+# Get-Command/direct invocation of e.g. Resolve-VesHdrMode then fails
+# with "term not recognized" even though Get-Module still lists it as
+# exported. Only importing when not already loaded avoids clobbering
+# whatever the caller already has.
+if (-not (Get-Module -Name VesProfileDecision)) {
+    Import-Module (Join-Path $PSScriptRoot 'VesProfileDecision.psm1') -Force
+}
 
 $script:VmafCrfCache = @{}
 
@@ -173,7 +186,7 @@ function Resolve-VesCrfForEncode {
         [bool]$VmafDisabled = $false,
         [bool]$FfmpegHasLibVmaf = $true,
         [bool]$DryRun = $false,
-        [bool]$ProfileUsesGrainSynthesis = $false,
+        [Nullable[bool]]$ProfileUsesGrainSynthesis = $null,
         [string]$AbAv1Path,
         [string]$FfprobePath,
         [string[]]$EncoderArgs = @(),
@@ -210,7 +223,16 @@ function Resolve-VesCrfForEncode {
     $model = Get-VesVmafModelForSource -Source $Source -FfprobePath $FfprobePath
     Write-Host "VMAF CRF search: target=$VmafTarget model=$model codec=$Codec"
 
-    $canUseAbAv1 = ($Codec -ne 'av1') -or (-not $ProfileUsesGrainSynthesis)
+    # Team-review fix (2026-08-02): this used to default to $false and
+    # trust the caller to pass the right value -- an opt-IN safety
+    # check for exactly the case (grain-synthesizing AV1 profiles) it
+    # exists to guard against, meaning a caller that simply forgot the
+    # flag would silently reopen the unsafe ab-av1 path. $Profile is
+    # already a mandatory parameter here, so there's no reason not to
+    # derive the real answer from it directly -- only trust an explicit
+    # caller override if one was actually supplied.
+    $grainSynthesis = if ($null -ne $ProfileUsesGrainSynthesis) { $ProfileUsesGrainSynthesis } else { Test-VesProfileUsesGrainSynthesis -Profile $Profile }
+    $canUseAbAv1 = ($Codec -ne 'av1') -or (-not $grainSynthesis)
     $result = $null
     if ($canUseAbAv1 -and $AbAv1Path) {
         $result = Invoke-VesVmafCrfSearchAbAv1 -Source $Source -Codec $Codec -Target $VmafTarget -Model $model `

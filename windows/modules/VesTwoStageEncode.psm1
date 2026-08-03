@@ -17,9 +17,15 @@
 #   - CRF resolution (VMAF search) -- ported separately, CRF is a required
 #     parameter here.
 
-Import-Module (Join-Path $PSScriptRoot 'VesTrackedProcess.psm1') -Force
-Import-Module (Join-Path $PSScriptRoot 'VesSubtitleFilter.psm1') -Force
-Import-Module (Join-Path $PSScriptRoot 'VesStaging.psm1') -Force
+if (-not (Get-Module -Name VesTrackedProcess)) {
+    Import-Module (Join-Path $PSScriptRoot 'VesTrackedProcess.psm1') -Force
+}
+if (-not (Get-Module -Name VesSubtitleFilter)) {
+    Import-Module (Join-Path $PSScriptRoot 'VesSubtitleFilter.psm1') -Force
+}
+if (-not (Get-Module -Name VesStaging)) {
+    Import-Module (Join-Path $PSScriptRoot 'VesStaging.psm1') -Force
+}
 
 function Get-VesAudioFilterChain {
     <#

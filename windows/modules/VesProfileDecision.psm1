@@ -13,6 +13,29 @@
 # needed, this port uses the bash version's OWN documented conservative
 # fallback (favor 1080 near the grace band, 720 for SD) rather than
 # inventing different behavior or silently guessing.
+#
+# Team-review fix (2026-08-02): every ffprobe call in this module used
+# to be a raw `& $FfprobePath ...` with no timeout -- the same missing-
+# timeout bug already found and fixed in three OTHER modules this same
+# session (a stalled child process blocks the caller indefinitely with
+# climbing memory). All ffprobe calls here now go through
+# Invoke-VesWithTimeoutRetry (VesTimeoutRetry.psm1), consistent with
+# every other validation-probe call in this port.
+
+if (-not (Get-Module -Name VesTimeoutRetry)) {
+    Import-Module (Join-Path $PSScriptRoot 'VesTimeoutRetry.psm1') -Force
+}
+
+function Invoke-VesProfileFfprobe {
+    param(
+        [Parameter(Mandatory)][string]$FfprobePath,
+        [Parameter(Mandatory)][string[]]$ProbeArgs,
+        [int]$TimeoutSeconds = 30
+    )
+    $r = Invoke-VesWithTimeoutRetry -FilePath $FfprobePath -ArgumentList $ProbeArgs -TimeoutSeconds $TimeoutSeconds
+    if ($r.ExitCode -ne 0) { return $null }
+    return $r.StdOut
+}
 
 $CLASSIC_ANIME_YEAR_CUTOFF = 1997
 
@@ -194,7 +217,7 @@ function Get-VesVideoColorTransfer {
         [Parameter(Mandatory)][string]$Source,
         [Parameter(Mandatory)][string]$FfprobePath
     )
-    $out = & $FfprobePath -v error -select_streams v:0 -show_entries stream=color_transfer -of default=noprint_wrappers=1:nokey=1 $Source 2>$null
+    $out = Invoke-VesProfileFfprobe -FfprobePath $FfprobePath -ProbeArgs @('-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=color_transfer', '-of', 'default=noprint_wrappers=1:nokey=1', $Source)
     if (-not $out) { return 'unknown' }
     return $out.Trim()
 }
@@ -204,8 +227,8 @@ function Test-VesSourceHasDolbyVision {
         [Parameter(Mandatory)][string]$Source,
         [Parameter(Mandatory)][string]$FfprobePath
     )
-    $out = & $FfprobePath -v error -select_streams v:0 -show_entries stream_side_data=side_data_type -of csv=p=0 $Source 2>$null
-    return ($out -join "`n") -match '(?i)DOVI configuration record'
+    $out = Invoke-VesProfileFfprobe -FfprobePath $FfprobePath -ProbeArgs @('-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream_side_data=side_data_type', '-of', 'csv=p=0', $Source)
+    return $out -match '(?i)DOVI configuration record'
 }
 
 function Get-VesSourceDoviProfile {
@@ -213,8 +236,9 @@ function Get-VesSourceDoviProfile {
         [Parameter(Mandatory)][string]$Source,
         [Parameter(Mandatory)][string]$FfprobePath
     )
-    $out = & $FfprobePath -v error -select_streams v:0 -show_entries stream_side_data=dv_profile -of csv=p=0 $Source 2>$null
-    $line = ($out | Where-Object { $_ -match '^\d+$' } | Select-Object -First 1)
+    $out = Invoke-VesProfileFfprobe -FfprobePath $FfprobePath -ProbeArgs @('-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream_side_data=dv_profile', '-of', 'csv=p=0', $Source)
+    if (-not $out) { return $null }
+    $line = ($out -split "`n" | Where-Object { $_ -match '^\d+$' } | Select-Object -First 1)
     return $line
 }
 
@@ -273,13 +297,14 @@ function Get-VesHdr10StaticMetadata {
         [Parameter(Mandatory)][string]$Source,
         [Parameter(Mandatory)][string]$FfprobePath
     )
-    $out = & $FfprobePath -v error -select_streams v:0 -show_frames -read_intervals '%+#1' -show_entries frame_side_data_list $Source 2>$null
+    $out = Invoke-VesProfileFfprobe -FfprobePath $FfprobePath -ProbeArgs @('-v', 'error', '-select_streams', 'v:0', '-show_frames', '-read_intervals', '%+#1', '-show_entries', 'frame_side_data_list', $Source)
 
     $hasMd = $false; $hasCll = $false
     $rx = $ry = $gx = $gy = $bx = $by = $wx = $wy = $minl = $maxl = $null
     $mc = $ma = 0
 
-    foreach ($line in $out) {
+    $outLines = if ($out) { $out -split "`r?`n" } else { @() }
+    foreach ($line in $outLines) {
         if ($line -match 'side_data_type=Mastering display metadata') { $hasMd = $true; continue }
         if ($line -match 'side_data_type=Content light level metadata') { $hasCll = $true; continue }
         if ($line -match '^red_x=(.+)$') { $rx = $Matches[1]; continue }
@@ -296,23 +321,37 @@ function Get-VesHdr10StaticMetadata {
         if ($line -match '^max_average=(.+)$') { $ma = $Matches[1]; continue }
     }
 
+    # Team-review fixes (2026-08-02): (1) a non-numeric, non-fraction
+    # $s (any unexpected ffprobe field content) hit a bare [double]$s
+    # cast that throws an unhandled FormatException, crashing the whole
+    # metadata-extraction call -- now falls back to 0.0 instead. (2) the
+    # "-f" string-format operator formats decimals using the CURRENT
+    # THREAD CULTURE -- on a non-US locale (comma decimal separator)
+    # this would silently corrupt the numbers ffmpeg/svtav1/x265 read
+    # back as -svtav1-params/-x265-params values. Formatted via
+    # [string]::Format with InvariantCulture explicitly instead.
     function ConvertTo-VesFraction($s) {
         if ($null -eq $s) { return 0.0 }
         if ($s -match '^(-?[\d.]+)/(-?[\d.]+)$') {
             $num = [double]$Matches[1]; $den = [double]$Matches[2]
             if ($den -gt 0) { return $num / $den }
         }
-        return [double]$s
+        $val = 0.0
+        if ([double]::TryParse($s, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$val)) {
+            return $val
+        }
+        return 0.0
     }
 
     $masterDisplay = $null
     if ($hasMd -and $maxl) {
-        $masterDisplay = "G({0:F4},{1:F4})B({2:F4},{3:F4})R({4:F4},{5:F4})WP({6:F4},{7:F4})L({8:F1},{9:F4})" -f `
-            (ConvertTo-VesFraction $gx), (ConvertTo-VesFraction $gy), `
-            (ConvertTo-VesFraction $bx), (ConvertTo-VesFraction $by), `
-            (ConvertTo-VesFraction $rx), (ConvertTo-VesFraction $ry), `
-            (ConvertTo-VesFraction $wx), (ConvertTo-VesFraction $wy), `
-            (ConvertTo-VesFraction $maxl), (ConvertTo-VesFraction $minl)
+        $masterDisplay = [string]::Format([System.Globalization.CultureInfo]::InvariantCulture,
+            "G({0:F4},{1:F4})B({2:F4},{3:F4})R({4:F4},{5:F4})WP({6:F4},{7:F4})L({8:F1},{9:F4})",
+            (ConvertTo-VesFraction $gx), (ConvertTo-VesFraction $gy),
+            (ConvertTo-VesFraction $bx), (ConvertTo-VesFraction $by),
+            (ConvertTo-VesFraction $rx), (ConvertTo-VesFraction $ry),
+            (ConvertTo-VesFraction $wx), (ConvertTo-VesFraction $wy),
+            (ConvertTo-VesFraction $maxl), (ConvertTo-VesFraction $minl))
     }
     $cll = $null
     if ($hasCll) { $cll = "$([int]$mc),$([int]$ma)" }
@@ -348,7 +387,7 @@ function Resolve-VesUpscaleTarget {
     $height = 0
     $bpppf = 0.0
     try {
-        $h = & $FfprobePath -v error -select_streams v:0 -show_entries stream=height -of default=noprint_wrappers=1:nokey=1 $Source 2>$null
+        $h = Invoke-VesProfileFfprobe -FfprobePath $FfprobePath -ProbeArgs @('-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=height', '-of', 'default=noprint_wrappers=1:nokey=1', $Source)
         if ($h) { $height = [int]$h.Trim() }
     } catch { }
 
@@ -363,13 +402,13 @@ function Resolve-VesUpscaleTarget {
     # the same conservative default the bash version uses when the sample
     # test itself is unavailable/fails.
     try {
-        $brOut = & $FfprobePath -v error -select_streams v:0 -show_entries stream=bit_rate -of default=noprint_wrappers=1:nokey=1 $Source 2>$null
-        $fpsOut = & $FfprobePath -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of default=noprint_wrappers=1:nokey=1 $Source 2>$null
+        $brOut = Invoke-VesProfileFfprobe -FfprobePath $FfprobePath -ProbeArgs @('-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=bit_rate', '-of', 'default=noprint_wrappers=1:nokey=1', $Source)
+        $fpsOut = Invoke-VesProfileFfprobe -FfprobePath $FfprobePath -ProbeArgs @('-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=avg_frame_rate', '-of', 'default=noprint_wrappers=1:nokey=1', $Source)
         $br = 0.0
         if ($brOut -and $brOut.Trim() -match '^\d+$') { $br = [double]$brOut.Trim() }
         $fpsNum = 0.0
         if ($fpsOut -match '^(\d+)/(\d+)$' -and [double]$Matches[2] -gt 0) { $fpsNum = [double]$Matches[1] / [double]$Matches[2] }
-        $widthOut = & $FfprobePath -v error -select_streams v:0 -show_entries stream=width -of default=noprint_wrappers=1:nokey=1 $Source 2>$null
+        $widthOut = Invoke-VesProfileFfprobe -FfprobePath $FfprobePath -ProbeArgs @('-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width', '-of', 'default=noprint_wrappers=1:nokey=1', $Source)
         $width = if ($widthOut) { [double]$widthOut.Trim() } else { 0 }
 
         if ($br -gt 0 -and $width -gt 0 -and $height -gt 0 -and $fpsNum -gt 0) {

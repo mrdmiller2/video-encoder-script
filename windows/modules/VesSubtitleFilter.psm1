@@ -20,7 +20,9 @@
 # optimization. Worth revisiting if full-file subtitle probes prove slow
 # on real network shares (tracked, not yet measured).
 
-Import-Module (Join-Path $PSScriptRoot 'VesTimeoutRetry.psm1') -Force
+if (-not (Get-Module -Name VesTimeoutRetry)) {
+    Import-Module (Join-Path $PSScriptRoot 'VesTimeoutRetry.psm1') -Force
+}
 
 $script:StrippedSubtitleLogged = @{}
 
@@ -96,8 +98,18 @@ function Test-VesSubtitleStreamHasRealContent {
     $decodeResult = Invoke-VesFfmpegValidation -FfmpegPath $FfmpegPath -FfmpegArgs $decodeArgs
     $rawSrt = $decodeResult.StdOut
 
-    if ([string]::IsNullOrEmpty($rawSrt) -and $decodeResult.ExitCode -ne 0) {
-        Write-Warning "Subtitle stream s:${Index} in ${Source}: text-decode probe failed/timed out -- keeping rather than risk discarding real content"
+    # Team-review fix (2026-08-02): checking ExitCode independently of
+    # whether $rawSrt is empty, not "empty AND nonzero" -- if ffmpeg
+    # crashes/times out AFTER already flushing some real (or garbage)
+    # partial SRT text to stdout, the old "both" check let a nonzero
+    # exit slip past unflagged, then fed that partial output into the
+    # line-stripper below, which could legitimately net 0 dialogue
+    # lines and return $false (discard) -- silently treating a genuine
+    # subprocess failure as proof of emptiness, the exact invariant
+    # this whole function exists to prevent. Any nonzero exit is now
+    # always ambiguous, regardless of what partial output exists.
+    if ($decodeResult.ExitCode -ne 0) {
+        Write-Warning "Subtitle stream s:${Index} in ${Source}: text-decode probe failed/timed out (exit $($decodeResult.ExitCode)) -- keeping rather than risk discarding real content"
         return $true
     }
 
@@ -145,8 +157,15 @@ function New-VesRealSubtitleMapArgs {
     $subsResult = Invoke-VesFfprobe -FfprobePath $FfprobePath -ProbeArgs $subsArgs
     $subsList = @($subsResult.StdOut -split "`n" | Where-Object { $_ -ne '' })
 
-    if ($subsList.Count -eq 0 -and $subsResult.ExitCode -ne 0) {
-        Write-Warning "Subtitle stream enumeration failed/timed out for ${Source} -- falling back to unfiltered subtitle mapping rather than risk discarding all subtitles"
+    # Team-review fix (2026-08-02): same class of bug as the text-decode
+    # check above -- ExitCode checked independently of whether $subsList
+    # is empty. If ffprobe crashes/times out after already printing SOME
+    # (but not all) stream indices, the old "both" check let that
+    # nonzero exit slip past unflagged and iterate over a truncated
+    # list, silently never even considering whatever subtitle streams
+    # ffprobe hadn't gotten to yet.
+    if ($subsResult.ExitCode -ne 0) {
+        Write-Warning "Subtitle stream enumeration failed/timed out for ${Source} (exit $($subsResult.ExitCode)) -- falling back to unfiltered subtitle mapping rather than risk discarding all subtitles"
         return @('-map', "${InputIndex}:s?")
     }
     if ($subsList.Count -eq 0) {
