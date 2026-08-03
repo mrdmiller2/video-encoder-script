@@ -350,6 +350,33 @@ project's "verify before trusting a review finding" convention.
 testing stays out of scope for this pass (no fixture available on ELVIS);
 tracked as an explicit follow-up, not silently dropped.
 
+## Real bug found building item 6 (2026-08-03), fixed and verified
+
+`VesTitleLock.psm1`'s first working draft had a genuine race, caught by an
+actual two-process test on ELVIS, not by review alone: it did a separate
+`Test-Path`+age pre-flight check, then called the blocking `Enter-VesSharedMutex`
+if that check looked clear. Window between the two calls let a second racing
+process fall into `Enter-VesSharedMutex`'s internal retry loop instead of
+being told "claimed by another" -- it then **queued and won the lock several
+seconds later** once the first process released, instead of skipping the
+title immediately. This is the opposite of bash's non-blocking `mkdir`-based
+claim semantics (loser skips right away, never queues).
+
+Fix: added `Enter-VesSharedMutexOnce` to `VesSharedMutex.psm1` -- a genuine
+single-attempt variant (one `CreateNew`, one reclaim-if-stale attempt, then
+give up) that never loops waiting for another holder. `VesTitleLock.psm1`
+now calls this instead of the blocking primitive, with no separate pre-flight
+check needed (removed -- it was the source of the race, not a safeguard).
+Re-verified with the same two-process test: exactly one process wins, the
+other returns `$null` immediately rather than eventually acquiring.
+
+An earlier draft of the same function also briefly used `Start-Job` to fake
+a bounded wait -- caught before deployment by rereading `VesSharedMutex.psm1`'s
+own header, which already documents that `Start-Job`-spawned children hit a
+persistent Access-Denied against this NAS. Removed in favor of a direct
+in-process call, consistent with why the module warns against that pattern
+in the first place.
+
 ---
 
 ## Cross-cutting notes for reviewers

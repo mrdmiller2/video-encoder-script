@@ -92,6 +92,59 @@ function Enter-VesSharedMutex {
     return $myToken
 }
 
+function Enter-VesSharedMutexOnce {
+    <#
+    .SYNOPSIS
+    Single-attempt (non-blocking) variant of Enter-VesSharedMutex, added
+    2026-08-03 for VesTitleLock.psm1's use: a title claim contested by
+    another machine must be skipped immediately by the caller, never
+    queued and waited on (that's correct for the done-log's short
+    append-lock, which is what Enter-VesSharedMutex's blocking loop was
+    built for, but wrong for a per-title claim -- found via a real
+    two-process race test where a "losing" process ended up blocking in
+    Enter-VesSharedMutex's retry loop and then winning the lock several
+    seconds later once the original holder released, instead of
+    reporting "claimed by another" right away as bash's non-blocking
+    mkdir-based claim does).
+
+    Tries exactly once; if the lock exists and isn't stale, returns
+    $null immediately. If it exists and IS stale, attempts exactly one
+    reclaim (same atomic rename-then-delete as the blocking version) and
+    one follow-up create attempt -- if that also loses the race, returns
+    $null rather than looping. Never blocks waiting for another holder
+    to finish.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$LockPath,
+        [int]$StaleSeconds = 90
+    )
+    $myToken = "$env:COMPUTERNAME.$PID.$(Get-Random).$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
+    $tokenBytes = [System.Text.Encoding]::UTF8.GetBytes($myToken)
+
+    for ($attempt = 0; $attempt -lt 2; $attempt++) {
+        try {
+            $fs = [System.IO.File]::Open($LockPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
+            $fs.Write($tokenBytes, 0, $tokenBytes.Length)
+            $fs.Close()
+            return $myToken
+        } catch [System.IO.IOException] {
+            if ($attempt -eq 1) { return $null }
+            $age = Get-VesSharedMutexAge -LockPath $LockPath
+            if ($age -lt $StaleSeconds) { return $null }
+            $reclaimName = "$LockPath.reclaim.$env:COMPUTERNAME.$PID.$(Get-Random)"
+            try {
+                [System.IO.File]::Move($LockPath, $reclaimName)
+                [System.IO.File]::Delete($reclaimName)
+            } catch {
+                return $null
+            }
+            # Loop once more to attempt CreateNew now that the stale
+            # lock (if our rename actually won the reclaim race) is gone.
+        }
+    }
+    return $null
+}
+
 function Exit-VesSharedMutex {
     <#
     .SYNOPSIS
@@ -164,4 +217,4 @@ function Invoke-VesSharedFileWriteWithRetry {
     }
 }
 
-Export-ModuleMember -Function Get-VesSharedMutexAge, Enter-VesSharedMutex, Exit-VesSharedMutex, Invoke-VesSharedFileWriteWithRetry
+Export-ModuleMember -Function Get-VesSharedMutexAge, Enter-VesSharedMutex, Enter-VesSharedMutexOnce, Exit-VesSharedMutex, Invoke-VesSharedFileWriteWithRetry
