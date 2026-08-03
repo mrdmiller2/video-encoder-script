@@ -128,38 +128,164 @@ function Build-VesHandBrakeArgs {
     return $args
 }
 
+function ConvertFrom-VesHandBrakeJsonBlock {
+    <#
+    .SYNOPSIS
+    Parses an already-accumulated, brace-balanced multi-line JSON block
+    (see Invoke-VesHandBrakeWithProgress's accumulation loop -- real
+    HandBrake --json output spans multiple lines per block, e.g.
+    "Progress: {" then indented fields then a closing "}" on its own
+    line, confirmed via a real captured run, 2026-08-03 -- an initial
+    single-line-JSON assumption was wrong). Extracts the same fields
+    bash's awk reader does, tolerating nesting (HandBrake nests
+    Progress/ETASeconds under a "Working"/"WorkDone" sub-object
+    depending on State) by searching the whole parsed tree rather than
+    assuming a fixed shape.
+    #>
+    param([Parameter(Mandatory)][string]$JsonText)
+    try {
+        $obj = $JsonText | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        return $null
+    }
+    $state = $obj.State
+    $detail = switch ($state) {
+        'WORKING' { $obj.Working }
+        'WORKDONE' { $obj.WorkDone }
+        default { $obj }
+    }
+    return [PSCustomObject]@{
+        State      = $state
+        Percent    = if ($detail -and $null -ne $detail.Progress) { [double]$detail.Progress * 100 } else { $null }
+        EtaSeconds = if ($detail -and $detail.ETASeconds) { [int]$detail.ETASeconds } else { $null }
+        ErrorCode  = if ($detail -and $null -ne $detail.Error) { [int]$detail.Error } else { $null }
+    }
+}
+
 function Invoke-VesHandBrakeWithProgress {
     <#
     .SYNOPSIS
     Port of run_handbrake_with_progress(): runs HandBrakeCLI, parsing
-    `Progress: {...}` JSON lines from its output as they arrive. Uses
-    Invoke-VesTrackedProcess for PID tracking (orphan-reaper
-    identification) same as the ffmpeg path in VesTwoStageEncode.psm1.
+    `Progress: {...}` JSON lines AS THEY ARRIVE, not after the process
+    exits. Confirmed via a real empirical spike (2026-08-03, see
+    DESIGN-remaining6features.md's "Spike 2") that a plain synchronous
+    $reader.ReadLine() loop delivers output incrementally on this
+    runtime -- no FIFO, no separate reader process/thread needed, unlike
+    bash's mkfifo+awk mechanism. Deliberately does NOT use
+    Invoke-VesTrackedProcess here (that wrapper's ReadToEndAsync-based
+    design is specifically buffered-until-exit, the opposite of what
+    this function needs) -- drives System.Diagnostics.Process directly.
+
+    Hard rule, not just an implementation detail: the stderr
+    ReadToEndAsync() task started below must NEVER be awaited
+    (.Result/.Wait()) until AFTER the stdout ReadLine() loop has fully
+    finished. Awaiting it mid-loop would block on stderr completing
+    (i.e. the process exiting) before stdout is ever read again,
+    recreating the exact full-pipe deadlock this design exists to avoid
+    -- flagged explicitly during team review after Spike 2's own script
+    got this right only implicitly.
 
     .PARAMETER OnProgress
-    Optional scriptblock invoked with the parsed progress object per
-    line -- live progress requires reading output incrementally rather
-    than after-the-fact (Invoke-VesTrackedProcess buffers until exit;
-    live progress plumbing is a known follow-up, not yet built here --
-    see ROADMAP.md).
+    Optional scriptblock invoked with each parsed Progress object
+    (State/Percent/EtaSeconds/ErrorCode) as it arrives. Left to the
+    caller to decide how to display it (bash hardcodes a \r-terminated
+    console line; this function doesn't assume that's always wanted).
     #>
     param(
         [Parameter(Mandatory)][string]$HandBrakeCliPath,
         [Parameter(Mandatory)][string[]]$ArgumentList,
-        [Parameter(Mandatory)][string]$ErrorLogPath
+        [Parameter(Mandatory)][string]$ErrorLogPath,
+        [scriptblock]$OnProgress
     )
-    $result = Invoke-VesTrackedProcess -FilePath $HandBrakeCliPath -ArgumentList $ArgumentList -ErrorLogPath $ErrorLogPath
-    $progressLines = @()
-    if ($result.StdOut) {
-        $progressLines = $result.StdOut -split "`r?`n" | Where-Object { $_ -match '^Progress: ' }
-    }
-    return [PSCustomObject]@{
-        ExitCode      = $result.ExitCode
-        ProgressLines = $progressLines
-        StdOut        = $result.StdOut
-        StdErr        = $result.StdErr
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $HandBrakeCliPath
+    # --json is required for parseable Progress lines at all -- confirmed
+    # via a real test (2026-08-03) that omitting it produces human-
+    # readable text instead. Build-VesHandBrakeArgs already includes it
+    # in its own base args -- only add it here if the caller's
+    # ArgumentList doesn't already have it, so it's never duplicated.
+    $argsWithJson = @($ArgumentList)
+    if ($argsWithJson -notcontains '--json') { $argsWithJson += '--json' }
+    foreach ($a in $argsWithJson) { $psi.ArgumentList.Add($a) }
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    $lastState = $null
+    $lastErrorCode = 0
+
+    try {
+        $proc.Start() | Out-Null
+        # Started but NOT awaited here -- see this function's hard rule
+        # above.
+        $stderrTask = $proc.StandardError.ReadToEndAsync()
+
+        $reader = $proc.StandardOutput
+        $blockLines = $null
+        $braceDepth = 0
+        while ($null -ne ($line = $reader.ReadLine())) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+
+            if ($null -eq $blockLines) {
+                # Only "Progress: {" (and other top-level "Xxx: {" blocks
+                # like "Version: {") start a JSON block we care about
+                # accumulating; anything else is a plain human log line.
+                if ($line -match '^\w+: \{') {
+                    $blockLines = New-Object System.Collections.Generic.List[string]
+                    $jsonStart = $line.IndexOf('{')
+                    $openingJson = $line.Substring($jsonStart)
+                    $blockLines.Add($openingJson)
+                    $braceDepth = ([regex]::Matches($openingJson, '\{')).Count - ([regex]::Matches($openingJson, '\}')).Count
+                    $isProgressBlock = $line -match '^Progress: '
+                    if ($braceDepth -le 0 -and $isProgressBlock) {
+                        $progress = ConvertFrom-VesHandBrakeJsonBlock -JsonText ($blockLines -join "`n")
+                        $blockLines = $null
+                        if ($progress) {
+                            $lastState = $progress.State
+                            if ($null -ne $progress.ErrorCode) { $lastErrorCode = $progress.ErrorCode }
+                            if ($OnProgress) { & $OnProgress $progress }
+                        }
+                    } elseif (-not $isProgressBlock) {
+                        $blockLines = $null
+                    }
+                }
+                continue
+            }
+
+            $blockLines.Add($line)
+            $braceDepth += ([regex]::Matches($line, '\{')).Count - ([regex]::Matches($line, '\}')).Count
+            if ($braceDepth -le 0) {
+                $progress = ConvertFrom-VesHandBrakeJsonBlock -JsonText ($blockLines -join "`n")
+                $blockLines = $null
+                if ($progress) {
+                    $lastState = $progress.State
+                    if ($null -ne $progress.ErrorCode) { $lastErrorCode = $progress.ErrorCode }
+                    if ($OnProgress) { & $OnProgress $progress }
+                }
+            }
+        }
+
+        $proc.WaitForExit()
+        # Safe to await now -- the stdout loop above has already hit EOF.
+        $stderrContent = $stderrTask.Result
+        if ($stderrContent) {
+            Set-Content -Path $ErrorLogPath -Value $stderrContent -NoNewline
+        }
+
+        return [PSCustomObject]@{
+            ExitCode      = $proc.ExitCode
+            Success       = ($proc.ExitCode -eq 0 -and $lastErrorCode -eq 0)
+            LastState     = $lastState
+            HandBrakeError = $lastErrorCode
+            ProcessId     = $proc.Id
+        }
+    } finally {
+        $proc.Dispose()
     }
 }
 
 Export-ModuleMember -Function Get-VesHandBrakeCli, Test-VesHandBrakeEncoderAvailable, `
-    Get-VesNvencAv1Cq, Build-VesHandBrakeArgs, Invoke-VesHandBrakeWithProgress
+    Get-VesNvencAv1Cq, Build-VesHandBrakeArgs, ConvertFrom-VesHandBrakeJsonBlock, Invoke-VesHandBrakeWithProgress
