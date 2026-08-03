@@ -119,26 +119,41 @@ window). Windows has no built-in equivalent. Candidates to evaluate:
   (see the v5.0.33R team-review deferred items above) applies here too
   and would need the same "estimate for two staged outputs" fix.
 
-### 3. NFS vs. SMB mounts — NAS supports both, need a decision + both paths tested
+### 3. NFS vs. SMB mounts — decided empirically on ELVIS: SMB is primary
 
-- **SMB is the more natively-Windows-idiomatic choice** — `New-SmbMapping`/
-  `net use` needs no optional Windows feature enabled, works on every
-  Windows SKU including Home, and is what a typical Windows user would
-  expect. Likely the primary/default path.
-- **Windows NFS client** ("Services for NFS") is a genuine alternative —
-  built into Windows but only on Pro/Enterprise/Server SKUs (not Home),
-  enabled via `Enable-WindowsOptionalFeature`. Worth supporting since the
-  NAS already serves NFS to the rest of the fleet and the user
-  explicitly wants both covered, but can't be the only path given the
-  SKU restriction.
-- Either way, this needs the same category of fix already hit
-  repeatedly on the Linux/WSL2 side of the fleet (PRINCE's
-  `noresvport` NFS mount requirement, GruntBox2's WSL2-NAT mount-
-  recovery gap, the NFS root_squash owner-mismatch issue hit multiple
-  times this session during test cleanup) — Windows SMB/NFS have their
-  own analogous permission/credential quirks (SMB credential caching,
-  UNC path length limits, NFS UID mapping without a domain controller)
-  that need discovering empirically on real hardware, not assumed away.
+- **Resolved via real throughput testing on ELVIS (2026-08-02).** Initial
+  numbers on both protocols were nearly identical and abnormally slow
+  (~5.4-5.5 MB/s) — root-caused to three laptop-only NIC power-throttling
+  issues (Balanced power plan, Realtek "Green Ethernet", and the
+  `MSPower_DeviceEnable` "allow Windows to turn off this device" WMI
+  setting), not a protocol difference. After fixing those plus unspecified
+  server-side improvements, a 256MB x2-pass comparison gave: NFS ~24.3→27.5
+  MB/s (consistent across passes, no caching effect), SMB ~42.1 MB/s cold
+  then ~2327 MB/s on the repeat read (served from local cache — a genuine,
+  reproducible caching benefit, not a fluke).
+- **Decision: SMB is the primary/default path**, per both of the explicit
+  criteria set for this comparison — it's faster on genuine (cold) reads
+  (~42 vs ~27 MB/s) AND it demonstrates real local caching that NFS does
+  not. SMB also natively supports `-Persistent $true` for automatic
+  reconnect after reboot; NFS has no equivalent and needed a custom
+  `Register-ScheduledTask`-at-startup workaround just to survive a
+  restart. On ELVIS, `D:\mnt\<Share>\...` (the fleet path convention) now
+  symlinks to the SMB drive letters; NFS stays mounted as a working
+  fallback via its scheduled-task remount.
+- **Windows NFS client** ("Services for NFS") remains available as that
+  fallback — built into Windows but only on Pro/Enterprise/Server SKUs
+  (not Home), enabled via `Enable-WindowsOptionalFeature` — but is no
+  longer the primary path for the port.
+- Real quirks discovered empirically (matching the pattern already hit
+  repeatedly on the Linux/WSL2 side — PRINCE's `noresvport` requirement,
+  GruntBox2's WSL2-NAT mount-recovery gap, NFS root_squash owner
+  mismatches): NFS export paths and SMB share names are DIFFERENT
+  namespaces on the same NAS (e.g. NFS export `\\<nas>\mnt\BigMomma\Media`
+  vs. SMB share simply named `Media`, discoverable via `net view
+  \\<nas> /all`); Windows NFS client only mounts to drive letters, not
+  arbitrary folders (worked around via `mklink /D` to match the fleet's
+  path convention); SMB auth needed the same domain credentials as SSH,
+  not anonymous.
 
 ### 4. Process/execution model — genuine redesign, not a mechanical translation
 
