@@ -131,19 +131,38 @@ window). Windows has no built-in equivalent. Candidates to evaluate:
   MB/s (consistent across passes, no caching effect), SMB ~42.1 MB/s cold
   then ~2327 MB/s on the repeat read (served from local cache — a genuine,
   reproducible caching benefit, not a fluke).
-- **Decision: SMB is the primary/default path**, per both of the explicit
-  criteria set for this comparison — it's faster on genuine (cold) reads
-  (~42 vs ~27 MB/s) AND it demonstrates real local caching that NFS does
-  not. SMB also natively supports `-Persistent $true` for automatic
-  reconnect after reboot; NFS has no equivalent and needed a custom
-  `Register-ScheduledTask`-at-startup workaround just to survive a
-  restart. On ELVIS, `D:\mnt\<Share>\...` (the fleet path convention) now
-  symlinks to the SMB drive letters; NFS stays mounted as a working
-  fallback via its scheduled-task remount.
-- **Windows NFS client** ("Services for NFS") remains available as that
-  fallback — built into Windows but only on Pro/Enterprise/Server SKUs
-  (not Home), enabled via `Enable-WindowsOptionalFeature` — but is no
-  longer the primary path for the port.
+- **Decision: SMB is the primary/default protocol**, per both of the
+  explicit criteria set for this comparison — it's faster on genuine
+  (cold) reads (~42 vs ~27 MB/s) AND it demonstrates real local caching
+  that NFS does not.
+- **Correction, found during reboot testing (2026-08-02): drive-letter
+  persistence (SMB's `-Persistent $true` and NFS's startup-task
+  workaround) does NOT actually solve reboot survival for automation
+  purposes.** Both were verified broken across two real cold reboots —
+  not a config mistake, but a fundamental Windows constraint: network
+  drive-letter mappings (`New-SmbMapping` and NFS `mount.exe` alike) are
+  **per-logon-session**, not machine-global like Linux's `/etc/fstab`.
+  A drive letter mapped by one session (interactive desktop, a
+  scheduled task, an SSH login) is invisible from every other
+  session, regardless of which user account owns it — confirmed by
+  re-registering the NFS remount task to run as `docm` instead of
+  `SYSTEM` (ruling out the session-isolation theory looking like a
+  privilege issue) and still finding zero mounts visible from a fresh
+  SSH session after a clean reboot, despite the task itself reporting
+  success (`LastTaskResult: 0`).
+  **Real architectural conclusion for the actual port (Phase 2/3, not
+  blocking Phase 1): don't depend on a persistent drive letter at all.**
+  Use UNC paths directly (`\\10.10.10.150\Media\...`), which work
+  globally regardless of session — the genuine Windows equivalent of
+  Linux's kernel-level `/etc/fstab` mount, not a per-session drive
+  letter. If a drive letter is still wanted for readability, the fork's
+  own process/service should establish it itself at the start of each
+  run, in its own session, rather than relying on some other process's
+  mapping surviving.
+- **Windows NFS client** ("Services for NFS") remains available as a
+  secondary protocol — built into Windows but only on Pro/Enterprise/
+  Server SKUs (not Home), enabled via `Enable-WindowsOptionalFeature` —
+  but is not the primary path for the port.
 - Real quirks discovered empirically (matching the pattern already hit
   repeatedly on the Linux/WSL2 side — PRINCE's `noresvport` requirement,
   GruntBox2's WSL2-NAT mount-recovery gap, NFS root_squash owner
