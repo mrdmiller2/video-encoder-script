@@ -67,41 +67,33 @@ touched by this port at all. The actual targets:
   The NVIDIA side did prove directly useful for the WSL2-vs-native
   NVENC investigation (section 6) despite not helping the AMD research.
 
-### 1. External tool binaries — mostly solved, needs confirmation
+### 1. External tool binaries — RESOLVED on ELVIS (2026-08-03)
 
-- **ffmpeg/ffprobe**: BtbN's ffmpeg-builds project already ships
-  full-featured static Windows builds (libsvtav1, libx265, libvmaf,
-  libplacebo included) — same source PRINCE already uses today via its
-  WSL-side ffmpeg. No compilation needed; just point at the Windows
-  `.exe` instead of the Linux binary. **Version parity is a hard
-  requirement, not a nice-to-have**: the fleet has a standing constant
-  pinning SVT-AV1 to a specific version (v4.1.0, see
-  [[feedback_svtav1_version_constant]]) specifically so encode behavior
-  stays consistent across every machine. Whatever Windows ffmpeg build
-  gets used must have its bundled SVT-AV1/x265 version (and SIMD build
-  flags — AVX2/AVX-512 support) checked against that pin before use, not
-  just whatever BtbN's latest build happens to include — otherwise the
-  Windows fork could silently diverge in encode output from day one,
-  which directly undermines "Windows follows the primary, doesn't make
-  independent decisions."
-- **HandBrakeCLI**: official Windows builds already exist and are
-  already in active use today (PRINCE's WSL-hybrid setup calls
-  `/mnt/c/Program Files/HandBrake/HandBrakeCLI.exe` directly). Directly
-  reusable, zero porting work.
-- **mkvmerge / mkvpropedit**: MKVToolNix ships official Windows
-  installers — should be a straight binary swap.
-  **mkvalidator**: unconfirmed whether a prebuilt Windows binary exists
-  (on Linux/macOS fleet members it was hand-copied as a binary between
-  machines rather than installed from a package manager, per
-  [[feedback_fleet_tool_parity_optional_tools]]) — may need building
-  from source with MSVC/MinGW, or the PowerShell fork may need to
-  degrade gracefully without it (mkvalidator is already optional/
-  degrades-gracefully in the primary script, per that same memory's
-  caution against treating "optional" as a reason to skip parity
-  checks — the degrade path itself still needs to actually work, not
-  just be assumed to).
-- **ab-av1**: Rust binary, has official Windows release builds on its
-  GitHub releases page — should be a straight download, no compile step.
+- **ffmpeg/ffprobe**: BtbN's ffmpeg-builds project static Windows build
+  in use on ELVIS. **Version parity confirmed, not just assumed**: the
+  real single-file end-to-end test (2026-08-03) recorded
+  `svtav1=4.1;x265=4.2` in its done-log tool fingerprint, matching the
+  fleet's pinned SVT-AV1 v4.1.0 constant
+  ([[feedback_svtav1_version_constant]]).
+- **HandBrakeCLI**: official Windows build in use on ELVIS (WinGet-
+  installed), zero porting work needed, confirmed via 15 real tests
+  ([[project_elvis_orchestration_e2e_2026_08_03]] and the HandBrake/
+  hardware-detect work earlier item 5).
+- **mkvmerge / mkvpropedit**: not yet actually exercised by any real
+  test on this port (the two-stage encode path uses ffmpeg for remux,
+  not mkvmerge) — MKVToolNix's official Windows installer should still
+  be a straight binary swap whenever something needs it, just unverified.
+- **mkvalidator**: **RESOLVED 2026-08-03** — the official Matroska-
+  project prebuilt `mkvalidator-0.6.0-win64.zip` is in use on ELVIS
+  (manual download required, SourceForge blocks scripted downloads with
+  a Cloudflare challenge). An earlier custom from-source build was
+  crashing (0xC0000005 ACCESS_VIOLATION) on genuinely valid files; the
+  official build validated 4/4 real test files cleanly with zero
+  crashes after the swap. Old custom build kept as
+  `mkvalidator.exe.old-custom-build`, not deleted.
+- **ab-av1**: Rust binary, official Windows release build in active use
+  on ELVIS, confirmed working across every real encode test this port
+  has run so far.
 
 ### 2. RAM-disk-equivalent staging — RESOLVED and shipped (2026-08-03)
 
