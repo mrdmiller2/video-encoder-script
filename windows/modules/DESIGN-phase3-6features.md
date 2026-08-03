@@ -377,6 +377,47 @@ persistent Access-Denied against this NAS. Removed in favor of a direct
 in-process call, consistent with why the module warns against that pattern
 in the first place.
 
+## Real bugs found building item 2 (orphan reaper, 2026-08-03), fixed and verified
+
+`VesOrphanReaper.psm1` + `VesValidation.psm1` built and tested (13 real
+tests on ELVIS: real live/dead process detection, self-kill refusal, a
+real target process killed, flag-file parsing across all 5 disposition
+outcomes including a real live encoder process and a real dead one, a real
+Windows junction refused via the reparse-point guard, confirmed
+duration-mismatch deletion, confirmed matching-duration salvage, RAM-disk
+crash-recovery with correct salvage-before-teardown ordering, and title-lock
+crash-recovery that reclaims only the confirmed-dead holder while leaving a
+live holder's lock untouched). Three real bugs found during testing, not
+just review:
+
+1. `Test-VesProcessIsAlive`'s `-RecordedStartTimeUtc` parameter was
+   non-nullable `[datetime]`, but a legitimate flag file can omit
+   `encoder_started_utc` entirely (the legacy/manual-review case) --
+   PowerShell threw a parameter-binding error rather than treating it as
+   "no start time recorded." Fixed with `[Nullable[datetime]]`.
+2. `Invoke-VesRamDiskOrphanRecovery`'s first draft used the SAME resolved
+   path for both the duration-match gate's "source" and the salvage
+   target's "final destination" -- these are genuinely different paths
+   (the true original library file vs. where a salvaged output should
+   land). This made the duration gate compare a candidate against its own
+   not-yet-existent destination, which also tripped the reparse-point
+   refusal for the wrong reason (path didn't exist, not that it was a
+   reparse point). Fixed by replacing the single `-ResolveFinalDestination`
+   parameter with `-ResolveSourceAndDestination`, returning both values
+   explicitly; `Test-VesOrphanCandidateSafeToDispose` also gained an
+   explicit "source doesn't exist" check with its own accurate warning
+   message, separate from the reparse-point check.
+3. (Test-harness-only, not a module bug, confirmed by manually running
+   `mkvalidator` against the same fixture): a synthetic 2-second
+   `color`+`anullsrc` lavfi test clip is itself genuinely flagged invalid
+   by mkvalidator (likely missing proper Cues for such a short
+   single-keyframe clip) -- the module's structure gate was working
+   correctly by rejecting it. The real-movie encode test earlier this
+   project (Twelve in a Box (2007)) already proved a genuinely
+   valid-structure file salvages cleanly through the equivalent finalize
+   path, so this test isolates the duration gate instead of asserting a
+   flawed fixture should pass structure validation.
+
 ---
 
 ## Cross-cutting notes for reviewers
