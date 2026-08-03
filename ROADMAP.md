@@ -103,7 +103,22 @@ touched by this port at all. The actual targets:
 - **ab-av1**: Rust binary, has official Windows release builds on its
   GitHub releases page — should be a straight download, no compile step.
 
-### 2. RAM-disk-equivalent staging — local-disk fallback shipped and verified; RAM disk itself blocked on interactive access
+### 2. RAM-disk-equivalent staging — RESOLVED and shipped (2026-08-03)
+
+**Update 2026-08-03**: ImDisk installed successfully on ELVIS via the
+user sitting at the physical console (the interactive-session blocker
+below is now cleared for this machine). Confirmed working: real
+create/format/write/read/unmount cycle via `imdisk.exe`
+(`C:\Windows\System32\imdisk.exe`, not `Program Files`), and — contrary
+to the SMB/NFS drive-letter finding elsewhere in this doc — ImDisk
+volumes are NOT session-scoped: a disk created over an SSH connection
+(Session 0) was directly confirmed visible in File Explorer on the
+physical console (Session 1) via a real split-session test. Shipped as
+`windows/modules/VesRamDisk.psm1` (job-scoped disk lifecycle, owner-
+marker-based crash attribution, local drive-letter-selection mutex) —
+see [[project_elvis_imdisk_ramdisk_2026_08_03]]. The rest of this
+section (below) is the pre-2026-08-03 history of how the local-disk
+fallback was built while this was still blocked.
 
 Linux/WSL2 fleet members stage encode output on `/dev/shm` or `/tmp`
 (tmpfs, RAM-backed, no disk I/O during the two-stage encode's temp-file
@@ -456,11 +471,30 @@ kinds of work, not one migration applied three times.
    reasoning, least Windows-specific redesign needed.
 3. **Phase 2 — mount/staging infrastructure**: RAM-disk equivalent, SMB
    +NFS mount handling, credential management.
-4. **Phase 3 — fleet infrastructure**: resume state, orphan reaper,
-   sharded directory scanning, detached/scheduled execution model.
-   **Shared cross-host mutex and done-log ported and verified against
-   the real NAS (2026-08-02)**, with two required Windows-specific
-   redesigns, not mechanical translations:
+4. **Phase 3 — fleet infrastructure — RESOLVED and shipped (2026-08-03).**
+   All six planned features built, team-reviewed (Gemini/Codex/Cursor),
+   and verified with real tests on ELVIS: `VesRamDisk.psm1` (RAM disk
+   staging, 8 tests), `VesTitleLock.psm1` (multi-machine per-title
+   claim coordination, 7 tests incl. a genuine two-process race),
+   `VesOrphanReaper.psm1` + `VesValidation.psm1` (crash-recovery/salvage-
+   or-delete safety logic, 13 tests), `VesShardedScan.psm1`
+   (per-directory scan chunking, 7 tests), `VesResumeState.psm1`
+   (per-hostname sidecar persistence, 10 tests incl. a real NAS round
+   trip), `VesHwDetect.psm1` + `VesHandBrake.psm1` (hardware-encoder
+   detection + HandBrake invocation, 15 tests incl. real HEVC/AV1 NVENC
+   probes reproducing the Turing-hardware-ceiling finding from item 6
+   below). Full design doc, review findings, and every real bug found
+   during building (several genuine, not just review-flagged) are in
+   `windows/modules/DESIGN-phase3-6features.md` — including a notable
+   self-caught-and-corrected regression around PowerShell's array-
+   unrolling behavior on function returns, worth reading before writing
+   any new Ves* module that returns a collection.
+
+   Original resume-state/orphan-reaper/sharded-scan/detached-execution
+   scoping note, and the shared cross-host mutex/done-log work that
+   predated this pass (both **ported and verified against the real NAS,
+   2026-08-02**), with two required Windows-specific redesigns, not
+   mechanical translations, follow below for historical context:
    - The mutex uses atomic exclusive file creation
      (`FileMode.CreateNew`) instead of bash's `mkdir`, since directory
      creation hits the same broken-ACL bug found in Phase 2. Also found
