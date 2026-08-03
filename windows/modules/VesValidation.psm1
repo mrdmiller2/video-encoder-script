@@ -69,7 +69,21 @@ function Test-VesMkvStructureValid {
     $result = Invoke-VesWithTimeoutRetry -FilePath $MkvalidatorPath -ArgumentList @($Path) `
         -TimeoutSeconds $TimeoutSeconds -MaxRetries 1
     if ($result.TimedOut) { return $null }
-    return ($result.ExitCode -eq 0)
+    if ($result.ExitCode -eq 0) { return $true }
+    # A negative exit code means the PROCESS ITSELF crashed (an unhandled
+    # Windows exception -- e.g. -1073741819 / 0xC0000005 ACCESS_VIOLATION),
+    # not that mkvalidator examined the file and found it invalid. Found
+    # via a real test on ELVIS (2026-08-03): mkvalidator crashed on a
+    # genuinely valid real-world encode output (confirmed independently:
+    # duration matched source to 3ms, correct AV1/Opus stream layout, a
+    # full ffmpeg decode read the entire file with zero errors) -- treating
+    # that crash as "structurally invalid" would have wrongly discarded a
+    # good file. A real validation failure mkvalidator itself reports uses
+    # a small positive exit code, never a large negative one, so this
+    # distinction is reliable, not a guess. Crash is ambiguous, same as a
+    # timeout -- never proof of corruption.
+    if ($result.ExitCode -lt 0) { return $null }
+    return $false
 }
 
 function Test-VesPathIsReparsePoint {

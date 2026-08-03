@@ -350,6 +350,67 @@ project's "verify before trusting a review finding" convention.
 testing stays out of scope for this pass (no fixture available on ELVIS);
 tracked as an explicit follow-up, not silently dropped.
 
+## Phase 4/5: real orchestration script + end-to-end proof (2026-08-03)
+
+Built `windows/convert.ps1`, the first real top-level entry point wiring
+every Ves* module built in Phases 1-3 into an actual runnable tool
+(scan -> orphan-reap -> per-file claim -> profile/CRF/encode -> validate
+-> finalize -> done-log -> resume-state). Deployed to ELVIS at
+`D:\VES-ELVIS\script\convert.ps1` + `modules\` (the real fleet onboarding
+layout -- Phase 5). Old accumulated debug/test/build scripts on ELVIS
+cleaned up per the project's deployment-hygiene convention.
+
+**Two real bugs found by the end-to-end test itself, not by review:**
+
+1. `Get-VesDetectedProfileForPath` returned an empty string against a
+   test file copied into an isolated scratch folder for scope control --
+   correct behavior, not a bug: profile auto-detection depends on the
+   real `Movies/<Lang>/<Category>` / `Television/<Country>/<Category>`
+   folder structure, which a scratch copy doesn't have. Fixed by using
+   `-ForceProfile` (this port's equivalent of bash's `--profile`
+   override), the documented mechanism for exactly this case.
+2. **Real bug, not a test artifact**: `mkvalidator.exe` crashed (exit
+   code -1073741819 / 0xC0000005, Windows ACCESS_VIOLATION) on a
+   genuinely valid real-world encode output. `Test-VesMkvStructureValid`
+   was treating ANY nonzero exit code as "structurally invalid,"
+   including this crash -- which would have discarded a good file.
+   Independently verified the file was actually fine before concluding
+   this: duration matched source to 3ms, correct AV1/Opus stream layout,
+   and a full `ffmpeg -f null -` decode of the entire ~57-minute file
+   completed with zero errors. Fixed: negative exit codes (the reliable
+   signature of an unhandled Windows exception, never used by a tool's
+   own normal "invalid" exit path) are now treated as ambiguous (`$null`),
+   not `$false` -- same "ambiguous is never proof of corruption"
+   invariant this project applies everywhere else. `mkvalidator v0.6.0`
+   on Windows matches the fleet's pinned version number, but this crash
+   suggests the Windows build itself may have a real quality issue worth
+   tracking (see ROADMAP.md) -- not something to fix in this port (it's a
+   third-party binary), but worth knowing structure validation may
+   silently degrade to duration+decode-only confidence on some files
+   until/unless a better Windows mkvalidator build is found.
+
+**Real end-to-end proof, both successful after the above fixes:**
+
+- **Single-file test**: `2 Dope Queens S01E01.mkv` (a real TV episode,
+  477.4MB) -> 195.9MB (59% shrink), CRF 45, VMAF 90.05. Verified: exactly
+  one done-log entry, no stray lock/in-progress files, clean RAM disk
+  teardown, SVT-AV1 v4.1 confirmed matching the fleet's pinned version.
+- **Multi-file queue test**: 3 more real episodes (S01E02-04) processed
+  sequentially in one run -- 3 found, 3 processed, 3 ok, 0 failed, 0
+  wrongly done-log-skipped. Verified: exactly 3 done-log entries (one
+  per file), correct per-file done-log fast-skip behavior confirmed live
+  in the transcript ("Done-log: N finished source(s) on record" growing
+  correctly job to job), no stray locks/processes, clean RAM disk
+  teardown, and a correct final resume-state snapshot
+  (`last_index":"3"`, `"last_status":"completed"`, `"queue_total":"3"`).
+
+Both tests used real production content (copied locally for deterministic
+test-scope control, source bytes never touched -- non-in-place mode by
+default), not synthetic fixtures, and exercised the full real pipeline
+including RAM disk staging, VMAF CRF search, two-stage encode, and
+title-lock claim/release -- the first genuine proof this port's Phase
+1-3 modules work correctly composed together, not just individually.
+
 ## Item 5 (HandBrake/hardware) built and verified (2026-08-03)
 
 `VesHwDetect.psm1` (ffmpeg-based real-encode probes + fixed

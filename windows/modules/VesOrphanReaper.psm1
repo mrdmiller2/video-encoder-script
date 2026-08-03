@@ -34,6 +34,55 @@ if (-not (Get-Module -Name VesTitleLock)) {
     Import-Module (Join-Path $PSScriptRoot 'VesTitleLock.psm1') -Force
 }
 
+function New-VesInProgressFlag {
+    <#
+    .SYNOPSIS
+    Port of place_in_progress_flag()'s flag-file write (the counterpart
+    to this module's own Get-VesOrphanFlagCandidates reader) -- written
+    by the orchestration script at the start of each per-file job so a
+    future crash-recovery pass has something to find. This is purely
+    informational bookkeeping (unlike VesTitleLock's actual claim
+    mechanism, which is what really prevents two machines encoding the
+    same title) -- it records THIS process's identity for the orphan
+    reaper to later evaluate.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][int]$EncoderPid,
+        [string]$EncoderFingerprint,
+        [string]$FlagSuffix = 'convert.IN_PROGRESS'
+    )
+    $flagPath = "$Source.$FlagSuffix"
+    $lines = @(
+        "pid=$PID",
+        "host=$env:COMPUTERNAME",
+        "encoder_pid=$EncoderPid",
+        "encoder_started_utc=$([DateTimeOffset]::UtcNow.ToString('o'))",
+        "source=$Source"
+    )
+    if ($EncoderFingerprint) { $lines += "encoder_fingerprint=$EncoderFingerprint" }
+    try {
+        [System.IO.File]::WriteAllLines($flagPath, $lines)
+        return $flagPath
+    } catch {
+        Write-Warning "Could not write in-progress flag for $Source -- $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Clear-VesInProgressFlag {
+    <#
+    .SYNOPSIS
+    Port of clear_in_progress_flag(). Idempotent -- tolerates the flag
+    already being gone.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [string]$FlagSuffix = 'convert.IN_PROGRESS'
+    )
+    Remove-VesFileRobust -Path "$Source.$FlagSuffix"
+}
+
 function Test-VesProcessIsAlive {
     <#
     .SYNOPSIS
@@ -385,6 +434,7 @@ function Invoke-VesTitleLockOrphanRecovery {
     return $reclaimed
 }
 
-Export-ModuleMember -Function Test-VesProcessIsAlive, Invoke-VesKillOrphanedProcess, `
-    Get-VesOrphanFlagCandidates, Get-VesOrphanDisposition, Test-VesOrphanCandidateSafeToDispose, `
-    Invoke-VesOrphanCandidateDisposal, Invoke-VesRamDiskOrphanRecovery, Invoke-VesTitleLockOrphanRecovery
+Export-ModuleMember -Function New-VesInProgressFlag, Clear-VesInProgressFlag, Test-VesProcessIsAlive, `
+    Invoke-VesKillOrphanedProcess, Get-VesOrphanFlagCandidates, Get-VesOrphanDisposition, `
+    Test-VesOrphanCandidateSafeToDispose, Invoke-VesOrphanCandidateDisposal, `
+    Invoke-VesRamDiskOrphanRecovery, Invoke-VesTitleLockOrphanRecovery
