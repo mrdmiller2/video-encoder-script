@@ -233,14 +233,25 @@ window). Windows has no built-in equivalent.
 
 ### 4. Process/execution model — genuine redesign, not a mechanical translation
 
-- **Detached/survives-session execution** (this session's `systemd-run
-  --unit=... --uid=worker` pattern, used constantly for real fleet
-  tests): Windows equivalent is most likely a Scheduled Task
-  (`Register-ScheduledTask`) for one-shot detached runs, or a proper
-  Windows Service for the always-on fleet-agent role GruntBox2 already
-  approximates today via its `VES-WSL-Keepalive` Scheduled Task +
-  `.wslconfig` idle-timeout workaround (a workaround this whole port
-  would eliminate the NEED for, ironically).
+- **Detached/survives-session execution — resolved and shipped
+  (2026-08-02).** Confirmed via direct testing, found while running a
+  real end-to-end encode test on ELVIS: `Start-Process` launched over
+  an SSH-invoked PowerShell session gets KILLED the moment that SSH
+  connection closes (Windows OpenSSH ties spawned children to the
+  session's own Job Object, no client-side opt-out). A one-shot
+  Scheduled Task (`Register-ScheduledTask`) is NOT tied to that Job
+  Object and survives teardown — verified with a real split-connection
+  test: launched via one short-lived SSH connection that fully closed
+  immediately, confirmed complete from a totally separate, later
+  connection. This is now the required mechanism for any orchestration
+  script launching a real encode job remotely; shipped as
+  `windows/modules/VesDetachedExecution.psm1`
+  (Start-VesDetachedProcess/Get-VesDetachedProcessStatus/
+  Wait-VesDetachedProcess/Stop-VesDetachedProcess). A proper Windows
+  Service for the always-on fleet-agent role (matching GruntBox2's
+  `VES-WSL-Keepalive` Scheduled Task + `.wslconfig` workaround, which
+  this whole port would eliminate the need for) is a separate,
+  not-yet-addressed piece.
 - **Signal handling / cleanup traps** (`trap ... EXIT`,
   `ramdisk_job_teardown`, `resume_on_signal`, `ACTIVE_FFMPEG_STAGE1_FILE`
   cleanup): PowerShell's nearest equivalents are `try/finally`,
