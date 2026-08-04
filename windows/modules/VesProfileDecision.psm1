@@ -441,6 +441,19 @@ function Build-VesFfmpegVideoArgs {
     Returns $null (Dolby Vision profile 5 without libplacebo) when the
     caller must flag the source for human review instead of encoding --
     matching build_ffmpeg_video_args()'s rc=2 contract.
+
+    Real bug found 2026-08-03: -SvtPreset/-X265Preset defaulted to '8'/
+    'medium' -- bash's own SEARCH-only presets (SVT_PRESET_SEARCH=8,
+    the fast-sample preset used only for VMAF CRF-search comparisons in
+    VesVmafCrfSearch.psm1), not its FINAL-encode presets
+    (SVT_PRESET_FINAL=5, X265_PRESET_FINAL=slow). Every real encode this
+    port has produced to date used the fast/lower-quality search preset
+    instead of the intended final-quality one. Found via a genuine SVT-AV1
+    crash on GruntBox2's pre-AVX2 Xeon X5570 at preset 8 (reproduced
+    identically on that host's Linux/WSL2 side with the same ffmpeg/
+    SVT-AV1 build -- a real upstream SVT-AV1 crash at preset>6 on this
+    CPU generation, not a Windows-specific bug), which is what surfaced
+    that preset 8 was ever reaching a final encode in the first place.
     #>
     param(
         [Parameter(Mandatory)][ValidateSet('av1', 'hevc')][string]$Codec,
@@ -453,8 +466,8 @@ function Build-VesFfmpegVideoArgs {
         [Parameter(Mandatory)][string]$FfprobePath,
         [int]$UpscaleTargetHeight = 0,
         [bool]$FfmpegHasLibPlacebo = $false,
-        [string]$SvtPreset = '8',
-        [string]$X265Preset = 'medium'
+        [string]$SvtPreset = '5',
+        [string]$X265Preset = 'slow'
     )
 
     $videoFilters = [System.Collections.Generic.List[string]]::new()

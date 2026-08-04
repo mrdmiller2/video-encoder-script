@@ -190,9 +190,21 @@ function Import-VesDoneLog {
     # small files on this NAS (not hung, genuinely that slow per-call),
     # consistent with the FileSystem-provider-cmdlet overhead already
     # found elsewhere this session. The raw .NET APIs are fast here.
+    #
+    # Real bug found 2026-08-03: the parameterless GetFiles() overload
+    # enumerates EVERY file in $DoneLogDir, not just done-log entries.
+    # Add-VesDoneLogEntry always names entries "*.tsv" (see that
+    # function) -- an unfiltered scan works fine for an ordinary movie
+    # folder (a modest video file plus small sidecars), but a disc
+    # source's media-content-dir (Get-VesDiscMediaContentDir) is the
+    # folder containing the multi-GB .ISO itself. ReadAllText() on a
+    # 22GB ISO over SMB hung for 90+ minutes in real testing -- caught
+    # via a stuck detached task with near-zero CPU and no further log
+    # output. Filtering to the real "*.tsv" entry pattern fixes this
+    # generally, not just for disc sources.
     $n = 0
     $entryMTimes = @{}
-    foreach ($filePath in [System.IO.Directory]::GetFiles($DoneLogDir)) {
+    foreach ($filePath in [System.IO.Directory]::GetFiles($DoneLogDir, '*.tsv')) {
         $line = $null
         try { $line = [System.IO.File]::ReadAllText($filePath) } catch { }
         $file = [PSCustomObject]@{ LastWriteTimeUtc = [System.IO.File]::GetLastWriteTimeUtc($filePath) }

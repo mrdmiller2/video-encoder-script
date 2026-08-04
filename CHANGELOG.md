@@ -4,6 +4,120 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.0.33U — 2026-08-04
+
+Found and fixed a real performance regression in v5.0.33T's fast stream-copy
+disc extraction within hours of that version reaching the fleet: the fast
+path worked exactly as designed and measured (~45s) when validated against a
+locally-staged copy of a disc, but real fleet usage always sources discs from
+the NAS over the network -- and ffmpeg's libbluray-based `bluray:` protocol
+does many small seeky reads for BD navigation structures, which is
+catastrophically slow over network latency (~0.27MB/s observed against a
+real NAS-hosted ISO -- 16+ hours for a typical disc, actually slower than
+the x264 method this feature exists to replace). A plain sequential file
+copy of the exact same network ISO ran at normal throughput, confirming the
+bottleneck is libbluray's own read pattern, not the network link.
+
+Fix: `stage_disc_source_local()` (bash) / `Copy-VesDiscSourceLocal`
+(PowerShell) copies the disc source (`.iso` file or BDMV directory tree) to
+local scratch first via a plain bulk copy (`cp -a` / `robocopy.exe`), THEN
+the already-proven-fast libbluray stream-copy runs against the local copy.
+Total wall time for a real disc is now a few minutes (staging copy + ~45s
+local stream-copy) rather than 45 seconds flat, but still a dramatic win
+over the original 12+ hour x264 path -- not unsafe as shipped in 33T (the
+fast path's own timeout still falls back correctly), just wasteful (~10
+minutes burned before falling back on every real disc job).
+
+Caught a genuine bug of my own while implementing this, not by the delta
+review: bash's `trap ... RETURN` is a single GLOBAL trap table, not
+function-scoped, despite reading like it should be -- confirmed empirically
+after two independent AI reviewers gave contradictory answers on this exact
+question. Left unguarded, the cleanup trap for the local raw disc copy would
+also have fired on the NEXT function return anywhere in the script,
+evaluating whatever `$local_src` happened to be in scope at that later
+point. Fixed by having the trap unset itself (`trap - RETURN`) as its own
+last action.
+
+Also fixed from the delta review (Gemini/Codex/Cursor): the local-staging
+copy's timeout was bumped from 3600s to 10800s on both platforms (all three
+reviewers independently flagged 3600s as tight enough to false-fail a
+genuinely healthy but slower network link, silently defeating the whole
+fix by falling back to the 12+ hour path); Windows' robocopy exit-code
+check now also rejects negative exit codes explicitly, not just `>= 8`;
+the local raw copy's cleanup on Windows now retries briefly rather than a
+single silent-failure `Remove-Item`, since a disc-sized (tens of GB) leak
+from one missed delete is a real cost; and the local source path is
+defensively trimmed of a trailing backslash before being interpolated into
+ffmpeg/ffprobe's `bluray:` argument (a known Windows command-line escaping
+hazard, not confirmed reachable in practice but cheap to close off).
+
+`bash -n` passes; the PowerShell module parses and imports cleanly. Verified
+end-to-end against the real Blu-ray title used throughout this investigation
+(`The Lazarus Effect (2015)`, 83.5 minutes) via ELVIS's actual `convert.ps1`
+pipeline, sourced from the real NAS path this time (not a local copy, which
+is what let 33T's regression slip through validation in the first place):
+"Fast stream-copy extraction OK", pipeline proceeded cleanly into VMAF/AV1
+encoding. Scan + local staging copy of the 21.5GB source + local stream-copy
+completed in ~16.5 minutes total -- still a dramatic win over the original
+12+ hour x264 path, now genuinely proven against real network-hosted
+content rather than a local copy.
+
+## v5.0.33T — 2026-08-04
+
+Replaced disc-title extraction's expensive lossless workaround with a genuine
+zero-recompression stream-copy, on both bash and the Windows PowerShell port.
+`handbrake_extract_disc_title_lossless()` previously used HandBrakeCLI's
+`-e x264 -q 0` (near-lossless re-encode, since HandBrake has no true video
+passthrough) as its only extraction path -- discovered during a live ELVIS
+disc-source test to take 12+ hours and produce output LARGER than the source
+disc for an 83.5-minute movie. ffmpeg (built with `--enable-libbluray`) can
+open a disc source directly via the `bluray:` protocol -- no OS-level mount
+needed, works against a raw `.iso` or a BDMV directory -- and do a genuine
+`-c copy` stream-copy: byte-identical video, full DTS-HD MA audio preserved
+(verified via `profile=` on the copied streams, not just the backward-
+compatible core), in ~45 seconds against the same real title.
+
+New `try_fast_stream_copy_disc_extraction()` (bash) /
+`Invoke-VesFastStreamCopyDiscExtraction` (PowerShell) is tried first;
+`handbrake_extract_disc_title_lossless()` falls back to the original x264
+-q 0 path unconditionally whenever the fast path can't confidently identify
+the correct title. Safety gates, hardened through a 3-way independent
+review (Gemini/Codex/Cursor, all three converged on the same core issues):
+
+- **Duration-uniqueness, not just duration-match.** A duration match alone
+  can't distinguish two full-length playlists of near-identical runtime on
+  playlist-obfuscated/multi-angle discs. `select_dominant_disk_title()` /
+  `Select-VesDominantDiskTitle` now checks every title on the disc and
+  refuses the fast path outright if another title's duration falls within
+  tolerance of the selected one. This merged what used to be two separate
+  HandBrake scans (`--main-feature` then a full scan) into one, since a
+  full scan's own text already carries the "+ Main Feature" flag when one
+  exists -- also fixes a real performance redundancy the review caught.
+- **Fail closed on unprobeable output, not fail open.** The original draft
+  of the post-copy duration re-check treated "ffprobe couldn't determine
+  the output's duration" as "trust it" instead of "reject it" -- exactly
+  backwards. All three reviewers independently flagged this; fixed on both
+  platforms to discard and fall back whenever the output duration can't be
+  positively confirmed.
+- PowerShell-specific fixes found in the same review: the disc-extraction-
+  target collision check used `-PathType Leaf`, silently letting a same-
+  named directory through; the free-space check on a UNC/network scratch
+  path read `$null.Free`, which PowerShell coerces to 0 in a numeric
+  comparison, so the check silently failed closed on every disc whenever
+  the scratch dir lived on a network share.
+- A genuine subshell-scoping bug caught during implementation, not by the
+  external review: bash's `$(...)` forks a subshell, so an early draft that
+  tried to communicate the duration-uniqueness result via a plain global
+  variable set inside `select_dominant_disk_title()` would never have
+  reached the caller (every call site invokes it via command substitution).
+  Fixed by encoding the flag into the function's own colon-delimited return
+  value instead.
+
+Verified end-to-end against a real Blu-ray title (`The Lazarus Effect
+(2015)`, 83.5 minutes) via ELVIS's actual `convert.ps1` pipeline, not a
+standalone script. `bash -n` passes; the PowerShell module parses and
+imports cleanly.
+
 ## v5.0.33S — 2026-08-02
 
 Added optional Telegram job-completion notifications, requested after a

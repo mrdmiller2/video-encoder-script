@@ -87,7 +87,7 @@ function New-VesRamDiskJob {
     param(
         [int]$PercentOfAvailable = 40,
         [long]$MinSizeBytes = 256MB,
-        [long]$MaxSizeBytes = 16GB
+        [long]$MaxSizeBytes = 32GB
     )
 
     $avail = Get-VesAvailableMemoryBytes

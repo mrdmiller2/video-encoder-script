@@ -36,6 +36,129 @@ if (-not (Get-Module -Name VesProfileDecision)) {
 
 $script:VmafCrfCache = @{}
 
+# Real bug found 2026-08-03, root-caused via team research (2026-08-03):
+# SVT-AV1 v4.1.0-279-gd3c4cb394's SSSE3 kernel
+# (Source/Lib/ASM_SSSE3/subpel_variance_ssse3.asm, an unaligned-buffer
+# `mova` used only by the fast-preset lpd1/subpel-search path reached at
+# preset 8+) segfaults/access-violates on pre-AVX2 CPUs. Upstream fixed
+# 2026-07-18 (after our pinned snapshot); note v4.2.0 does NOT contain
+# the fix either (tagged before the fix merged) -- do not assume a
+# version-tag bump alone resolves this. SVT_PRESET_SEARCH=8 (bash) /
+# the ab-av1 search preset here are exactly the affected value.
+# Real runtime workaround (no rebuild/version change): `asm=sse3` in
+# -svtav1-params forces SIMD dispatch below the buggy SSSE3 kernel.
+# Team consensus (Codex + Cursor, 2026-08-03) against applying this
+# fleet-wide unconditionally -- it demotes AVX2/AVX-512 machines' SIMD
+# level too, a real perf cost for zero benefit on unaffected hardware.
+# Instead: an empirical, one-time, sticky probe using a REAL short trim
+# of actual source content (not a synthetic clip -- confirmed via this
+# same investigation that a probe must exercise the genuine lpd1/subpel
+# code path, which a trivial 1-frame black clip may not reach) at
+# preset 8 with a direct ffmpeg invocation (bypassing ab-av1, whose own
+# exit-code behavior on an internal SVT-AV1 crash isn't verified) --
+# never a CPU-model/family allowlist, matching this project's other
+# hardware probes (Test-VesHwEncoderAvailable, etc).
+$script:VesSvtAv1Preset8Probed = $false
+# One of: 'Safe' (preset 8 works as-is), 'NeedsSse3' (asm=sse3 confirmed
+# to fix it -- caller must inject it), 'Broken' (crashes even with the
+# workaround -- caller must not attempt an AV1 ab-av1 search at all).
+$script:VesSvtAv1Preset8State = 'Safe'
+
+function Test-VesSvtAv1Preset8Safe {
+    <#
+    .SYNOPSIS
+    One-time, sticky, empirical probe: does this host's SVT-AV1 build
+    crash at preset 8 (the ab-av1 search preset)? Runs a short (~2s)
+    direct ffmpeg encode of real source content at preset 8 with
+    default SIMD dispatch; on a crash-like failure, retries the same
+    clip with asm=sse3 to confirm the workaround actually resolves it
+    before trusting it. Caches the result for the rest of this process
+    -- never re-probes.
+
+    Real bug found in this probe itself, 2026-08-03: an earlier version
+    used a single boolean to represent three real outcomes (safe /
+    needs-workaround / broken-even-with-workaround), which silently
+    conflated "no workaround needed" with "workaround doesn't help
+    either" -- both left the flag false, so a cached re-check on a
+    genuinely broken host wrongly reported "safe". Fixed by returning
+    a real three-state result, cached as such.
+
+    .OUTPUTS
+    'Safe', 'NeedsSse3', or 'Broken' -- see $script:VesSvtAv1Preset8State
+    doc comment above for what the caller must do for each.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$FfmpegPath,
+        [Parameter(Mandatory)][string]$Source,
+        [int]$TimeoutSeconds = 60
+    )
+    if ($script:VesSvtAv1Preset8Probed) {
+        return $script:VesSvtAv1Preset8State
+    }
+    $script:VesSvtAv1Preset8Probed = $true
+
+    $probeOut = Join-Path ([System.IO.Path]::GetTempPath()) "ves-svtav1-probe-$PID.mkv"
+    $baseArgs = @('-y', '-v', 'error', '-i', $Source, '-t', '2', '-map', '0:v:0',
+        '-c:v', 'libsvtav1', '-preset', '8', '-crf', '35', '-pix_fmt', 'yuv420p10le', '-an', '-f', 'matroska')
+
+    try {
+        $default = Invoke-VesProbeFfmpegRun -FfmpegPath $FfmpegPath -Args ($baseArgs + @('-svtav1-params', 'enable-qm=1', $probeOut)) -TimeoutSeconds $TimeoutSeconds
+        if ($default.Ok) {
+            Write-Host 'SVT-AV1 preset-8 probe: OK, no workaround needed'
+            $script:VesSvtAv1Preset8State = 'Safe'
+            return $script:VesSvtAv1Preset8State
+        }
+        Write-Warning "SVT-AV1 preset-8 probe crashed (exitcode=$($default.ExitCode)) -- this matches a known upstream SVT-AV1 bug on pre-AVX2 CPUs (unaligned SSSE3 access in the fast-preset subpel-search path); retrying with asm=sse3 workaround"
+
+        $withWorkaround = Invoke-VesProbeFfmpegRun -FfmpegPath $FfmpegPath -Args ($baseArgs + @('-svtav1-params', 'enable-qm=1:asm=sse3', $probeOut)) -TimeoutSeconds $TimeoutSeconds
+        if ($withWorkaround.Ok) {
+            Write-Warning 'SVT-AV1 preset-8 probe: asm=sse3 workaround confirmed working -- will be applied to all AV1 VMAF CRF-search encodes on this host for the rest of this run'
+            $script:VesSvtAv1Preset8State = 'NeedsSse3'
+            return $script:VesSvtAv1Preset8State
+        }
+        Write-Warning "SVT-AV1 preset-8 probe: crashed even with asm=sse3 (exitcode=$($withWorkaround.ExitCode)) -- workaround does not fix it on this host. Skipping AV1 VMAF CRF-search entirely for the rest of this run (fixed-CRF only) rather than risking further crashes"
+        $script:VesSvtAv1Preset8State = 'Broken'
+        return $script:VesSvtAv1Preset8State
+    } finally {
+        Remove-Item $probeOut -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-VesProbeFfmpegRun {
+    param(
+        [Parameter(Mandatory)][string]$FfmpegPath,
+        [Parameter(Mandatory)][string[]]$Args,
+        [Parameter(Mandatory)][int]$TimeoutSeconds
+    )
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $FfmpegPath
+    foreach ($a in $Args) { $psi.ArgumentList.Add($a) }
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    try {
+        $proc.Start() | Out-Null
+        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        $stderrTask = $proc.StandardError.ReadToEndAsync()
+        $finished = $proc.WaitForExit($TimeoutSeconds * 1000)
+        if (-not $finished) {
+            try { $proc.Kill($true) } catch { }
+            $proc.WaitForExit()
+            return [PSCustomObject]@{ Ok = $false; ExitCode = 124 }
+        }
+        [System.Threading.Tasks.Task]::WaitAll(@($stdoutTask, $stderrTask))
+        # A native crash (STATUS_ACCESS_VIOLATION 0xC0000005 on Windows,
+        # SIGSEGV on Linux) always surfaces as a nonzero exit code here --
+        # never key on the exact negative/signed value, per team review.
+        return [PSCustomObject]@{ Ok = ($proc.ExitCode -eq 0); ExitCode = $proc.ExitCode }
+    } finally {
+        $proc.Dispose()
+    }
+}
+
 function Get-VesVideoHeight {
     param(
         [Parameter(Mandatory)][string]$Source,
@@ -188,6 +311,7 @@ function Resolve-VesCrfForEncode {
         [bool]$DryRun = $false,
         [Nullable[bool]]$ProfileUsesGrainSynthesis = $null,
         [string]$AbAv1Path,
+        [string]$FfmpegPath,
         [string]$FfprobePath,
         [string[]]$EncoderArgs = @(),
         [string]$VideoFilter
@@ -234,10 +358,27 @@ function Resolve-VesCrfForEncode {
     $grainSynthesis = if ($null -ne $ProfileUsesGrainSynthesis) { $ProfileUsesGrainSynthesis } else { Test-VesProfileUsesGrainSynthesis -Profile $Profile }
     $canUseAbAv1 = ($Codec -ne 'av1') -or (-not $grainSynthesis)
     $result = $null
+    if ($canUseAbAv1 -and $Codec -eq 'av1' -and $FfmpegPath) {
+        $preset8State = Test-VesSvtAv1Preset8Safe -FfmpegPath $FfmpegPath -Source $Source
+        if ($preset8State -eq 'Broken') {
+            Write-Warning "SVT-AV1 preset 8 crashes on this host even with the asm=sse3 workaround -- skipping AV1 VMAF CRF-search entirely (fixed CRF $FixedCrf) rather than risking a crash"
+            $canUseAbAv1 = $false
+        }
+    }
     if ($canUseAbAv1 -and $AbAv1Path) {
+        $searchEncoderArgs = $EncoderArgs
+        if ($Codec -eq 'av1' -and $preset8State -eq 'NeedsSse3') {
+            $searchEncoderArgs = @($EncoderArgs)
+            for ($i = 0; $i -lt $searchEncoderArgs.Count - 1; $i++) {
+                if ($searchEncoderArgs[$i] -eq '--svt') {
+                    $searchEncoderArgs[$i + 1] = "$($searchEncoderArgs[$i + 1]):asm=sse3"
+                    break
+                }
+            }
+        }
         $result = Invoke-VesVmafCrfSearchAbAv1 -Source $Source -Codec $Codec -Target $VmafTarget -Model $model `
-            -AbAv1Path $AbAv1Path -EncoderArgs $EncoderArgs -VideoFilter $VideoFilter
-    } elseif (-not $canUseAbAv1) {
+            -AbAv1Path $AbAv1Path -EncoderArgs $searchEncoderArgs -VideoFilter $VideoFilter
+    } elseif (-not $canUseAbAv1 -and $grainSynthesis -and $Codec -eq 'av1') {
         Write-Warning "Profile '$Profile' uses AV1 grain synthesis -- ab-av1's VMAF scoring can't account for it (upstream limitation), and the internal grain-aware search isn't ported yet -- using fixed CRF $FixedCrf instead of a potentially-wrong VMAF-searched value"
     }
 
@@ -252,4 +393,4 @@ function Resolve-VesCrfForEncode {
     return $result.Crf
 }
 
-Export-ModuleMember -Function Get-VesVideoHeight, Get-VesVmafModelForSource, Invoke-VesVmafCrfSearchAbAv1, Resolve-VesCrfForEncode
+Export-ModuleMember -Function Get-VesVideoHeight, Get-VesVmafModelForSource, Invoke-VesVmafCrfSearchAbAv1, Resolve-VesCrfForEncode, Test-VesSvtAv1Preset8Safe

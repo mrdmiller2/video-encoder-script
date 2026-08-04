@@ -113,7 +113,7 @@ function Invoke-VesTwoStageEncode {
     try {
         # --- Stage 1: video + audio only ---
         $stage1Args = @('-y', '-nostdin', '-v', 'warning', '-stats', '-thread_queue_size', '4096', '-i', $Source,
-            '-map', '0:v:0', '-map', '0:a?', '-map_chapters', '0')
+            '-map', '0:v:0?', '-map', '0:a?', '-map_chapters', '0', '-map_metadata', '0')
         $stage1Args += $VideoArgs
         if ($VideoFilters.Count -gt 0) {
             $stage1Args += @('-vf', ($VideoFilters -join ','))
@@ -147,9 +147,9 @@ function Invoke-VesTwoStageEncode {
         $remuxArgs = @('-y', '-nostdin', '-v', 'warning', '-stats',
             '-thread_queue_size', '4096', '-i', $stage1,
             '-thread_queue_size', '4096', '-i', $Source,
-            '-map', '0:v:0', '-map', '0:a?')
+            '-map', '0:v:0?', '-map', '0:a?')
         $remuxArgs += $mapArgs
-        $remuxArgs += @('-map', '1:t?', '-map_chapters', '1', '-c:v', 'copy')
+        $remuxArgs += @('-map', '1:t?', '-map_chapters', '1', '-map_metadata', '1', '-c:v', 'copy')
         $remuxArgs += $ColorArgs
         $remuxArgs += @('-c:a', 'copy')
         $remuxArgs += $subArgs
@@ -163,7 +163,7 @@ function Invoke-VesTwoStageEncode {
             Write-Warning "ffmpeg remux with subtitle/attachment streams failed (rc=$($remuxResult.ExitCode)) -- retrying final remux without subtitle/attachment streams -- stderr: $remuxErrFile"
             $retryArgs = @('-y', '-nostdin', '-v', 'warning', '-stats',
                 '-thread_queue_size', '4096', '-i', $stage1,
-                '-map', '0:v:0', '-map', '0:a?', '-map_chapters', '0', '-c:v', 'copy')
+                '-map', '0:v:0?', '-map', '0:a?', '-map_chapters', '0', '-map_metadata', '0', '-c:v', 'copy')
             $retryArgs += $ColorArgs
             $retryArgs += @('-c:a', 'copy', '-max_muxing_queue_size', '8192', '-fps_mode', 'passthrough',
                 '-max_interleave_delta', '1000000', '-flush_packets', '1', '-f', 'matroska', $writeDst)
