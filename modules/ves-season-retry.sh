@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # ves-season-retry.sh -- TV episode/season detection and the season-level
-# shrink-vs-predicted-no-shrink retry heuristic. Pure move from the former
-# monolithic script -- no logic changes.
+# shrink-vs-predicted-no-shrink retry heuristic. Originally a pure move from
+# the former monolithic script; is_tv_episode() below got a real bug fix on
+# 2026-08-04 (team-reviewed) -- see its own comment.
 
 # Naming/organization still uses this broad library-path predicate; encoding
 # profile selection never does.
@@ -21,8 +22,32 @@ is_tv_episode() {
   [[ "$stem" =~ [Ee][Pp][[:space:]]*[0-9]{1,3} ]] && return 0
   [[ "$stem" =~ [Ee]pisode[[:space:]]*[0-9]{1,3} ]] && return 0
   [[ "$stem" =~ [0-9]{1,2}[xX][0-9]{1,2} ]] && return 0
-  [[ "$stem" =~ -[[:space:]]*[0-9]{1,2}$ ]] && return 0
-  [[ "$stem" =~ [[:space:]][0-9]{1,2}$ ]] && return 0
+  # The two generic trailing-number catch-alls below (dash-prefixed and
+  # bare-space-prefixed -- e.g. "Show - 05" / "Show 05") both false-positive
+  # on multi-part-source markers (Part/Pt/CD/Disc N, in any of their
+  # supported separator forms: "Title - Part 1", "Title CD-1", "Title.Pt.1"
+  # -- see MULTIPART_PART_REGEX in ves-config.sh), which are a movie-split
+  # convention, not TV numbering. Checked once, up front, to guard both
+  # rules identically -- an earlier version of this fix only guarded the
+  # space-prefixed rule, missing hyphen-joined forms like "Title-Part-1"
+  # (team review, 2026-08-04). Without this exemption, real 2+ part movies
+  # were silently misclassified as TV episodes: is_tv_show_directory() then
+  # flagged their folder as a TV show directory from a single false-positive
+  # file, which made detect_multipart_groups() skip the whole folder and
+  # never merge them -- found via real-content regression testing,
+  # 2026-08-04, confirmed pre-existing (present unchanged since before this
+  # file's own extraction). Genuine multi-part TV episodes remain protected
+  # two other ways, both unaffected by this exemption: an explicit
+  # season/episode marker anywhere in the name is caught by the rules above
+  # it, and is_tv_show_directory()'s is_tv_library_path() fallback still
+  # treats any 2+-video folder under a real Television/ path as a TV show
+  # directory regardless of individual filenames -- matching this project's
+  # past, opposite-direction incident ("Multipart merge ate two-part TV
+  # episodes"), which this exemption is deliberately scoped not to reopen.
+  if ! [[ "$stem" =~ $MULTIPART_PART_REGEX ]]; then
+    [[ "$stem" =~ -[[:space:]]*[0-9]{1,2}$ ]] && return 0
+    [[ "$stem" =~ [[:space:]][0-9]{1,2}$ ]] && return 0
+  fi
   # 2-3 digits only: covers sequential numbering up to 999 episodes (e.g.
   # "065-The Obsolete Man") without also matching a 4-digit year-prefixed
   # movie title ("1999-Title", "2001-A Space Odyssey").

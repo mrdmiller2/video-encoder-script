@@ -1195,18 +1195,6 @@ declare -A _ORPHAN_FLAG_LIST_CACHE=()
 
 
 
-# ============================================================================
-# v5.0.7 — junk-file scan/cleanup (--clean-junk / --clean-junk-apply)
-# ============================================================================
-# Finds leftover debris from interrupted runs: zero-byte or empty
-# .AV1.mkv/.x265.mkv/.merged.mkv outputs, and stale IN_PROGRESS flags whose
-# process is gone. Report-only by default; --clean-junk-apply actually
-# deletes. Never touches original sources, .merged.mkv files with intact
-# output (a merge surviving after its raw parts were cleaned up is the
-# expected end state, not junk), or the human-review logs (bad_sources.txt,
-# corrupt_files.txt, multipart_mismatch.txt, reconvert_files.txt).
-
-
 # --- v5.0.7: per-folder done/in-progress semaphores -------------------------
 # Complements the file-list cache with a coarser, cheaper skip: once every
 # video in a folder (show/movie folder) has a valid finished output, that

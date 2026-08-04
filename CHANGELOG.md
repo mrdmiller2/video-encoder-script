@@ -4,10 +4,65 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.0B — 2026-08-04
+
+Fixes a real, pre-existing bug found during a full functionality/regression
+pass on the newly-modularized v5.1.0A: multi-part movies named
+"Title - Part 1.mkv" / "Part 2.mkv" (or Pt/CD/Disc N, in any separator
+form) were never being merged by the multipart-merge feature, despite it
+existing specifically for this case. Confirmed byte-identical to the
+pre-modularization code — not introduced by that refactor, just surfaced by
+testing it against real content for the first time with this exact naming
+pattern.
+
+Two-part root cause: (1) `is_tv_episode()`'s generic trailing-number
+catch-all rules (meant for sequentially-numbered TV libraries, e.g.
+"Show - 05") also matched the trailing part number in "Title - Part 1",
+misclassifying the movie as a TV episode — which made
+`is_tv_show_directory()` flag the whole containing folder as a TV show
+directory from a single false-positive file, which made
+`detect_multipart_groups()` skip it entirely; (2) separately, even after
+fixing (1), the organize phase was still splitting the two parts into two
+different per-title folders before the convert phase's multipart detection
+ever got a chance to see them as siblings, since `canonical_organize_title()`
+doesn't strip the part marker.
+
+Fixed in `ves-season-retry.sh` (`is_tv_episode()`) and `ves-organize.sh`
+(`needs_flat_organize()`): both now exempt filenames matching a new
+`MULTIPART_PART_REGEX` global (`ves-config.sh`) from being treated as TV
+content. Two existing protections keep genuine multi-part TV episodes safe
+from this change: an explicit season/episode marker anywhere in the name is
+still caught by the more specific rules checked first, and
+`is_tv_show_directory()`'s separate `is_tv_library_path()` fallback still
+flags any 2+-video folder under a real `Television/` path regardless of
+individual filenames — this project has a documented past incident from
+the *opposite* direction ("Multipart merge ate two-part TV episodes"), and
+this fix is deliberately scoped not to reopen it.
+
+First-round team review caught a real gap in the first draft of this fix
+(missed hyphen-joined forms like "Title-Part-1"/"Title CD-1", which hit an
+earlier, differently-guarded generic rule than the space-separated form)
+and a minor efficiency issue (forking a subshell per file for a static
+regex string in what can be a hot loop over large libraries). Both fixed
+in a follow-up pass: the regex now lives as a real global
+(`MULTIPART_PART_REGEX`) rather than a function call, and a single upfront
+exemption check guards both risky rules together. Re-reviewed clean by all
+three tools.
+
+Verified end-to-end on real content: two real movie clips named with every
+supported separator form (space, hyphen, dot, underscore, glued) now
+genuinely merge and encode correctly (confirmed: correct summed duration,
+mkvalidator clean, full clean decode); a real 2-part TV episode with an
+explicit S01E05 marker and a real markerless 2-part TV episode under a
+`Television/` path both confirmed to still NOT trigger multipart merge,
+via both a full pipeline run and direct unit-level calls. 18 unit-level
+classification cases (7 multipart-movie forms, 4 genuine-TV forms, plus
+`needs_flat_organize` cases) all pass.
+
 ## v5.1.0A — 2026-08-04
 
 Structural rewrite of the bash/macOS fleet script: the 15,136-line monolith
-(447 functions, zero module boundaries) is now `convert-v5.1.0A.sh` (2,432
+(447 functions, zero module boundaries) is now `convert-v5.1.0A.sh` (2,396
 lines — orchestration glue, `main()`, and 7 core logging primitives only)
 sourcing 30 files under `modules/ves-*.sh`, mirroring the module boundaries
 the Windows PowerShell port already proved out in production (ELVIS/PRINCE/

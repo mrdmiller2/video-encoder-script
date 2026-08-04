@@ -4,10 +4,12 @@
 # the former monolithic script -- no logic changes.
 
 multipart_part_regex() {
-  # Captures: 1=title, 2=marker word (unused), 3=part number.
   # bash [[ =~ ]] is POSIX ERE — no (?:...) non-capturing groups, so the
   # marker is a real capture group and the number is BASH_REMATCH[3].
-  printf '%s' '^(.*[^ ._-])[ ._-]*([Pp][Aa][Rr][Tt]|[Pp][Tt]|[Cc][Dd]|[Dd][Ii][Ss][Cc])[ ._-]*([0-9]{1,2})$'
+  # Pattern itself lives in MULTIPART_PART_REGEX (ves-config.sh) so callers
+  # that only need a boolean match (not BASH_REMATCH captures) can reference
+  # the global directly instead of forking a subshell to call this function.
+  printf '%s' "$MULTIPART_PART_REGEX"
 }
 
 # Groups candidate files in one directory by common title; returns groups with

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # ves-organize.sh -- per-movie folder layout (shelf/letter-bucket
 # detection, canonical title resolution) and subtitle-name normalization
-# for the organize phase. Pure move from the former monolithic script --
-# no logic changes.
+# for the organize phase. Originally a pure move from the former monolithic
+# script; needs_flat_organize() below got a real bug fix on 2026-08-04
+# (team-reviewed) -- see its own comment.
 
 # Directory holding sidecar subtitles and output MKVs for a source.
 media_content_dir() {
@@ -166,6 +167,19 @@ needs_flat_organize() {
   if is_tv_show_directory "$parent"; then
     return 1
   fi
+  # A multi-part source (Part/Pt/CD/Disc N -- see MULTIPART_PART_REGEX in
+  # ves-config.sh) must stay flat, never organized into its own solo
+  # per-title folder: canonical_organize_title() doesn't strip the part
+  # marker, so "Title - Part 1" and "Title - Part 2" would otherwise get
+  # two DIFFERENT canonical titles and be moved into two separate folders --
+  # and detect_multipart_groups() only scans one directory at a time, so
+  # once split apart the parts can never be found together and merged.
+  # Found via real-content regression testing, 2026-08-04, same
+  # investigation as the is_tv_episode() fix in ves-season-retry.sh (that
+  # fix alone wasn't sufficient -- the organize phase runs first and was
+  # separating the parts before the convert phase's multipart detection
+  # ever got a chance to see them as siblings).
+  [[ "$raw_title" =~ $MULTIPART_PART_REGEX ]] && return 1
 
   # Right folder, filename needs year parenthesized (or other canon fix).
   if [ "$dirbase" = "$canon_title" ] && [ "$raw_title" != "$canon_title" ]; then

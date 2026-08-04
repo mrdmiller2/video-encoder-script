@@ -2,10 +2,19 @@
 # ves-config.sh -- CLI-default globals, VMAF/CQ/CRF tables, x265/SVT-AV1
 # param strings, and color escape codes. Sourced first (before any other
 # module) so its defaults/lookup tables are available to every other
-# module. Pure move from the former monolithic script -- no logic changes.
+# module. Originally a pure move from the former monolithic script;
+# MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
+# bug fix) -- see its own comment.
 
-VERSION="5.1.0A"
+VERSION="5.1.0B"
 SCRIPT_NAME="convert-v${VERSION}.sh"
+# Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
+# as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
+# Captures: 1=title, 2=marker word (unused), 3=part number. A real global
+# (not a function call) so is_tv_episode()/needs_flat_organize() can test
+# against it directly without forking a subshell per file in what can be a
+# hot loop over large libraries (team review, 2026-08-04).
+MULTIPART_PART_REGEX='^(.*[^ ._-])[ ._-]*([Pp][Aa][Rr][Tt]|[Pp][Tt]|[Cc][Dd]|[Dd][Ii][Ss][Cc])[ ._-]*([0-9]{1,2})$'
 # Matroska Tags element (global "Simple Tag") marking a file as already run through
 # this script's encode pipeline -- distinct from track properties (Name/Language/
 # flags) and from the Segment Info title, so clearing/rewriting it never touches
