@@ -6,7 +6,7 @@
 # MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
 # bug fix) -- see its own comment.
 
-VERSION="5.1.0B"
+VERSION="5.1.0C"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
 # as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
@@ -543,6 +543,13 @@ ACTIVE_ENCODER_LABEL=""
 ACTIVE_ENCODER_FINGERPRINT=""
 ACTIVE_ENCODER_STARTED_UTC=""
 ACTIVE_ENCODER_FIFO_DIR=""
+# PID of run_tracked_encoder's periodic in-progress-flag heartbeat subshell,
+# if one is currently running (0 = none). A global (not a local inside
+# run_tracked_encoder) so kill_active_encoder -- called from the SIGINT/
+# SIGTERM trap handler, a different function entirely -- can also kill it
+# immediately instead of leaving it to self-terminate on its own next
+# sleep-wake (bounded to <=300s, but a real gap; found 2026-08-04).
+ACTIVE_ENCODER_HEARTBEAT_PID=0
 CONVERT_READY_OFFSET=0
 CONVERT_READY_FD=""
 CONVERT_READY_WRITE_FD=""

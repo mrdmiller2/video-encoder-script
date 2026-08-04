@@ -4,6 +4,68 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.0C — 2026-08-04
+
+Fixes a real, pre-existing bug found during a broader post-modularization
+functionality/regression pass: `run_tracked_encoder()`'s periodic
+in-progress-flag heartbeat subshell (keeps a long encode's lock from being
+wrongly reclaimed as abandoned after 2h by another fleet machine sharing
+the same NAS) was leaking on SIGINT/SIGTERM. Confirmed byte-identical to
+the pre-modularization code — not introduced by the refactor.
+
+Root cause: on normal completion, `run_tracked_encoder` explicitly kills
+the heartbeat right after its own `wait` returns, but on an interrupt the
+trap handler (`resume_on_signal` → `kill_active_encoder`) unwinds the whole
+script via `exit 130` before `run_tracked_encoder` ever resumes past its
+`wait` line — so the heartbeat was never being cleaned up, and was observed
+via real-content testing to survive for up to 300 real seconds after the
+parent script had already exited.
+
+Took three iterations to actually fix, each verified empirically (not by
+inspection alone) before moving to the next:
+- **Draft 1** (thread the heartbeat's PID through a new global,
+  `ACTIVE_ENCODER_HEARTBEAT_PID`, so `kill_active_encoder` can also kill
+  it): failed a real interrupt test. A plain `kill` only terminates the
+  bash subshell wrapper, not the `sleep 300` grandchild it's currently
+  blocked in — background jobs in a non-interactive script share the
+  script's own process group rather than getting their own, so the dying
+  subshell doesn't take its foreground child down with it; the sleep is
+  simply orphaned and keeps running out its own timer.
+- **Draft 2** (add `pkill -P` to also kill the child): also failed, for a
+  subtly different reason — by the time `pkill -P` ran, the parent was
+  already dead and the kernel had already reparented the child, so `-P`
+  no longer matched anything. A genuine race, confirmed via a manual
+  isolated repro.
+- **Draft 3** (snapshot the child PID with `pgrep -P` *before* killing the
+  parent, then kill both): verified across 5 repeated real interrupt
+  trials with 1-second-granularity process-tree monitoring — heartbeat
+  present at the moment of interrupt, gone within 1 second, every time.
+
+Team review of Draft 3 caught something worse than the leak it fixed: a
+bare `hb_children="$(pgrep -P "$hb_pid" 2>/dev/null)"` assignment
+propagates `pgrep`'s exit status, and under this script's global
+`set -euo pipefail`, `pgrep` finding zero children (the ordinary case) would
+abort the *entire* SIGINT/SIGTERM trap handler right there — skipping every
+cleanup step after it, a genuinely worse failure mode than the original
+bug. Confirmed via direct empirical repro. Fixed by guarding every
+command in the new `_kill_encoder_heartbeat()` helper with `|| true`
+(including a `command -v pgrep` existence check, so the function degrades
+to the original bounded-leak behavior rather than crashing outright on a
+platform lacking `pgrep`), then re-verified: the `set -e` abort scenario
+now survives, and all 5 real interrupt trials still pass with the trap
+handler's own final cleanup log line printing every time (confirming it
+runs to completion, not cut short).
+
+Two rounds of team review total. Final version: no blocking findings from
+any of the three tools. A few narrow, already-bounded residual risks
+(a tiny window where a brand-new heartbeat sleep could start between the
+`pgrep` snapshot and the parent kill; the same PID-assignment race pattern
+this codebase already accepts elsewhere for `ACTIVE_ENCODER_PID` itself)
+were assessed and left as documented, not engineered away — consistent
+with existing patterns in this codebase and proportionate to the actual
+risk (worst case still bounded to the original leak's own self-healing
+window, not unbounded).
+
 ## v5.1.0B — 2026-08-04
 
 Fixes a real, pre-existing bug found during a full functionality/regression
