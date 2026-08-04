@@ -4,6 +4,92 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.0A — 2026-08-04
+
+Structural rewrite of the bash/macOS fleet script: the 15,136-line monolith
+(447 functions, zero module boundaries) is now `convert-v5.1.0A.sh` (2,432
+lines — orchestration glue, `main()`, and 7 core logging primitives only)
+sourcing 30 files under `modules/ves-*.sh`, mirroring the module boundaries
+the Windows PowerShell port already proved out in production (ELVIS/PRINCE/
+GruntBox2). Zero intended behavior change — this is a relocation, not a
+rewrite, per this project's own "don't combine the file-move with logic
+cleanup" convention. Mid version component bumped (not just Minor/phase)
+to mark the new architecture line, per this project's versioning scheme.
+
+Extraction ran in 3 risk-ordered phases (low-coupling utilities first,
+then medium-coupling feature modules, then the highest-coupling
+state-entangled modules: CIFS mounting, resume-state, done-log, orphan
+reaper, stats-log, staging, pipeline-scan), each gated on a real functional
+encode test plus a Gemini/Codex/Cursor team review before the next phase
+started, per the approved plan.
+
+First extraction attempt used a naive brace counter
+(`line.count('{') - line.count('}')`) and it silently corrupted the file —
+mis-detecting function boundaries on constructs like `${#arr[@]}`,
+`[0-9]{1,2}` regex quantifiers inside `[[ =~ ]]`, and `10#${VAR}`
+forced-base arithmetic (where the naive counter treated `#` as a comment
+start). Caught before it reached any module content: rebuilt the extractor
+as a real stack-based lexer (tracks squote/dquote/`$()`/subshell-parens/
+`${}`-parameter-expansion/`[[ ]]`-conditionals as distinct nesting
+contexts) and re-verified it against all 447 functions in the file before
+trusting it again — zero span overlaps, and a byte-for-byte body diff
+against git HEAD for every single function showed zero mismatches.
+
+Extended the fleet's existing single-file rsync-daemon deploy mechanism
+(Phase 0, prerequisite to any extraction) to push a directory tree
+(orchestrator + `modules/*.sh`) atomically: client stages + checksums every
+`ves-*.sh` file alongside the orchestrator, server validates the complete
+set (filename pattern, sha256, `bash -n`) before publishing anything, then
+atomically swaps a `modules` symlink to a version-stamped directory — never
+a per-file overwrite, so a fleet machine can never be caught sourcing an
+orchestrator from version N against modules from version N-1 mid-deploy.
+Found and fixed two real cross-platform bugs during Phase 0 testing (not
+by review — by direct SSH testing on Crystalight): `mv -T` doesn't exist on
+macOS's BSD `mv` at all, and even bare `mv -f` onto an existing
+symlink-to-directory follows the symlink and moves the source INTO it
+rather than replacing the link (fixed with `ln -sfn`, `-n` for
+no-dereference); and `local -n` bash namerefs require bash 4.3+, breaking
+on macOS's stock bash 3.2 (client-side deploy script hardened to avoid
+them).
+
+Team review across all three phases found one real production-risk bug
+(not a relocation bug — a design gap in the new scaffolding itself): the
+module-sourcing block silently continued if `modules/` was missing,
+meaning a bad/partial deploy would look healthy on `--help`/`--check-tools`
+and only crash confusingly deep into a real run. Now hard-fails at startup
+with a clear diagnostic if `modules/ves-config.sh` isn't found. Also fixed:
+a duplicated `set -euo pipefail`/script-path scaffolding artifact from the
+config-block extraction script (behavior-neutral, but sloppy), several
+now-orphaned section-banner comments left behind when their functions
+moved out from under them, and one stale cross-module comment reference.
+
+One pre-existing fragility surfaced (not introduced by this refactor —
+confirmed byte-identical to HEAD, already documented in its own code
+comment): `try_fast_stream_copy_disc_extraction`'s cleanup trap
+(`trap ... RETURN`) can fire earlier than the function's own return if a
+helper it calls returns first, since bash's RETURN trap is a single global
+table, not function-scoped. Traced through and confirmed benign in the
+current code (the local raw disc copy it cleans up isn't referenced again
+after the point it actually fires) but is a landmine for future edits.
+Deliberately NOT fixed in this pass — fixing it means a real logic change,
+out of scope for a "pure move, zero behavior change" phase. Flagged as a
+follow-up hardening item.
+
+Also deliberately deferred, per the same scoping discipline: `ves-detached-
+exec.sh`, a planned DRY-up of `convert_scan_producer` and
+`run_tracked_encoder`/`kill_active_encoder`'s near-duplicate ad hoc
+background-job implementations — a real logic change, not a pure move.
+
+Verified after every phase: `bash -n` on the orchestrator and every
+module; a full function-inventory diff against git HEAD (all 447 functions
+present exactly once, zero missing/duplicated); a byte-for-byte function-
+body diff against HEAD (zero mismatches, all 3 phases); and a real encode
+through the full pipeline compared against the pre-refactor monolith on
+the same synthetic source — byte-identical output file, matching
+ffprobe-reported codec/resolution/duration, matching done-log entries,
+with only expected non-determinism (random tmpdir suffix, PIDs, encode
+timing) in the logs.
+
 ## v5.0.33U — 2026-08-04
 
 Found and fixed a real performance regression in v5.0.33T's fast stream-copy
