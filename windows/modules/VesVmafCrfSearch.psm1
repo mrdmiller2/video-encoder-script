@@ -128,7 +128,8 @@ function Invoke-VesProbeFfmpegRun {
     param(
         [Parameter(Mandatory)][string]$FfmpegPath,
         [Parameter(Mandatory)][string[]]$Args,
-        [Parameter(Mandatory)][int]$TimeoutSeconds
+        [Parameter(Mandatory)][int]$TimeoutSeconds,
+        [string]$WorkingDirectory
     )
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $FfmpegPath
@@ -137,6 +138,7 @@ function Invoke-VesProbeFfmpegRun {
     $psi.RedirectStandardError = $true
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
+    if ($WorkingDirectory) { $psi.WorkingDirectory = $WorkingDirectory }
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = $psi
     try {
@@ -426,16 +428,25 @@ function Get-VesFinalVmaf {
     $psi.RedirectStandardError = $true
     $psi.UseShellExecute = $false
     $proc = [System.Diagnostics.Process]::Start($psi)
-    $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
-    if (-not $proc.WaitForExit(30000)) {
-        try { $proc.Kill($true) } catch { }
-        $proc.WaitForExit()
-        return $null
-    }
-    $stdoutTask.Wait()
     $dur = 0.0
-    if (-not [double]::TryParse($stdoutTask.Result.Trim(), [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$dur) -or $dur -le 0) {
-        return $null
+    try {
+        # Drain both streams concurrently like Invoke-VesProbeFfmpegRun --
+        # an undrained stderr pipe can fill and block the child until the
+        # timeout fires (team review, 2026-08-05: this probe was written
+        # ad hoc instead of reusing that helper and missed this).
+        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        $stderrTask = $proc.StandardError.ReadToEndAsync()
+        if (-not $proc.WaitForExit(30000)) {
+            try { $proc.Kill($true) } catch { }
+            $proc.WaitForExit()
+            return $null
+        }
+        [System.Threading.Tasks.Task]::WaitAll(@($stdoutTask, $stderrTask))
+        if (-not [double]::TryParse($stdoutTask.Result.Trim(), [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$dur) -or $dur -le 0) {
+            return $null
+        }
+    } finally {
+        $proc.Dispose()
     }
     $durInt = [int][math]::Floor($dur)
 
@@ -454,11 +465,23 @@ function Get-VesFinalVmaf {
     $n = 0
     for ($i = 1; $i -le $nsamples; $i++) {
         $start = [int]([math]::Floor($durInt * (2 * $i - 1) / ($nsamples * 2)))
-        $vlog = Join-Path ([System.IO.Path]::GetTempPath()) "ves-vmaf-$([guid]::NewGuid().ToString('N')).json"
-        $lavfi = "[0:v]setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]${scaleFilter}setpts=PTS-STARTPTS,format=yuv420p10le[r];[d][r]libvmaf=model=$model`:n_threads=$nThreads`:log_fmt=json:log_path=$vlog"
+        $vlogDir = [System.IO.Path]::GetTempPath()
+        $vlogName = "ves-vmaf-$([guid]::NewGuid().ToString('N')).json"
+        $vlog = Join-Path $vlogDir $vlogName
+        # ffmpeg's filter-option parser splits on ':' -- a raw Windows path
+        # (C:\Users\...\file.json) breaks log_path at the drive letter, so
+        # every sample silently failed and this always returned $null (team
+        # review, 2026-08-05: all three reviewers independently caught this
+        # as a real bug; colon-escaping (`C\:/...`) was tried first and
+        # ALSO failed against a real ffmpeg N-125907 build -- empirically
+        # confirmed via a live test on PRINCE, not just inferred). Passing
+        # just the bare filename with the process's working directory set
+        # to the temp folder sidesteps the escaping question entirely --
+        # also verified working end-to-end on PRINCE.
+        $lavfi = "[0:v]setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]${scaleFilter}setpts=PTS-STARTPTS,format=yuv420p10le[r];[d][r]libvmaf=model=$model`:n_threads=$nThreads`:log_fmt=json:log_path=$vlogName"
         $ffArgs = @('-y', '-v', 'error', '-ss', "$start", '-t', "$SampleSeconds", '-i', $Output,
             '-ss', "$start", '-t', "$SampleSeconds", '-i', $Source, '-lavfi', $lavfi, '-f', 'null', '-')
-        $run = Invoke-VesProbeFfmpegRun -FfmpegPath $FfmpegPath -Args $ffArgs -TimeoutSeconds $TimeoutSeconds
+        $run = Invoke-VesProbeFfmpegRun -FfmpegPath $FfmpegPath -Args $ffArgs -TimeoutSeconds $TimeoutSeconds -WorkingDirectory $vlogDir
         if (-not $run.Ok -or -not (Test-Path -LiteralPath $vlog)) {
             Remove-Item -LiteralPath $vlog -Force -ErrorAction SilentlyContinue
             continue

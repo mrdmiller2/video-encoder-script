@@ -285,7 +285,11 @@ function Invoke-VesEncodeAndValidate {
         # alike (mirrors bash's write_ves_processed_tag, called uniformly for
         # both paths) -- see Get-VesFinalVmaf/Write-VesLowQualityFlag for why
         # a below-floor result is log-only rather than moving the output.
-        $finalVmaf = Get-VesFinalVmaf -Source $EncodeSource -Output $finalDst -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath
+        # -TargetHeight $upscaleTarget matters: without it, an upscaled
+        # output (source scaled to 720p/1080p during encode) gets compared
+        # against the source at mismatched resolutions, so libvmaf fails
+        # every sample -- team review, 2026-08-05, caught this was missing.
+        $finalVmaf = Get-VesFinalVmaf -Source $EncodeSource -Output $finalDst -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -TargetHeight $upscaleTarget
         if ($null -ne $finalVmaf) {
             Write-VesLog "Final VMAF: $finalVmaf ($finalDst)"
             if ($finalVmaf -lt $LowQualityVmafThreshold) {

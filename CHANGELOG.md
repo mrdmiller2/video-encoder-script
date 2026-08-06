@@ -4,6 +4,43 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.0E — 2026-08-05
+
+Team review (Gemini, Codex, Cursor, run independently in parallel) of
+v5.1.0D found the Windows side of the new low-quality-VMAF feature was
+completely inert in production, plus two smaller real bugs:
+
+- **`windows/modules/VesVmafCrfSearch.psm1` — `Get-VesFinalVmaf` never
+  actually measured anything on Windows.** All three reviewers
+  independently caught it: ffmpeg's filter-option parser splits on `:`,
+  so a raw Windows temp path (`C:\Users\...\file.json`) passed as
+  `log_path=` broke at the drive letter, every sample silently failed,
+  and the function always returned `$null` — the entire feature was a
+  no-op on all 3 Windows fleet machines since the moment it shipped.
+  Colon-escaping (`C\:/...`) was tried first and *also* failed against a
+  real ffmpeg N-125907 build (confirmed via a live test on PRINCE, not
+  just inferred from docs). Fixed by passing a bare relative filename
+  with the ffmpeg process's working directory set to the temp folder —
+  sidesteps the escaping question entirely, verified end-to-end on
+  PRINCE with a real encode/re-encode pair before redeploying fleet-wide.
+- **`windows/convert.ps1` — missing `-TargetHeight` passthrough.** The
+  already-resolved `$upscaleTarget` wasn't being passed to
+  `Get-VesFinalVmaf`, so an upscaled output would've been compared
+  against its source at mismatched resolutions once the above fix
+  landed. Fixed by threading `$upscaleTarget` through.
+- **`windows/modules/VesVmafCrfSearch.psm1` — duration-probe subprocess
+  hygiene.** The new duration probe in `Get-VesFinalVmaf` didn't drain
+  stderr or dispose the process, unlike the sibling
+  `Invoke-VesProbeFfmpegRun` it should have matched — a chatty/stalling
+  ffprobe could fill the stderr pipe and sit until the 30s timeout.
+  Fixed to match the hardened pattern.
+- **`modules/ves-validation.sh` — numeric-format guard on bash's
+  threshold check.** `awk`'s `v + 0` coerces any non-numeric string
+  (e.g. a stray `"nan"`) to `0`, which would misread as "far below
+  floor" instead of "VMAF unavailable." Low severity — `measure_final_vmaf`
+  normally only ever prints a plain `%.1f` or fails empty — but cheap to
+  close, so a numeric-format check was added before the comparison.
+
 ## v5.1.0D — 2026-08-05
 
 New feature, both platforms: a kept output whose final measured VMAF lands

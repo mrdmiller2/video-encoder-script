@@ -383,7 +383,11 @@ write_ves_processed_tag() {
     # skipping it here would just cause an endless re-encode-to-the-same-VMAF
     # loop on every future scan. Flagging is additive: a log entry a human can
     # audit, plus a visible marker in the tag itself.
-    if [ -n "$vmaf" ] && awk -v v="$vmaf" -v t="$LOW_QUALITY_VMAF_THRESHOLD" \
+    # Numeric-format guard (team review, 2026-08-05): measure_final_vmaf
+    # normally only ever prints a plain %.1f or fails empty, but awk's
+    # `v + 0` coerces ANY non-numeric string (e.g. a stray "nan") to 0,
+    # which would wrongly read as "far below floor" instead of "unavailable".
+    if [[ "$vmaf" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v v="$vmaf" -v t="$LOW_QUALITY_VMAF_THRESHOLD" \
          'BEGIN { exit !(v + 0 < t + 0) }' 2>/dev/null; then
       tag_value="${tag_value} — BELOW ${LOW_QUALITY_VMAF_THRESHOLD} FLOOR, NEEDS REVIEW"
       flag_low_quality_output_for_human "$mkv" "$src" "$vmaf"
