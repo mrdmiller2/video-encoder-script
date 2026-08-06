@@ -4,6 +4,24 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.0I — 2026-08-06
+
+Real bug found resuming the 27-file fleet production test: `-p` targeting
+a real, existing file whose name contains literal `[`, `]`, `*`, or `?`
+characters (e.g. a common release-group tag like
+`Law.&.Order.5x06...[tvu.org.ru].avi`) was silently reinterpreted as
+"directory + trailing name-glob" instead of a literal single-file target.
+`split_path_trailing_glob()`'s glob-metacharacter heuristic (`case "$path"
+in *[\*\?\[]*)`) can't distinguish an actual unexpanded shell glob from a
+real filename that just happens to contain those characters. Fixed by
+checking `[ -f "$path" ]` first -- a literal existing file always wins
+over the heuristic now, matching the same "does it literally exist"
+precedence `SINGLE_FILE_MODE` detection already uses a few lines later.
+Verified both directions: the real production file that surfaced this now
+correctly resolves as a single-file target with no name-glob; a genuine
+`-p .../A*` glob-pattern invocation (which never exists as a literal path)
+is unaffected.
+
 ## v5.1.0H — 2026-08-06
 
 E2E confidence review (Gemini, Codex, Cursor, run independently in

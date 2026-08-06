@@ -102,6 +102,19 @@ name_glob_matches() {
 split_path_trailing_glob() {
   local path="$1"
   local base parent
+  # A literal existing file always wins over the glob-metacharacter
+  # heuristic below (found via a real production run, 2026-08-06): the
+  # case pattern *[\*\?\[]* can't distinguish an actual unexpanded glob
+  # from a real filename that just happens to contain literal [, ], *, or
+  # ? -- e.g. a common release-group tag like "[tvu.org.ru]". Without this
+  # check, `-p ".../Title.[tvu.org.ru].avi"` silently got reinterpreted as
+  # "directory .../ + name-glob '*.[tvu.org.ru].avi'" and either matched
+  # nothing (hard failure) or matched the wrong thing entirely -- neither
+  # of which the caller asked for or would expect from a plain file path.
+  if [ -f "$path" ]; then
+    SEARCH_PATH="$path"
+    return 0
+  fi
   case "$path" in
     *[\*\?\[]*)
       base="$(basename "$path")"
