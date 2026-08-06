@@ -61,6 +61,28 @@ place_in_progress_flag() {
   this_host="$(hostname 2>/dev/null || echo unknown)"
   mkdir -p -- "$dir" 2>/dev/null || true
 
+  # Cross-platform claim peek (team review, 2026-08-06): the Windows port
+  # (windows/modules/VesTitleLock.psm1) uses a DIFFERENT lock name/type
+  # for the exact same purpose -- a FILE at "<basename>.convert.lock"
+  # (chosen there specifically because this NAS gives freshly-Windows-
+  # created DIRECTORIES a broken ACL, so it can't use bash's mkdir
+  # approach). Neither platform recognized the other's lock at all until
+  # now, so a bash and a Windows machine sharing this library could both
+  # claim and encode the same title simultaneously. This is a read-only
+  # existence+age peek, not a reclaim -- it never touches or deletes the
+  # other platform's lock file, only skips this run if a fresh one is
+  # present, leaving that platform's own orphan-reaper to handle its own
+  # stale locks.
+  local win_lock="$dir/$(basename -- "$src").convert.lock"
+  if [ -e "$win_lock" ]; then
+    local win_lock_age
+    win_lock_age=$(( $(date +%s) - $(stat -c %Y -- "$win_lock" 2>/dev/null || stat -f %m -- "$win_lock" 2>/dev/null || echo 0) ))
+    if [ "$win_lock_age" -lt 7200 ]; then
+      warn "Title claimed by a Windows fleet machine — skipping: $title"
+      return 1
+    fi
+  fi
+
   if ! mkdir -- "$lockdir" 2>/dev/null; then
     if junk_flag_is_stale "$flag" 2>/dev/null; then
       # rmdir-then-mkdir is two separate syscalls -- two hosts can both pass

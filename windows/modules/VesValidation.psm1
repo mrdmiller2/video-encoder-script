@@ -9,6 +9,9 @@
 if (-not (Get-Module -Name VesTimeoutRetry)) {
     Import-Module (Join-Path $PSScriptRoot 'VesTimeoutRetry.psm1') -Force
 }
+if (-not (Get-Module -Name VesDoneLog)) {
+    Import-Module (Join-Path $PSScriptRoot 'VesDoneLog.psm1') -Force
+}
 
 function Get-VesMediaDurationSeconds {
     <#
@@ -135,6 +138,19 @@ function Write-VesLowQualityFlag {
     )
     Write-Warning "Kept output below VMAF $Threshold floor ($Vmaf) -- flagged for human review: $OutputPath"
     $logf = Join-Path $JobSidecarDir 'low_quality_review.txt'
+    # Mirrors bash's _neutralize_symlink_sidecar_path: refuse to append
+    # through a symlink at a predictable path, closing the class of risk
+    # where a planted link could redirect this write into an arbitrary
+    # file. Not a full match for bash's hardening -- bash opens its FD
+    # once at job start and holds it for the run's lifetime (immune to
+    # the path being swapped after that one check), whereas this
+    # re-checks on every call since there's no long-lived handle plumbed
+    # through here yet. Still closes the gap the team review flagged
+    # (team review, 2026-08-06) -- a real improvement over no check at all.
+    if ((Test-Path -LiteralPath $logf) -and (Test-VesPathIsReparsePoint -Path $logf)) {
+        Write-Warning "Low-quality log path is a reparse point -- removing the link only (target untouched) before use: $logf"
+        Remove-Item -LiteralPath $logf -Force -ErrorAction SilentlyContinue
+    }
     $line = "{0}`t{1}`t{2}`t{3}" -f (Get-Date -AsUTC -Format 'yyyy-MM-ddTHH:mm:ssZ'), $Vmaf, $OutputPath, $SourcePath
     try {
         Add-Content -LiteralPath $logf -Value $line -Encoding utf8 -ErrorAction Stop
@@ -143,5 +159,99 @@ function Write-VesLowQualityFlag {
     }
 }
 
+function Write-VesBadSourceFlag {
+    <#
+    .SYNOPSIS
+    Port of bash's flag_bad_source_for_human(): a source that can never
+    succeed on retry (Dolby Vision Profile 5 without libplacebo, today's
+    only caller) gets logged and durably marked 'skip' in the done-log,
+    so future scans stop re-attempting a job that will always fail the
+    same way. Never deletes or moves the source, matching bash. Same
+    3-field TSV shape (timestamp, source, reason) as bash's
+    bad_sources.txt, and the same log filename, so both platforms'
+    human-review backlogs can be read as one combined list on a shared
+    library.
+
+    Unlike bash (which never deletes a source, only skips future
+    conversion attempts on it), this reuses the existing done-log 'skip'
+    status Add-VesDoneLogEntry already supports -- no new sidecar
+    mechanism needed on the Windows side.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Reason,
+        [Parameter(Mandatory)][string]$JobSidecarDir,
+        [Parameter(Mandatory)][string]$DoneLogDir,
+        [Parameter(Mandatory)][string]$FfmpegPath
+    )
+    Write-Warning "Bad source -- durably skipping, needs human review: $Source ($Reason)"
+    $logf = Join-Path $JobSidecarDir 'bad_sources.txt'
+    if ((Test-Path -LiteralPath $logf) -and (Test-VesPathIsReparsePoint -Path $logf)) {
+        Write-Warning "Bad-sources log path is a reparse point -- removing the link only (target untouched) before use: $logf"
+        Remove-Item -LiteralPath $logf -Force -ErrorAction SilentlyContinue
+    }
+    $line = "{0}`t{1}`t{2}" -f (Get-Date -AsUTC -Format 'yyyy-MM-ddTHH:mm:ssZ'), $Source, $Reason
+    try {
+        Add-Content -LiteralPath $logf -Value $line -Encoding utf8 -ErrorAction Stop
+    } catch {
+        Write-Warning "Could not write bad-source flag to $logf -- ${_}"
+    }
+    Add-VesDoneLogEntry -Status skip -Source $Source -DoneLogDir $DoneLogDir -FfmpegPath $FfmpegPath
+}
+
+function Find-VesExistingValidOutput {
+    <#
+    .SYNOPSIS
+    Cross-platform existing-output pre-check, port of the spirit of
+    bash's inspect_existing_outputs_for_queue() (ves-profile-decision.sh)
+    -- this port had NO equivalent at all before (team review, 2026-08-06):
+    it relied purely on its own done-log, so a title a bash fleet machine
+    already finished (bash's own ".AV1.mkv"/".x265.mkv" naming) would be
+    silently re-encoded here every run, and vice versa if this port's
+    done-log entry was ever lost. Checks bash's two output names plus
+    this port's own -OutputSuffix (belt-and-suspenders: catches a
+    completed title whose done-log entry didn't survive, same as bash's
+    own layered done-log + filesystem checks).
+
+    Deliberately safer than bash's version: this NEVER deletes a
+    candidate that fails validation (bash's flag_bad_processed_output
+    does, guarded by its own mtime/codec-claim checks) -- a failed
+    candidate here is silently skipped and the caller proceeds to a
+    normal encode, since this port has no equivalent ownership-proof
+    mechanism (no VES-tag reading) to safely judge "is this genuinely
+    something either platform produced, safe to delete" the way bash's
+    layered guards do. Returns the valid candidate's path, or $null if
+    none found/valid (caller must encode normally).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$FfprobePath,
+        [string]$MkvalidatorPath,
+        [string]$OutputSuffix = '.AV1-WIN'
+    )
+    $dir = Split-Path -Parent $Source
+    $title = [System.IO.Path]::GetFileNameWithoutExtension($Source)
+    $candidates = @(
+        (Join-Path $dir "$title.AV1.mkv"),
+        (Join-Path $dir "$title.x265.mkv"),
+        (Join-Path $dir "$title$OutputSuffix.mkv")
+    )
+    foreach ($cand in $candidates) {
+        if ($cand -eq $Source) { continue }
+        if (-not (Test-Path -LiteralPath $cand -PathType Leaf)) { continue }
+        if ($MkvalidatorPath) {
+            $structOk = Test-VesMkvStructureValid -Path $cand -MkvalidatorPath $MkvalidatorPath
+            if ($structOk -eq $false) { continue }
+        }
+        $srcDur = Get-VesMediaDurationSeconds -Path $Source -FfprobePath $FfprobePath
+        $dstDur = Get-VesMediaDurationSeconds -Path $cand -FfprobePath $FfprobePath
+        if (Test-VesDurationsMatch -DurationA $srcDur -DurationB $dstDur -ToleranceSeconds 2.0) {
+            return $cand
+        }
+    }
+    return $null
+}
+
 Export-ModuleMember -Function Get-VesMediaDurationSeconds, Test-VesDurationsMatch, `
-    Test-VesMkvStructureValid, Test-VesPathIsReparsePoint, Write-VesLowQualityFlag
+    Test-VesMkvStructureValid, Test-VesPathIsReparsePoint, Write-VesLowQualityFlag, Write-VesBadSourceFlag, `
+    Find-VesExistingValidOutput

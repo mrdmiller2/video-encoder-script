@@ -107,5 +107,43 @@ function Resolve-VesHwEncodePriority {
     return 'software'
 }
 
+function Test-VesFfmpegHasLibPlacebo {
+    <#
+    .SYNOPSIS
+    Port of bash's ffmpeg_lists_filter "libplacebo" (see FF_HAS_LIBPLACEBO
+    in ves-hwdetect.sh) -- a one-time capability probe so Dolby Vision
+    Profile 5 sources get properly converted via libplacebo when the
+    ffmpeg build actually supports it, instead of always being treated
+    as unsupported. convert.ps1 never called this at all before (team
+    review, 2026-08-06) -- Build-VesFfmpegVideoArgs's -FfmpegHasLibPlacebo
+    param always silently defaulted to $false, so every DoVi P5 source
+    was routed to the human-review path even on builds (e.g. PRINCE's)
+    that do have libplacebo compiled in.
+    #>
+    param([Parameter(Mandatory)][string]$FfmpegPath)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $FfmpegPath
+    foreach ($a in @('-hide_banner', '-filters')) { $psi.ArgumentList.Add($a) }
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    try {
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        $stderrTask = $proc.StandardError.ReadToEndAsync()
+        if (-not $proc.WaitForExit(30000)) {
+            try { $proc.Kill($true) } catch { }
+            $proc.WaitForExit()
+            return $false
+        }
+        [System.Threading.Tasks.Task]::WaitAll(@($stdoutTask, $stderrTask))
+        return ($stdoutTask.Result -match '(?m)^\s*\S+\s+libplacebo\s+')
+    } catch {
+        return $false
+    } finally {
+        if ($proc) { $proc.Dispose() }
+    }
+}
+
 Export-ModuleMember -Function Test-VesHwEncoderAvailable, Test-VesNvencAvailable, `
-    Test-VesQsvAvailable, Test-VesAmfAvailable, Resolve-VesHwEncodePriority
+    Test-VesQsvAvailable, Test-VesAmfAvailable, Resolve-VesHwEncodePriority, Test-VesFfmpegHasLibPlacebo

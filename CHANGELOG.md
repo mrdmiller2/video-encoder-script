@@ -4,6 +4,98 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.0G — 2026-08-06
+
+Remediation of the four remaining gaps flagged by the v5.1.0D/E team
+review (cross-OS lock/done-log non-interop, no Windows size-guard/x265
+fallback, Dolby Vision Profile 5 not parked for review on Windows,
+`Write-VesLowQualityFlag` lacking bash's symlink-hardened log pattern),
+per explicit direction that bash is this project's master feature set
+and Windows should close the gap toward it wherever practical.
+
+**Cross-platform title-lock claim peek** (`modules/ves-title-lock.sh`,
+`windows/modules/VesTitleLock.psm1`): bash and Windows use different
+lock primitives for the same purpose (bash: an atomically-`mkdir`'d
+directory; Windows: an atomically-`CreateNew`'d file — chosen there
+specifically because this NAS gives freshly-Windows-created directories
+a broken ACL). Neither recognized the other's lock at all before this,
+so a bash and a Windows machine sharing a library could both claim and
+encode the same title simultaneously. Fixed with a read-only
+existence+age peek on both sides — each platform computes the other's
+expected lock path for the same source (verified byte-identical against
+real filenames, including the `.AV1.mkv`/`.AV1-WIN.mkv` derived-output
+case) and skips if a fresh one is found. Never touches or reclaims the
+other platform's lock, so a bug here can only cause an over-cautious
+skip, never lock corruption.
+
+**Cross-platform existing-output recognition**: the lock peek only
+prevents a *simultaneous* collision — bash's own done-log had no record
+of a Windows-only completion (or vice versa), so sequential duplicate
+work across platforms was still unbounded. `inspect_existing_outputs_for_queue`
+(`modules/ves-profile-decision.sh`) now also checks for a valid
+`Title.AV1-WIN.mkv` before queuing a re-encode, reusing the exact same
+validate-then-trust-or-reject pattern already used for its own AV1/x265
+outputs. Windows gained an equivalent pre-check it never had at all
+(`Find-VesExistingValidOutput`, `windows/modules/VesValidation.psm1`) —
+deliberately safer than bash's version: it never deletes a candidate
+that fails validation, only skips silently and proceeds to a normal
+encode, since this port has no VES-tag-reading ownership proof the way
+bash's layered mtime/codec-claim guards do.
+
+**Dolby Vision Profile 5 handling on Windows**: two real, connected bugs.
+(1) `windows/convert.ps1` never probed for libplacebo at all — every DoVi
+P5 source was routed to "needs human review" even on ffmpeg builds
+(confirmed on PRINCE) that actually support the conversion. Fixed with a
+new `Test-VesFfmpegHasLibPlacebo` capability probe (`VesHwDetect.psm1`),
+mirroring bash's own `FF_HAS_LIBPLACEBO` detection. (2) The one existing
+caller of `Build-VesFfmpegVideoArgs` never checked its documented `$null`
+return contract at all -- a DoVi P5 source without libplacebo (or,
+discovered via direct testing, an unrecognized `-ForceProfile` value)
+silently fell through into the encode pipeline with null video args.
+Fixed by checking the return value, and by verifying the actual DoVi
+condition independently rather than assuming every `$null` means DoVi P5
+(a real second bug caught via testing: `Build-VesFfmpegVideoArgs` returns
+`$null` for two other unrelated reasons too, and the first draft of this
+fix mis-attributed all of them). A genuine DoVi P5-without-libplacebo
+source is now durably parked via a new `Write-VesBadSourceFlag`
+(`windows/modules/VesValidation.psm1`) -- same `bad_sources.txt` name and
+3-field TSV shape as bash's `flag_bad_source_for_human`, reusing the
+existing done-log `'skip'` status so future scans stop retrying a job
+that will always fail identically.
+
+**Windows size-guard + x265 fallback**: this port previously kept ANY
+duration/structure-valid AV1 regardless of size -- a real, silent policy
+divergence from bash on a shared library. `Invoke-VesEncodeAndValidate`
+was refactored into a per-codec `Invoke-VesCodecEncodeAttempt` helper
+(`Build-VesFfmpegVideoArgs` was already fully codec-parameterized before
+this -- only the orchestration layer needed a second codepath, not the
+encode pipeline itself) plus a new size-guard check mirroring bash's
+`size_keep_policy_av1` (`AV1_MAX_OVERSHOOT_PCT=20` there too, now a new
+`-Av1MaxOvershootPct` param here). An oversized or failed AV1 now falls
+back to a real software x265 encode (`Title.X265-WIN.mkv`), keeping
+whichever valid candidate is actually smaller. Deliberately scoped
+narrower than bash's full behavior: no upscale-tiered overshoot limit and
+no must-eliminate stash/tie-break bookkeeping -- the must-eliminate case
+is handled by simply re-trying AV1 if x265 doesn't beat it, rather than
+bash's stash-and-compare mechanism. No GPU bake-off either (NVENC/QSV/
+VideoToolbox/AMD VCE) -- this port's AV1 path is software-only today too,
+so a software-only x265 fallback matches its current scope. Empirically
+verified end-to-end on PRINCE across all three outcomes (AV1 kept
+normally; AV1 rejected → x265 fallback triggers and gets kept; both
+rejected → guardrail correctly leaves the original untouched) -- caught
+and fixed two more real bugs in the process: a PowerShell `-replace`
+operator-precedence bug that silently no-op'd the x265 output-filename
+construction, and the DoVi-null-misattribution bug described above (first
+surfaced by this testing, not the DoVi work itself).
+
+**`Write-VesLowQualityFlag` log hardening**: now refuses to append
+through a symlink at the log path, mirroring bash's
+`_neutralize_symlink_sidecar_path`. Not a full match for bash's
+hardening (bash opens its FD once at job start and holds it for the
+run's lifetime; this re-checks on every call since there's no long-lived
+handle plumbed through here yet) but a real improvement over no check at
+all.
+
 ## v5.1.0F — 2026-08-05
 
 Follow-up triage of the remaining gaps Cursor surfaced during the v5.1.0D/E

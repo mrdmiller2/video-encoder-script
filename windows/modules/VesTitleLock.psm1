@@ -48,6 +48,31 @@ function Get-VesTitleLockPath {
     return Join-Path $dir "$name.convert.lock"
 }
 
+function Get-VesBashTitleLockPath {
+    <#
+    .SYNOPSIS
+    Computes the bash fleet's lock DIRECTORY path for the same source,
+    mirroring canonical_title_from_file()/canonical_title_from_source()
+    (extension stripped, then a trailing .AV1/.av1/.x265/.X265/.merged/
+    .MERGED suffix stripped if present) plus in_progress_flag_path()'s
+    "<title>.convert-v4.IN_PROGRESS.lock" naming (ves-title-lock.sh /
+    ves-organize.sh). Used only for the read-only cross-platform claim
+    peek in Enter-VesTitleLock -- never written to from this side.
+    Deliberately does not replicate is_bluray_root()'s disc-source
+    special case (a disc source's "title" is its own directory name,
+    not an extension-stripped filename) -- this port's own title lock
+    is file-path-keyed throughout, so disc-source cross-locking is out
+    of scope here, matching this function's single caller.
+    #>
+    param([Parameter(Mandatory)][string]$Source)
+    $dir = Split-Path -Parent $Source
+    $title = [System.IO.Path]::GetFileNameWithoutExtension($Source)
+    foreach ($suffix in @('.AV1', '.av1', '.x265', '.X265', '.merged', '.MERGED')) {
+        if ($title.EndsWith($suffix)) { $title = $title.Substring(0, $title.Length - $suffix.Length); break }
+    }
+    return Join-Path $dir "$title.convert-v4.IN_PROGRESS.lock"
+}
+
 function Enter-VesTitleLock {
     <#
     .SYNOPSIS
@@ -60,6 +85,24 @@ function Enter-VesTitleLock {
     Exit-VesTitleLock.
     #>
     param([Parameter(Mandatory)][string]$Source)
+
+    # Cross-platform claim peek (team review, 2026-08-06): bash's own
+    # lock (ves-title-lock.sh) uses a different name/type for the same
+    # purpose -- a DIRECTORY, atomically mkdir'd, which this port
+    # deliberately avoids (see this module's header comment on the
+    # broken-ACL-on-freshly-Windows-created-directories NAS bug). Until
+    # now neither platform recognized the other's lock at all, so a
+    # bash and a Windows machine sharing this library could both claim
+    # the same title. Read-only existence+age check -- never touches or
+    # reclaims bash's lock, only skips this run if a fresh one exists.
+    $bashLockPath = Get-VesBashTitleLockPath -Source $Source
+    if (Test-Path -LiteralPath $bashLockPath) {
+        $ageSeconds = ([DateTimeOffset]::UtcNow - (Get-Item -LiteralPath $bashLockPath -Force).LastWriteTimeUtc).TotalSeconds
+        if ($ageSeconds -lt $script:VesTitleLockStaleSeconds) {
+            Write-Warning "Title claimed by a bash fleet machine -- skipping: $Source"
+            return $null
+        }
+    }
 
     $lockPath = Get-VesTitleLockPath -Source $Source
     $metaPath = "$lockPath.meta"

@@ -115,6 +115,22 @@ av1_output_path() {
   printf '%s/%s.AV1.mkv' "$dir" "$title"
 }
 
+# Windows port's own default -OutputSuffix (windows/convert.ps1) naming
+# convention. Used by inspect_existing_outputs_for_queue's cross-platform
+# check so a bash machine recognizes a title a Windows fleet machine
+# already finished, instead of redundantly re-encoding it (team review,
+# 2026-08-06) -- the title-lock cross-check only prevents a SIMULTANEOUS
+# collision; without this, sequential duplicate work across platforms was
+# still unbounded (bash's own done-log has no record of a Windows-only
+# completion).
+windows_output_path() {
+  local src="$1"
+  local dir title
+  dir="$(media_content_dir "$src")"
+  title="$(canonical_title_from_source "$src")"
+  printf '%s/%s.AV1-WIN.mkv' "$dir" "$title"
+}
+
 is_oversized_av1() {
   local src="$1"
   local orig orig_sz av1_sz lim
@@ -503,6 +519,34 @@ inspect_existing_outputs_for_queue() {
       return 1
     fi
     flag_bad_processed_output "$src" "$x265_out" "invalid processed x265 (scan)"
+  fi
+
+  # Cross-platform: a Windows fleet machine may have already finished this
+  # title (windows/convert.ps1's own default -OutputSuffix naming). Without
+  # this, bash's done-log has no record of a Windows-only completion, so
+  # every scan would redundantly re-encode a title someone else already
+  # finished (team review, 2026-08-06) -- the title-lock cross-check only
+  # prevents a SIMULTANEOUS collision, not this sequential duplicate work.
+  # Same validate-then-trust-or-reject pattern as the two checks above;
+  # validate_mkv_output has no bash-specific expectations (no VES tag
+  # check), so a genuinely valid Windows output passes identically.
+  local win_out
+  win_out="$(windows_output_path "$src")"
+  if [ -f "$win_out" ]; then
+    MKV_VALIDATE_DEFERRED=false
+    MKV_VALIDATE_TIMED_OUT=false
+    if validate_mkv_output "$src" "$win_out" "" true; then
+      done_log_append done "$src"
+      return 1
+    fi
+    if [ "$MKV_VALIDATE_DEFERRED" = true ]; then
+      return 0
+    fi
+    if [ "$MKV_VALIDATE_TIMED_OUT" = true ]; then
+      warn "Validation timed out for $win_out — leaving output in place for retry next run"
+      return 1
+    fi
+    flag_bad_processed_output "$src" "$win_out" "invalid processed Windows-port output (scan)"
   fi
 
   if is_must_eliminate_format "$src"; then

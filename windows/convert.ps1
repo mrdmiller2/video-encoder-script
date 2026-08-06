@@ -57,6 +57,7 @@ param(
     [string]$NameGlob,
     [int]$VmafTarget = 90,
     [double]$LowQualityVmafThreshold = 85.00,
+    [double]$Av1MaxOvershootPct = 20,
     [ValidateSet('libopus', 'aac')][string]$AudioCodec = 'libopus',
     [string]$AudioBitrate = '112k',
     [string]$ForceProfile,
@@ -80,7 +81,7 @@ foreach ($m in @(
         'VesRamDisk', 'VesOrphanReaper', 'VesShardedScan',
         'VesSubtitleFilter', 'VesProfileDecision', 'VesVmafCrfSearch', 'VesTwoStageEncode',
         'VesTelegram', 'VesOrganize', 'VesPipelineScan', 'VesHandBrake', 'VesDiscSource',
-        'VesLegacyFallback'
+        'VesLegacyFallback', 'VesHwDetect'
     )) {
     Import-Module (Join-Path $ModuleDir "modules\$m.psm1") -Force
 }
@@ -150,6 +151,14 @@ function Write-VesLog {
     Write-Host "[$([DateTime]::Now.ToString('HH:mm:ss'))] $Message"
 }
 
+# One-time capability probe (mirrors bash's FF_HAS_LIBPLACEBO) so Dolby
+# Vision Profile 5 sources are only routed to human-review when this
+# ffmpeg build genuinely can't handle them -- team review, 2026-08-06:
+# this was never probed at all before, so -FfmpegHasLibPlacebo always
+# silently defaulted to $false everywhere it was used.
+$script:FfmpegHasLibPlacebo = Test-VesFfmpegHasLibPlacebo -FfmpegPath $FfmpegPath
+Write-VesLog "ffmpeg capability: libplacebo=$script:FfmpegHasLibPlacebo"
+
 # --- Organize-only mode: run the organize phase and exit, matching bash's --organize-only ---
 if ($OrganizeOnly) {
     if ($SingleFileMode) {
@@ -218,27 +227,84 @@ $script:processed = 0; $script:skippedDone = 0; $script:skippedClaimed = 0; $scr
 # --- Core per-file encode+validate, shared by normal files and a disc
 #     source's extracted intermediate (EncodeSource differs from
 #     ProfileSource only for the latter). ---
-function Invoke-VesEncodeAndValidate {
+function Invoke-VesCodecEncodeAttempt {
+    <#
+    .SYNOPSIS
+    One encode+validate attempt for a single codec -- extracted from
+    Invoke-VesEncodeAndValidate (team review, 2026-08-06) so the caller
+    can try AV1, then fall back to a real x265 encode when AV1 is
+    oversized or fails, mirroring bash's own try_av1_convert/
+    try_x265_convert size-guard-driven fallback. Build-VesFfmpegVideoArgs
+    was already fully codec-parameterized ('av1'/'hevc') before this --
+    only the orchestration layer needed to grow a second codepath, not
+    the encode pipeline itself.
+    #>
     param(
         [Parameter(Mandatory)][string]$EncodeSource,
         [Parameter(Mandatory)][string]$ProfileSource,
         [Parameter(Mandatory)][string]$Destination,
-        [switch]$IsDiscSource
+        [Parameter(Mandatory)][ValidateSet('av1', 'hevc')][string]$Codec
     )
     $profile = if ($ForceProfile) { $ForceProfile } else { Get-VesDetectedProfileForPath -Path $ProfileSource }
     $hdrMode = Resolve-VesHdrMode -Source $EncodeSource -FfprobePath $FfprobePath
     $isHdr = $hdrMode -in @('pq', 'pq_reconstruct', 'hlg')
     $upscaleTarget = Resolve-VesUpscaleTarget -Source $EncodeSource -FfprobePath $FfprobePath
-    $fixedCrf = Get-VesProfileFixedCrf -Codec av1 -Profile $profile -IsHdr $isHdr
-    $svtParams = Get-VesProfileSvtParams -Profile $profile -FfmpegPath $FfmpegPath
-    Write-VesLog "Profile: $profile  HDR: $hdrMode  Upscale target: $upscaleTarget"
+    $fixedCrf = Get-VesProfileFixedCrf -Codec $Codec -Profile $profile -IsHdr $isHdr
+    Write-VesLog "Profile: $profile  Codec: $Codec  HDR: $hdrMode  Upscale target: $upscaleTarget"
 
-    $crf = Resolve-VesCrfForEncode -Source $EncodeSource -Codec av1 -Profile $profile -IsHdr $isHdr -TargetHeight $upscaleTarget `
-        -FixedCrf $fixedCrf -VmafTarget $VmafTarget -AbAv1Path $AbAv1Path -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -EncoderArgs @('--svt', $svtParams)
+    if ($Codec -eq 'av1') {
+        $svtParams = Get-VesProfileSvtParams -Profile $profile -FfmpegPath $FfmpegPath
+        $crf = Resolve-VesCrfForEncode -Source $EncodeSource -Codec av1 -Profile $profile -IsHdr $isHdr -TargetHeight $upscaleTarget `
+            -FixedCrf $fixedCrf -VmafTarget $VmafTarget -AbAv1Path $AbAv1Path -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -EncoderArgs @('--svt', $svtParams)
+    } else {
+        # x265 is a size-guard fallback here, not the primary quality-search
+        # path -- fixed CRF only, no VMAF-targeted ab-av1 search (ab-av1
+        # itself is AV1-only). Matches this port's current scope: bash's
+        # own multi-encoder GPU bake-off (NVENC/QSV/VideoToolbox/AMD VCE)
+        # isn't ported here either -- this fallback is software x265 via
+        # ffmpeg only, consistent with how this port's AV1 path is
+        # currently software-only too.
+        $crf = $fixedCrf
+    }
     Write-VesLog "Resolved CRF: $crf"
 
-    $videoArgsResult = Build-VesFfmpegVideoArgs -Codec av1 -Crf $crf -Source $EncodeSource -Profile $profile -IsHdr $isHdr -HdrMode $hdrMode `
-        -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -UpscaleTargetHeight $upscaleTarget
+    $videoArgsResult = Build-VesFfmpegVideoArgs -Codec $Codec -Crf $crf -Source $EncodeSource -Profile $profile -IsHdr $isHdr -HdrMode $hdrMode `
+        -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -UpscaleTargetHeight $upscaleTarget -FfmpegHasLibPlacebo $script:FfmpegHasLibPlacebo
+
+    if ($null -eq $videoArgsResult) {
+        # Build-VesFfmpegVideoArgs returns $null for THREE distinct reasons
+        # (Dolby Vision profile 5 without libplacebo; no SVT-AV1 params
+        # entry for this profile; no x265 params entry for this profile) --
+        # its own doc comment only mentions the DoVi case, and this caller
+        # originally (and wrongly) attributed every $null to DoVi P5
+        # unconditionally. Caught via direct testing, 2026-08-06: an
+        # unrecognized -ForceProfile value hit the "no SVT params" path and
+        # got durably flagged with a misleading "needs libplacebo" message.
+        # Check the actual DoVi condition independently rather than assume.
+        $isDoviP5WithoutLibplacebo = $isHdr -and
+            (Test-VesSourceHasDolbyVision -Source $EncodeSource -FfprobePath $FfprobePath) -and
+            ((Get-VesSourceDoviProfile -Source $EncodeSource -FfprobePath $FfprobePath) -eq '5') -and
+            (-not $script:FfmpegHasLibPlacebo)
+        if ($isDoviP5WithoutLibplacebo) {
+            # Build-VesFfmpegVideoArgs's documented $null contract for
+            # "caller must flag for human review instead of encoding."
+            # Previously uncaught entirely (team review, 2026-08-05):
+            # $videoArgsResult.VideoArgs on $null silently evaluates to
+            # $null too (property access on $null doesn't throw in
+            # PowerShell), so this fell through into Invoke-VesTwoStageEncode
+            # with null video args instead of being caught -- risking
+            # exactly the wrong-color-output class of bug this codebase's
+            # own comments already warn about by name (the original bash
+            # Profile 5 tint bug).
+            return [PSCustomObject]@{
+                Ok = $false; Destination = $Destination; SizeBytes = 0
+                NeedsHumanReview = $true
+                Reason = 'Dolby Vision profile 5 requires libplacebo (not in this ffmpeg build)'
+            }
+        }
+        Write-VesLog "$Codec video args could not be built for profile '$profile' (no $Codec params entry for this profile) -- encode cannot proceed: $EncodeSource"
+        return [PSCustomObject]@{ Ok = $false; Destination = $Destination; SizeBytes = 0 }
+    }
 
     $errLogDir = Join-Path $JobRoot 'ffmpeg-logs'
     $result = Invoke-VesTwoStageEncode -Source $EncodeSource -Destination $Destination -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath `
@@ -246,37 +312,112 @@ function Invoke-VesEncodeAndValidate {
         -AudioCodec $AudioCodec -AudioBitrate $AudioBitrate -ErrorLogDir $errLogDir `
         -RamdiskDir $(if ($ramDiskJob) { $ramDiskJob.RootPath }) -LocalFallbackDir $stageDir
 
-    $finalDst = $Destination
-    $ok = $false
     if (-not $result.Success) {
-        Write-VesLog "Encode FAILED (stage=$($result.Stage) exitcode=$($result.ExitCode)): $EncodeSource"
-        if (Test-VesIsMustEliminateFormat -Source $ProfileSource) {
-            $floor = Invoke-VesMustEliminateRemuxFloor -Source $EncodeSource -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -ErrorLogDir $errLogDir -IsDiscSource:$IsDiscSource
-            if ($floor.Success) {
-                Write-VesLog "Must-eliminate remux floor succeeded: $($floor.Path)"
-                $finalDst = $floor.Path
-                $ok = $true
-            }
-        }
-    } else {
-        $durMatch = $true
-        if ($MkvalidatorPath) {
-            $structOk = Test-VesMkvStructureValid -Path $Destination -MkvalidatorPath $MkvalidatorPath
-            if ($structOk -eq $false) {
-                Write-VesLog "Output failed structure validation: $Destination"
-                $durMatch = $false
-            }
-        }
-        $srcDur = Get-VesMediaDurationSeconds -Path $EncodeSource -FfprobePath $FfprobePath
-        $dstDur = Get-VesMediaDurationSeconds -Path $Destination -FfprobePath $FfprobePath
-        if (-not (Test-VesDurationsMatch -DurationA $srcDur -DurationB $dstDur -ToleranceSeconds 2.0)) {
-            Write-VesLog "Duration mismatch (src=$srcDur dst=$dstDur): $Destination"
+        Write-VesLog "$Codec encode FAILED (stage=$($result.Stage) exitcode=$($result.ExitCode)): $EncodeSource"
+        return [PSCustomObject]@{ Ok = $false; Destination = $Destination; SizeBytes = 0 }
+    }
+
+    $durMatch = $true
+    if ($MkvalidatorPath) {
+        $structOk = Test-VesMkvStructureValid -Path $Destination -MkvalidatorPath $MkvalidatorPath
+        if ($structOk -eq $false) {
+            Write-VesLog "$Codec output failed structure validation: $Destination"
             $durMatch = $false
         }
-        if ($durMatch) {
+    }
+    $srcDur = Get-VesMediaDurationSeconds -Path $EncodeSource -FfprobePath $FfprobePath
+    $dstDur = Get-VesMediaDurationSeconds -Path $Destination -FfprobePath $FfprobePath
+    if (-not (Test-VesDurationsMatch -DurationA $srcDur -DurationB $dstDur -ToleranceSeconds 2.0)) {
+        Write-VesLog "$Codec duration mismatch (src=$srcDur dst=$dstDur): $Destination"
+        $durMatch = $false
+    }
+    if (-not $durMatch) {
+        Write-VesLog "$Codec output did not pass validation: $EncodeSource"
+        return [PSCustomObject]@{ Ok = $false; Destination = $Destination; SizeBytes = 0 }
+    }
+
+    $sizeBytes = (Get-Item -LiteralPath $Destination -Force).Length
+    return [PSCustomObject]@{ Ok = $true; Destination = $Destination; SizeBytes = $sizeBytes }
+}
+
+function Invoke-VesEncodeAndValidate {
+    param(
+        [Parameter(Mandatory)][string]$EncodeSource,
+        [Parameter(Mandatory)][string]$ProfileSource,
+        [Parameter(Mandatory)][string]$Destination,
+        [switch]$IsDiscSource
+    )
+    $errLogDir = Join-Path $JobRoot 'ffmpeg-logs'
+    $srcSizeBytes = (Get-Item -LiteralPath $EncodeSource -Force).Length
+
+    $av1Result = Invoke-VesCodecEncodeAttempt -EncodeSource $EncodeSource -ProfileSource $ProfileSource -Destination $Destination -Codec av1
+    if ($av1Result.NeedsHumanReview) { return $av1Result }
+
+    $finalDst = $Destination
+    $ok = $false
+
+    if ($av1Result.Ok) {
+        $overshootPct = if ($srcSizeBytes -gt 0) { (($av1Result.SizeBytes - $srcSizeBytes) / $srcSizeBytes) * 100 } else { 0 }
+        if ($av1Result.SizeBytes -le $srcSizeBytes -or $overshootPct -le $Av1MaxOvershootPct) {
+            $finalDst = $av1Result.Destination
             $ok = $true
         } else {
-            Write-VesLog "Output did not pass validation -- leaving source untouched, not recording as done: $EncodeSource"
+            # Size-guard rejection -- port of bash's size_keep_policy_av1
+            # (AV1_MAX_OVERSHOOT_PCT=20 there too). Team review, 2026-08-06:
+            # this port had NO size guard at all before -- ANY duration/
+            # structure-valid AV1 was kept regardless of size, a real,
+            # silent policy divergence from bash on a shared library.
+            # Deliberately simplified vs. bash's full behavior: no upscale-
+            # tiered limit (bash's effective_upscale_overshoot_pct) and no
+            # must-eliminate stash/tie-break bookkeeping -- scoped to the
+            # common case (real x265 fallback exists now, vs. none before),
+            # with the fuller bash-parity mechanics left as a follow-up.
+            Write-VesLog "AV1 output >$Av1MaxOvershootPct% larger than original ($([math]::Round($overshootPct,1))%) -- trying x265 fallback: $EncodeSource"
+        }
+    } else {
+        Write-VesLog "AV1 encode/validation failed -- trying x265 fallback: $EncodeSource"
+    }
+
+    if (-not $ok) {
+        # Parens around the pattern are load-bearing (found via direct
+        # testing, 2026-08-06): without them, -replace's operator
+        # precedence does not bind '+ "$"' to the pattern operand as a
+        # plain read would suggest, and the suffix silently fails to
+        # strip at all.
+        $x265Dst = [System.IO.Path]::ChangeExtension($Destination, $null).TrimEnd('.') -replace ([regex]::Escape($OutputSuffix) + '$'), '.X265-WIN'
+        $x265Dst = "$x265Dst.mkv"
+        Remove-VesFileRobust -Path $Destination
+        $x265Result = Invoke-VesCodecEncodeAttempt -EncodeSource $EncodeSource -ProfileSource $ProfileSource -Destination $x265Dst -Codec hevc
+        if ($x265Result.NeedsHumanReview) { return $x265Result }
+
+        if ($x265Result.Ok -and ($x265Result.SizeBytes -le $srcSizeBytes -or -not $av1Result.Ok)) {
+            $finalDst = $x265Result.Destination
+            $ok = $true
+            Write-VesLog "Kept x265 fallback: $finalDst"
+        } elseif ($av1Result.Ok -and (Test-VesIsMustEliminateFormat -Source $ProfileSource)) {
+            # Must-eliminate format (avi/ogm/mpg/rmvb/etc.): don't discard a
+            # working AV1 elimination just because x265 didn't beat it on
+            # size -- matches bash's own reasoning (eliminating the
+            # undesirable container matters more than the size guardrail
+            # here). Re-run the AV1 attempt since its output was already
+            # deleted above before trying x265.
+            Remove-VesFileRobust -Path $x265Dst
+            Write-VesLog "Source is a must-eliminate format -- re-encoding AV1 to keep despite exceeding the size guardrail: $EncodeSource"
+            $av1Retry = Invoke-VesCodecEncodeAttempt -EncodeSource $EncodeSource -ProfileSource $ProfileSource -Destination $Destination -Codec av1
+            if ($av1Retry.Ok) {
+                $finalDst = $av1Retry.Destination
+                $ok = $true
+            }
+        } else {
+            Remove-VesFileRobust -Path $x265Dst
+            if (Test-VesIsMustEliminateFormat -Source $ProfileSource) {
+                $floor = Invoke-VesMustEliminateRemuxFloor -Source $EncodeSource -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -ErrorLogDir $errLogDir -IsDiscSource:$IsDiscSource
+                if ($floor.Success) {
+                    Write-VesLog "Must-eliminate remux floor succeeded: $($floor.Path)"
+                    $finalDst = $floor.Path
+                    $ok = $true
+                }
+            }
         }
     }
 
@@ -289,6 +430,7 @@ function Invoke-VesEncodeAndValidate {
         # output (source scaled to 720p/1080p during encode) gets compared
         # against the source at mismatched resolutions, so libvmaf fails
         # every sample -- team review, 2026-08-05, caught this was missing.
+        $upscaleTarget = Resolve-VesUpscaleTarget -Source $EncodeSource -FfprobePath $FfprobePath
         $finalVmaf = Get-VesFinalVmaf -Source $EncodeSource -Output $finalDst -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -TargetHeight $upscaleTarget
         if ($null -ne $finalVmaf) {
             Write-VesLog "Final VMAF: $finalVmaf ($finalDst)"
@@ -320,6 +462,24 @@ function Invoke-VesFileJob {
     if (Test-VesDoneLogShouldSkip -Source $src -FfmpegPath $FfmpegPath -NoResume:$NoResume) {
         $script:skippedDone++
         return
+    }
+
+    # Cross-platform existing-output check (team review, 2026-08-06): this
+    # port had no equivalent to bash's inspect_existing_outputs_for_queue
+    # at all before -- a title a bash fleet machine (or an earlier run of
+    # this port whose done-log entry didn't survive) already finished
+    # would be silently re-encoded here every time. Scoped to non-disc
+    # sources only, matching the title-lock cross-check's own scoping
+    # (a disc source's canonical "title" derivation is a different,
+    # more complex case -- out of scope for this pass).
+    if (-not (Test-VesIsDiskSource -Source $src) -and -not $NoResume) {
+        $existing = Find-VesExistingValidOutput -Source $src -FfprobePath $FfprobePath -MkvalidatorPath $MkvalidatorPath -OutputSuffix $OutputSuffix
+        if ($existing) {
+            Write-VesLog "Already has a valid output (this or another fleet machine) -- skipping: $src -> $existing"
+            Add-VesDoneLogEntry -Status done -Source $src -DoneLogDir $doneLogDir -FfmpegPath $FfmpegPath
+            $script:skippedDone++
+            return
+        }
     }
 
     $lock = Enter-VesTitleLock -Source $src
@@ -385,6 +545,13 @@ function Invoke-VesFileJob {
                 $shrinkPct = [math]::Round((1 - ($dstSize / $srcSize)) * 100, 1)
                 Write-VesLog "Encode OK: $([math]::Round($srcSize/1MB,1))MB -> $([math]::Round($dstSize/1MB,1))MB ($shrinkPct% shrink): $($r.Destination)"
                 Add-VesDoneLogEntry -Status done -Source $src -DoneLogDir $doneLogDir -FfmpegPath $FfmpegPath
+                $ok = $true
+            } elseif ($r.NeedsHumanReview) {
+                # A durable, deterministic failure -- retrying would fail
+                # identically every time, so mark 'skip' (matches bash's
+                # flag_bad_source_for_human) instead of leaving this to
+                # retry forever on every future scan.
+                Write-VesBadSourceFlag -Source $src -Reason $r.Reason -JobSidecarDir $JobRoot -DoneLogDir $doneLogDir -FfmpegPath $FfmpegPath
                 $ok = $true
             } else {
                 $ok = $false
