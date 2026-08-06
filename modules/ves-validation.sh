@@ -376,6 +376,18 @@ write_ves_processed_tag() {
     elif [ -n "$vmaf" ]; then
       tag_value="${tag_value} — VMAF ${vmaf}"
     fi
+    # Below-floor quality still gets kept (e.g. a must-eliminate legacy source
+    # too far gone for a clean re-encode) and MUST still be tagged/done-logged
+    # normally -- inspect_existing_outputs_for_queue's "done" detection keys
+    # off the output existing at its canonical derived path, so moving or
+    # skipping it here would just cause an endless re-encode-to-the-same-VMAF
+    # loop on every future scan. Flagging is additive: a log entry a human can
+    # audit, plus a visible marker in the tag itself.
+    if [ -n "$vmaf" ] && awk -v v="$vmaf" -v t="$LOW_QUALITY_VMAF_THRESHOLD" \
+         'BEGIN { exit !(v + 0 < t + 0) }' 2>/dev/null; then
+      tag_value="${tag_value} — BELOW ${LOW_QUALITY_VMAF_THRESHOLD} FLOOR, NEEDS REVIEW"
+      flag_low_quality_output_for_human "$mkv" "$src" "$vmaf"
+    fi
   fi
 
   _mkv_write_single_tag "$mkv" "$tag_value"
@@ -710,6 +722,34 @@ flag_bad_source_for_human() {
   fi
   maybe_chown_for_media_user "$logf"
   record_skip "$src" "bad source — human review: $reason"
+}
+
+# A valid, kept output whose final measured VMAF still lands below
+# LOW_QUALITY_VMAF_THRESHOLD -- log-only, unlike flag_bad_source_for_human:
+# the output stays exactly at its canonical derived path (moving it would
+# make inspect_existing_outputs_for_queue's "done" check blind to it, causing
+# an endless re-encode-to-the-same-VMAF loop on every future scan). The
+# caller (write_ves_processed_tag) also stamps a visible marker into the
+# file's own tag, so this log is a convenience index, not the only record.
+flag_low_quality_output_for_human() {
+  local mkv="$1" src="$2" vmaf="$3"
+  local logf="${LOW_QUALITY_LOG:-}"
+  [ -n "$logf" ] || logf="${JOB_SIDECAR_DIR:-.}/low_quality_review.txt"
+
+  warn "Kept output below VMAF ${LOW_QUALITY_VMAF_THRESHOLD} floor (${vmaf}) — flagged for human review: $mkv"
+
+  if [ "$DRY_RUN" = true ]; then
+    return 0
+  fi
+
+  if [ -n "$LOW_QUALITY_LOG_FD" ]; then
+    printf '%s\t%s\t%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$vmaf" "$mkv" "$src" >&"$LOW_QUALITY_LOG_FD" 2>/dev/null || true
+  else
+    {
+      printf '%s\t%s\t%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$vmaf" "$mkv" "$src"
+    } >>"$logf" 2>/dev/null || true
+  fi
+  maybe_chown_for_media_user "$logf"
 }
 
 # Checks whether a structurally-bad source MKV/WebM's content is actually

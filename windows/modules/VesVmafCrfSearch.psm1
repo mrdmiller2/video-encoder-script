@@ -393,4 +393,90 @@ function Resolve-VesCrfForEncode {
     return $result.Crf
 }
 
-Export-ModuleMember -Function Get-VesVideoHeight, Get-VesVmafModelForSource, Invoke-VesVmafCrfSearchAbAv1, Resolve-VesCrfForEncode, Test-VesSvtAv1Preset8Safe
+function Get-VesFinalVmaf {
+    <#
+    .SYNOPSIS
+    Port of measure_final_vmaf() -- sampled full-output VMAF for a kept
+    encode (real encode, fixed-CRF fallback, or the must-eliminate remux
+    floor alike), distinct from the CRF-search's candidate-CRF prediction:
+    this scores the actual chosen output against the actual source. Unlike
+    the bash version (which shells out to python3 to parse libvmaf's JSON
+    log), this uses PowerShell's built-in ConvertFrom-Json -- no extra
+    dependency needed on a Windows fleet machine. Returns $null on any
+    failure (caller must treat that as "couldn't measure," never as a
+    passing or failing score).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Output,
+        [Parameter(Mandatory)][string]$FfmpegPath,
+        [Parameter(Mandatory)][string]$FfprobePath,
+        [int]$TargetHeight = 0,
+        [int]$Samples = 3,
+        [int]$SampleSeconds = 20,
+        [int]$TimeoutSeconds = 180
+    )
+    if (-not (Test-Path -LiteralPath $Source) -or -not (Test-Path -LiteralPath $Output)) { return $null }
+
+    $durProbeArgs = @('-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', $Source)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $FfprobePath
+    foreach ($a in $durProbeArgs) { $psi.ArgumentList.Add($a) }
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+    if (-not $proc.WaitForExit(30000)) {
+        try { $proc.Kill($true) } catch { }
+        $proc.WaitForExit()
+        return $null
+    }
+    $stdoutTask.Wait()
+    $dur = 0.0
+    if (-not [double]::TryParse($stdoutTask.Result.Trim(), [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$dur) -or $dur -le 0) {
+        return $null
+    }
+    $durInt = [int][math]::Floor($dur)
+
+    $nsamples = $Samples
+    while ($nsamples -gt 1 -and $durInt -lt ($SampleSeconds * $nsamples * 2)) { $nsamples-- }
+
+    $model = Get-VesVmafModelForSource -Source $Source -FfprobePath $FfprobePath
+    $scaleFilter = switch ($TargetHeight) {
+        720  { 'scale=1280:720:flags=lanczos:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,' }
+        1080 { 'scale=1920:1080:flags=lanczos:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,' }
+        default { '' }
+    }
+    $nThreads = [Environment]::ProcessorCount
+
+    $vsum = 0.0
+    $n = 0
+    for ($i = 1; $i -le $nsamples; $i++) {
+        $start = [int]([math]::Floor($durInt * (2 * $i - 1) / ($nsamples * 2)))
+        $vlog = Join-Path ([System.IO.Path]::GetTempPath()) "ves-vmaf-$([guid]::NewGuid().ToString('N')).json"
+        $lavfi = "[0:v]setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]${scaleFilter}setpts=PTS-STARTPTS,format=yuv420p10le[r];[d][r]libvmaf=model=$model`:n_threads=$nThreads`:log_fmt=json:log_path=$vlog"
+        $ffArgs = @('-y', '-v', 'error', '-ss', "$start", '-t', "$SampleSeconds", '-i', $Output,
+            '-ss', "$start", '-t', "$SampleSeconds", '-i', $Source, '-lavfi', $lavfi, '-f', 'null', '-')
+        $run = Invoke-VesProbeFfmpegRun -FfmpegPath $FfmpegPath -Args $ffArgs -TimeoutSeconds $TimeoutSeconds
+        if (-not $run.Ok -or -not (Test-Path -LiteralPath $vlog)) {
+            Remove-Item -LiteralPath $vlog -Force -ErrorAction SilentlyContinue
+            continue
+        }
+        try {
+            $json = Get-Content -LiteralPath $vlog -Raw | ConvertFrom-Json
+            $v = [double]$json.pooled_metrics.vmaf.mean
+            $vsum += $v
+            $n++
+        } catch {
+            # Malformed/partial JSON -- skip this sample, same as bash's
+            # python3-parse failure falling through to `continue`.
+        } finally {
+            Remove-Item -LiteralPath $vlog -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if ($n -eq 0) { return $null }
+    return [math]::Round($vsum / $n, 1)
+}
+
+Export-ModuleMember -Function Get-VesVideoHeight, Get-VesVmafModelForSource, Invoke-VesVmafCrfSearchAbAv1, Resolve-VesCrfForEncode, Test-VesSvtAv1Preset8Safe, Get-VesFinalVmaf

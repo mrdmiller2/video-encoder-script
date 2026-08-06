@@ -6,7 +6,7 @@
 # MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
 # bug fix) -- see its own comment.
 
-VERSION="5.1.0C"
+VERSION="5.1.0D"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
 # as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
@@ -267,6 +267,12 @@ CORRUPT_FILES_LOG=""
 BAD_SOURCES_LOG=""
 RECONVERT_FILES_LOG=""
 STRIPPED_SUBTITLES_LOG=""
+LOW_QUALITY_LOG=""
+# A kept, valid output whose final measured VMAF still lands below this floor
+# (e.g. a must-eliminate legacy source too far gone for a clean re-encode)
+# gets logged to LOW_QUALITY_LOG and marked in its tag for human review/manual
+# reconvert, rather than being silently treated as a normal successful pass.
+LOW_QUALITY_VMAF_THRESHOLD="85.00"
 # Set by validate_mkv_structure when quick scan defers full mkvalidator (do not delete yet).
 MKV_VALIDATE_DEFERRED=false
 # Set by validate_mkv_metadata / validate_mkv_structure / validate_mkv_output when a
@@ -479,6 +485,7 @@ CORRUPT_FILES_LOG_FD=""
 BAD_SOURCES_LOG_FD=""
 RECONVERT_FILES_LOG_FD=""
 STRIPPED_SUBTITLES_LOG_FD=""
+LOW_QUALITY_LOG_FD=""
 SHARD_LOG_FD=""
 SHARD_LOG_ROOT=""
 SHARD_LOG_ACTIVE=false

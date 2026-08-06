@@ -56,6 +56,7 @@ param(
     [switch]$NoShard,
     [string]$NameGlob,
     [int]$VmafTarget = 90,
+    [double]$LowQualityVmafThreshold = 85.00,
     [ValidateSet('libopus', 'aac')][string]$AudioCodec = 'libopus',
     [string]$AudioBitrate = '112k',
     [string]$ForceProfile,
@@ -84,6 +85,41 @@ foreach ($m in @(
     Import-Module (Join-Path $ModuleDir "modules\$m.psm1") -Force
 }
 
+if (-not (Test-Path -LiteralPath $SearchPath)) {
+    Write-Error "Path not found: $SearchPath"
+    exit 1
+}
+
+# Port of bash's SINGLE_FILE_MODE (convert-v5.1.0C.sh, "-p may target a
+# single file directly"): -SearchPath may be a single file (movie or
+# episode), not just a directory. Sidecars (log/state/resume/done-log)
+# live in the file's parent directory; organize is skipped (nothing to
+# reorganize for one file); sharding/name-glob/pipeline-mode scanning do
+# not apply -- there is nothing to scan, the one file IS the job.
+#
+# Why this needs an explicit branch here (bash needed none): bash's
+# get_scan_roots() sets _roots=("$SEARCH_PATH") for a no-shard root, and
+# `find "$root" -maxdepth 1 -type f ...` naturally returns a file target
+# itself (no -mindepth 1), so single-file mode "just worked" once
+# NO_SHARD was forced -- no separate per-file code path was needed.
+# PowerShell's Get-ChildItem -Recurse has no equivalent self-inclusive
+# behavior for a Leaf path (it requires a container and returns nothing
+# for a file, silently swallowed by -ErrorAction SilentlyContinue) --
+# confirmed via direct testing, 2026-08-05 -- so the batch-mode scan
+# loop below needs an explicit single-file branch instead.
+$SingleFileMode = (Test-Path -LiteralPath $SearchPath -PathType Leaf)
+if ($SingleFileMode) {
+    if (-not $JobRoot) { $JobRoot = Split-Path -Parent $SearchPath }
+    if ($NameGlob) {
+        Write-Warning "-NameGlob ignored -- $SearchPath is a single file target"
+        $NameGlob = $null
+    }
+    if ($Pipeline) {
+        Write-Warning "-Pipeline ignored -- $SearchPath is a single file target (nothing to background-scan)"
+        $Pipeline = $false
+    }
+    $NoShard = $true
+}
 if (-not $JobRoot) { $JobRoot = $SearchPath }
 if (-not $FfmpegPath) { $FfmpegPath = Join-Path $ToolsRoot 'bin\ffmpeg.exe' }
 if (-not $FfprobePath) { $FfprobePath = Join-Path $ToolsRoot 'bin\ffprobe.exe' }
@@ -116,6 +152,10 @@ function Write-VesLog {
 
 # --- Organize-only mode: run the organize phase and exit, matching bash's --organize-only ---
 if ($OrganizeOnly) {
+    if ($SingleFileMode) {
+        Write-VesLog "Organize phase: skipped -- $SearchPath is a single file target (nothing to reorganize)"
+        exit 0
+    }
     Write-VesLog 'Organize phase: scanning for loose movie files to reorganize'
     $orgResult = Invoke-VesOrganizeLibrary -SearchPath $SearchPath -ShardDepth $ShardDepth -NoShard:$NoShard -NameGlob $NameGlob -VideoExtensions $VideoExtensions
     Write-VesLog "Organize complete: $($orgResult.Total) found, $($orgResult.Organized) organized, $($orgResult.Skipped) already in place, $($orgResult.Failed) failed"
@@ -237,6 +277,20 @@ function Invoke-VesEncodeAndValidate {
             $ok = $true
         } else {
             Write-VesLog "Output did not pass validation -- leaving source untouched, not recording as done: $EncodeSource"
+        }
+    }
+
+    if ($ok) {
+        # Measured for both a real encode AND the must-eliminate remux floor
+        # alike (mirrors bash's write_ves_processed_tag, called uniformly for
+        # both paths) -- see Get-VesFinalVmaf/Write-VesLowQualityFlag for why
+        # a below-floor result is log-only rather than moving the output.
+        $finalVmaf = Get-VesFinalVmaf -Source $EncodeSource -Output $finalDst -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath
+        if ($null -ne $finalVmaf) {
+            Write-VesLog "Final VMAF: $finalVmaf ($finalDst)"
+            if ($finalVmaf -lt $LowQualityVmafThreshold) {
+                Write-VesLowQualityFlag -JobSidecarDir $JobRoot -OutputPath $finalDst -SourcePath $EncodeSource -Vmaf $finalVmaf -Threshold $LowQualityVmafThreshold
+            }
         }
     }
 
@@ -364,7 +418,7 @@ function Invoke-VesFileJob {
 
 # --- Resolve scan roots and pick batch vs. pipeline mode ---
 $scanRoots = @(Get-VesScanRoots -SearchPath $SearchPath -ShardDepth $ShardDepth -NoShard:$NoShard -NameGlob $NameGlob)
-$usePipeline = if ($Pipeline) { $true } elseif ($NoPipeline) { $false } else { Test-VesShouldUsePipelineMode -SearchPath $SearchPath -ForcePipeline:$Pipeline -LargestFirst:$false }
+$usePipeline = if ($SingleFileMode) { $false } elseif ($Pipeline) { $true } elseif ($NoPipeline) { $false } else { Test-VesShouldUsePipelineMode -SearchPath $SearchPath -ForcePipeline:$Pipeline -LargestFirst:$false }
 
 if ($usePipeline -and -not (Test-VesPathIsUnc -Path $SearchPath)) {
     Write-VesLog "Pipeline mode requires a UNC -SearchPath (\\host\share\...) -- falling back to batch mode for: $SearchPath"
@@ -412,21 +466,37 @@ if ($usePipeline) {
         Stop-VesScanProducer -Handle $handle
     }
 } else {
-    Write-VesLog "Convert mode: batch (scan everything, then encode) -- $SearchPath"
     $allFiles = New-Object System.Collections.Generic.List[string]
-    foreach ($root in $scanRoots) {
-        Get-ChildItem -LiteralPath $root -Recurse -Force -File -ErrorAction SilentlyContinue |
-            Where-Object { $VideoExtensions -contains $_.Extension.TrimStart('.').ToLowerInvariant() } |
-            ForEach-Object { $allFiles.Add($_.FullName) }
-    }
-    if (Test-VesRootsNeedCatchupScan -SearchPath $SearchPath -VideoExtensions $VideoExtensions) {
-        Get-ChildItem -LiteralPath $SearchPath -Force -File -ErrorAction SilentlyContinue |
-            Where-Object { $VideoExtensions -contains $_.Extension.TrimStart('.').ToLowerInvariant() } |
-            ForEach-Object { if (-not $allFiles.Contains($_.FullName)) { $allFiles.Add($_.FullName) } }
-    }
-    if ($HandBrakeCliPath) {
-        foreach ($disc in @(Find-VesDiskSources -SearchPath $SearchPath)) {
-            if (-not $allFiles.Contains($disc)) { $allFiles.Add($disc) }
+    if ($SingleFileMode) {
+        # Get-ChildItem -Recurse cannot be pointed at a Leaf path (see the
+        # SingleFileMode comment above) -- the one file IS the job, no scan
+        # needed. Still honors the video-extension allowlist so an
+        # unsupported single-file target fails the same clear way a
+        # directory scan would (silently skipping it, not a cryptic
+        # downstream encoder error).
+        Write-VesLog "Convert mode: single file -- $SearchPath"
+        $ext = [System.IO.Path]::GetExtension($SearchPath).TrimStart('.').ToLowerInvariant()
+        if ($VideoExtensions -contains $ext) {
+            $allFiles.Add($SearchPath)
+        } else {
+            Write-VesLog "Skip -- '$ext' is not in the video-extensions allowlist: $SearchPath"
+        }
+    } else {
+        Write-VesLog "Convert mode: batch (scan everything, then encode) -- $SearchPath"
+        foreach ($root in $scanRoots) {
+            Get-ChildItem -LiteralPath $root -Recurse -Force -File -ErrorAction SilentlyContinue |
+                Where-Object { $VideoExtensions -contains $_.Extension.TrimStart('.').ToLowerInvariant() } |
+                ForEach-Object { $allFiles.Add($_.FullName) }
+        }
+        if (Test-VesRootsNeedCatchupScan -SearchPath $SearchPath -VideoExtensions $VideoExtensions) {
+            Get-ChildItem -LiteralPath $SearchPath -Force -File -ErrorAction SilentlyContinue |
+                Where-Object { $VideoExtensions -contains $_.Extension.TrimStart('.').ToLowerInvariant() } |
+                ForEach-Object { if (-not $allFiles.Contains($_.FullName)) { $allFiles.Add($_.FullName) } }
+        }
+        if ($HandBrakeCliPath) {
+            foreach ($disc in @(Find-VesDiskSources -SearchPath $SearchPath)) {
+                if (-not $allFiles.Contains($disc)) { $allFiles.Add($disc) }
+            }
         }
     }
 

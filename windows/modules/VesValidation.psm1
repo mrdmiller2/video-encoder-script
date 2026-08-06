@@ -105,5 +105,34 @@ function Test-VesPathIsReparsePoint {
     }
 }
 
+function Write-VesLowQualityFlag {
+    <#
+    .SYNOPSIS
+    Port of bash's flag_low_quality_output_for_human(): a kept, valid
+    output whose final measured VMAF still lands below the quality floor
+    gets logged for human review. Log-only, matching the bash design: the
+    output stays exactly where the pipeline expects it (moving it would
+    make "already done" detection blind to it and cause an endless
+    re-encode-to-the-same-VMAF loop on every future scan). Same TSV shape
+    (timestamp, VMAF, output path, source path) as bash's
+    low_quality_review.txt so both platforms produce one comparable log.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$JobSidecarDir,
+        [Parameter(Mandatory)][string]$OutputPath,
+        [Parameter(Mandatory)][string]$SourcePath,
+        [Parameter(Mandatory)][double]$Vmaf,
+        [Parameter(Mandatory)][double]$Threshold
+    )
+    Write-Warning "Kept output below VMAF $Threshold floor ($Vmaf) -- flagged for human review: $OutputPath"
+    $logf = Join-Path $JobSidecarDir 'low_quality_review.txt'
+    $line = "{0}`t{1}`t{2}`t{3}" -f (Get-Date -AsUTC -Format 'yyyy-MM-ddTHH:mm:ssZ'), $Vmaf, $OutputPath, $SourcePath
+    try {
+        Add-Content -LiteralPath $logf -Value $line -Encoding utf8 -ErrorAction Stop
+    } catch {
+        Write-Warning "Could not write low-quality flag to $logf -- ${_}"
+    }
+}
+
 Export-ModuleMember -Function Get-VesMediaDurationSeconds, Test-VesDurationsMatch, `
-    Test-VesMkvStructureValid, Test-VesPathIsReparsePoint
+    Test-VesMkvStructureValid, Test-VesPathIsReparsePoint, Write-VesLowQualityFlag

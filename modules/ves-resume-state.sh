@@ -43,11 +43,12 @@ resume_init_paths() {
   BAD_SOURCES_LOG="$JOB_SIDECAR_DIR/bad_sources.txt"
   RECONVERT_FILES_LOG="$JOB_SIDECAR_DIR/reconvert_files.txt"
   STRIPPED_SUBTITLES_LOG="$JOB_SIDECAR_DIR/stripped_subtitles.txt"
+  LOW_QUALITY_LOG="$JOB_SIDECAR_DIR/low_quality_review.txt"
   RESUME_DONE_LOG="$JOB_SIDECAR_DIR/convert-v5.done"
   local p
   for p in "$RESUME_STATE_FILE" "$RESUME_QUEUE_FILE" "$MKV_STRUCTURE_CACHE_FILE" \
            "$CORRUPT_FILES_LOG" "$BAD_SOURCES_LOG" "$RECONVERT_FILES_LOG" \
-           "$STRIPPED_SUBTITLES_LOG" \
+           "$STRIPPED_SUBTITLES_LOG" "$LOW_QUALITY_LOG" \
            "$RESUME_SHARDS_FILE" "$RESUME_DONE_LOG"; do
     _neutralize_symlink_sidecar_path "$p"
   done
@@ -75,6 +76,11 @@ resume_init_paths() {
     chmod 0666 "$RECONVERT_FILES_LOG" 2>/dev/null || true
   else
     RECONVERT_FILES_LOG_FD=""
+  fi
+  if { exec {LOW_QUALITY_LOG_FD}>>"$LOW_QUALITY_LOG"; } 2>/dev/null; then
+    chmod 0666 "$LOW_QUALITY_LOG" 2>/dev/null || true
+  else
+    LOW_QUALITY_LOG_FD=""
   fi
   if { exec {STRIPPED_SUBTITLES_LOG_FD}>>"$STRIPPED_SUBTITLES_LOG"; } 2>/dev/null; then
     chmod 0666 "$STRIPPED_SUBTITLES_LOG" 2>/dev/null || true

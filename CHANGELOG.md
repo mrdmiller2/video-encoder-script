@@ -4,6 +4,36 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.0D — 2026-08-05
+
+New feature, both platforms: a kept output whose final measured VMAF lands
+below a 85.00 floor (`LOW_QUALITY_VMAF_THRESHOLD`) is now flagged for human
+review instead of silently treated as a normal successful pass — matters
+most for must-eliminate legacy sources (avi/ogm/mpg/rmvb/etc.) where the
+existing format-elimination override already keeps a lower-quality AV1/x265
+output rather than leaving the undesirable container in place.
+
+Bash (`ves-validation.sh`): `write_ves_processed_tag()` checks the already-
+measured final VMAF and, below the floor, stamps a visible marker into the
+file's own tag and calls the new `flag_low_quality_output_for_human()`,
+which appends to a new `low_quality_review.txt` sidecar log
+(`ves-resume-state.sh`/`ves-config.sh` wire up its FD same as
+`bad_sources.txt`). Deliberately log-only, unlike `flag_bad_source_for_human`
+— the output stays at its canonical derived path; moving it would make
+`inspect_existing_outputs_for_queue`'s "done" detection blind to it and
+cause an endless re-encode-to-the-same-VMAF loop on every future scan.
+
+Windows (`convert.ps1`): new `Get-VesFinalVmaf` (`VesVmafCrfSearch.psm1`,
+libvmaf sampled comparison, same 3×20s sampling as bash's
+`measure_final_vmaf` but parses the JSON via PowerShell's built-in
+`ConvertFrom-Json` instead of shelling out to python3 — no new dependency
+needed) and `Write-VesLowQualityFlag` (`VesValidation.psm1`, same TSV shape
+as bash's log so both platforms produce one comparable record), wired into
+`Invoke-VesEncodeAndValidate` for both the real-encode and must-eliminate
+remux-floor success paths. This is new infrastructure on the Windows side,
+not a port — the port had no post-encode quality measurement, tag, or
+Deferred/-style human-review mechanism at all before this.
+
 ## v5.1.0C — 2026-08-04
 
 Fixes a real, pre-existing bug found during a broader post-modularization
