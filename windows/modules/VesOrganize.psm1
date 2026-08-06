@@ -138,6 +138,12 @@ function Test-VesIsDerivedOutput {
     if ($base -match '\.(AV1|av1|x265|X265)\.mkv$') { return $true }
     if ($base -match '-av1\.mkv$') { return $true }
     if ($OutputSuffix -and $base -match ([regex]::Escape($OutputSuffix) + '\.mkv$')) { return $true }
+    # convert.ps1's own x265 size-guard fallback naming (fixed, not
+    # -OutputSuffix-configurable) -- team review, 2026-08-06: missing
+    # this was the same class of self-reencode cascade bug the
+    # -OutputSuffix check above was added to fix, just for the newer
+    # x265 fallback path instead of the original AV1 path.
+    if ($base -match '\.X265-WIN\.mkv$') { return $true }
     return $false
 }
 

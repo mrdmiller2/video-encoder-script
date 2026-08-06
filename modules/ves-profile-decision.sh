@@ -41,6 +41,9 @@ is_derived_output() {
   # -- without this, a bash rescan would treat a Windows-produced
   # "Title.AV1-WIN.mkv" as an unprocessed source (team review, 2026-08-05).
   [[ "$base" =~ \.AV1-WIN\.mkv$ ]] && return 0
+  # Windows port's x265 size-guard fallback naming (team review,
+  # 2026-08-06) -- same cascade risk as the AV1-WIN case above if missed.
+  [[ "$base" =~ \.X265-WIN\.mkv$ ]] && return 0
   return 1
 }
 
@@ -59,6 +62,13 @@ derived_output_codec_claim_matches() {
   case "$base" in
     *.[Aa][Vv]1.mkv) codec="$(video_codec "$out" 2>/dev/null)"; [ "$codec" = "av1" ] ;;
     *.[Xx]265.mkv)   codec="$(video_codec "$out" 2>/dev/null)"; [ "$codec" = "hevc" ] ;;
+    # Windows port's own output naming (team review, 2026-08-06) -- same
+    # real codec-claim proof now applies to cross-platform outputs too,
+    # closing the gap where a *.AV1-WIN.mkv/*.X265-WIN.mkv candidate fell
+    # through to the permissive bare-.mkv case below with no ownership
+    # proof at all before flag_bad_processed_output could delete it.
+    *.[Aa][Vv]1-WIN.mkv) codec="$(video_codec "$out" 2>/dev/null)"; [ "$codec" = "av1" ] ;;
+    *.[Xx]265-WIN.mkv)   codec="$(video_codec "$out" 2>/dev/null)"; [ "$codec" = "hevc" ] ;;
     # A bare Title.mkv (must_eliminate_remux_path's output -- no codec
     # suffix, since it's a plain stream-copy remux, not a re-encode) has no
     # codec claim to verify, so this permissive fallback trusts it. Team
@@ -129,6 +139,16 @@ windows_output_path() {
   dir="$(media_content_dir "$src")"
   title="$(canonical_title_from_source "$src")"
   printf '%s/%s.AV1-WIN.mkv' "$dir" "$title"
+}
+
+# Windows port's x265 size-guard fallback naming (team review, 2026-08-06)
+# -- same cross-platform completion-recognition need as windows_output_path.
+windows_x265_output_path() {
+  local src="$1"
+  local dir title
+  dir="$(media_content_dir "$src")"
+  title="$(canonical_title_from_source "$src")"
+  printf '%s/%s.X265-WIN.mkv' "$dir" "$title"
 }
 
 is_oversized_av1() {
@@ -547,6 +567,27 @@ inspect_existing_outputs_for_queue() {
       return 1
     fi
     flag_bad_processed_output "$src" "$win_out" "invalid processed Windows-port output (scan)"
+  fi
+
+  # Same cross-platform reasoning as the AV1-WIN check just above, for
+  # Windows's x265 size-guard fallback naming (team review, 2026-08-06).
+  local win_x265_out
+  win_x265_out="$(windows_x265_output_path "$src")"
+  if [ -f "$win_x265_out" ]; then
+    MKV_VALIDATE_DEFERRED=false
+    MKV_VALIDATE_TIMED_OUT=false
+    if validate_mkv_output "$src" "$win_x265_out" "" true; then
+      done_log_append done "$src"
+      return 1
+    fi
+    if [ "$MKV_VALIDATE_DEFERRED" = true ]; then
+      return 0
+    fi
+    if [ "$MKV_VALIDATE_TIMED_OUT" = true ]; then
+      warn "Validation timed out for $win_x265_out — leaving output in place for retry next run"
+      return 1
+    fi
+    flag_bad_processed_output "$src" "$win_x265_out" "invalid processed Windows-port x265 output (scan)"
   fi
 
   if is_must_eliminate_format "$src"; then

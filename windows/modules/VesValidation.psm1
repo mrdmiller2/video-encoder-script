@@ -234,10 +234,24 @@ function Find-VesExistingValidOutput {
     $candidates = @(
         (Join-Path $dir "$title.AV1.mkv"),
         (Join-Path $dir "$title.x265.mkv"),
-        (Join-Path $dir "$title$OutputSuffix.mkv")
+        (Join-Path $dir "$title$OutputSuffix.mkv"),
+        # convert.ps1's own x265 size-guard fallback naming (fixed, not
+        # -OutputSuffix-configurable) -- team review, 2026-08-06: missing
+        # this meant a title that finished via the x265 fallback path
+        # was never recognized as already-done by this check.
+        (Join-Path $dir "$title.X265-WIN.mkv")
     )
+    # Full-path normalization, not a raw string match -- $Source can arrive
+    # with forward slashes (a user-typed -SearchPath in single-file mode
+    # isn't run through Join-Path the way $cand is), which a plain -eq
+    # would miss. Found via review, 2026-08-06: without this, an -InPlace
+    # or empty-$OutputSuffix run could have $cand resolve to $Source
+    # itself, and this function would then ffprobe the source, see a
+    # valid duration against itself, and return the SOURCE as if it were
+    # an already-existing output -- silently skipping the encode entirely.
+    $sourceFull = [System.IO.Path]::GetFullPath($Source)
     foreach ($cand in $candidates) {
-        if ($cand -eq $Source) { continue }
+        if ([System.IO.Path]::GetFullPath($cand) -eq $sourceFull) { continue }
         if (-not (Test-Path -LiteralPath $cand -PathType Leaf)) { continue }
         if ($MkvalidatorPath) {
             $structOk = Test-VesMkvStructureValid -Path $cand -MkvalidatorPath $MkvalidatorPath

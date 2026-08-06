@@ -4,6 +4,76 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.0H — 2026-08-06
+
+E2E confidence review (Gemini, Codex, Cursor, run independently in
+parallel) of v5.1.0G found two critical bugs in the new size-guard/x265
+fallback and derived-output recognition, both confirmed independently by
+multiple reviewers, plus several smaller real issues.
+
+- **Critical, data-loss: `-InPlace` + oversized/failed AV1 could delete
+  the only remaining copy of a title.** `-InPlace` makes `$Destination`
+  literally equal `$EncodeSource` for a source already named `*.mkv`. By
+  the time a successful AV1 attempt returns from
+  `Invoke-VesCodecEncodeAttempt`, the staging finalize has already
+  atomically replaced the source with the new encode (the whole point of
+  `-InPlace`). The v5.1.0G size-guard fallback then unconditionally
+  deleted `$Destination` before trying x265 -- if x265 also failed, the
+  title was gone permanently. Fixed by detecting the InPlace-collision
+  case up front and skipping the size-guard/x265-fallback dance entirely
+  for it, exactly matching this port's pre-v5.1.0G `-InPlace` behavior
+  (no size guard existed then either -- no new risk, just none of the
+  new benefit for this one mode). Empirically verified on PRINCE: a
+  254%-oversized AV1 result is now kept without ever reaching the
+  fallback/deletion code path.
+- **Critical: the new x265 fallback's `Title.X265-WIN.mkv` naming wasn't
+  recognized as a derived output anywhere.** Same cascade-risk class as
+  the v5.1.0F `.AV1-WIN.mkv` bug, for the newer x265 fallback path this
+  same release introduced. Fixed in all five places that needed it:
+  bash's `is_derived_output` and a new `windows_x265_output_path` wired
+  into `inspect_existing_outputs_for_queue`; Windows's
+  `Test-VesIsDerivedOutput`, `Find-VesExistingValidOutput`, and the
+  pipeline-mode `ShouldQueue` scriptblock. Empirically verified on
+  PRINCE.
+- Hardened `derived_output_codec_claim_matches` (bash) to recognize
+  `.AV1-WIN.mkv`/`.X265-WIN.mkv` explicitly instead of falling through to
+  the permissive bare-`.mkv` case -- closes a real (if narrow) gap where
+  a cross-platform output candidate had no codec-claim proof at all
+  before a deletion decision.
+- `Find-VesExistingValidOutput`: candidate-vs-source comparison now
+  normalizes full paths instead of a raw string `-eq` -- a user-typed
+  `-SearchPath` with forward slashes could otherwise make a candidate
+  resolve to the source itself, and the function would ffprobe the
+  source against itself and return it as an "existing valid output,"
+  silently skipping the encode.
+- Must-eliminate AV1 retry: now cleans up an invalid retry output instead
+  of leaving a canonical-looking but unvalidated `Title.AV1-WIN.mkv` for
+  a future scan to mistake for a finished title.
+- Dolby Vision Profile 5 on the disc-source path: `Invoke-VesProcessDiskSource`'s
+  `EncodeFunction` contract only returns a bool, so `NeedsHumanReview`
+  was silently dropped for disc sources -- a DoVi P5 disc extraction
+  without libplacebo failed every scan forever instead of being durably
+  parked like the non-disc path already was. Fixed via a script-scoped
+  variable smuggled out of the closure (chosen over changing the shared
+  `EncodeFunction` contract, which every other caller also depends on).
+
+**Reviewed and confirmed not real issues:** a reviewer claimed
+`[Nullable[double]]` isn't valid PowerShell type-accelerator syntax --
+already empirically verified working correctly via direct testing
+earlier this same review cycle, both in isolation and through the actual
+shipped code path; not changed.
+
+**Logged as real but lower-priority, not fixed this pass:** a
+theoretical race where `inspect_existing_outputs_for_queue`'s pipeline
+scan could observe a mid-write cross-platform output over a slow SMB
+link (largely mitigated already by the existing atomic-rename staging
+pattern on both platforms, but not independently re-verified for this
+specific interaction); `Find-VesExistingValidOutput` running before
+`Enter-VesTitleLock` in `Invoke-VesFileJob` (same mitigation reasoning);
+a pre-existing (not introduced by this release) partial-line read risk
+in `VesPipelineScan.psm1`'s ready-queue consumer over a slow/interrupted
+SMB write.
+
 ## v5.1.0G — 2026-08-06
 
 Remediation of the four remaining gaps flagged by the v5.1.0D/E team

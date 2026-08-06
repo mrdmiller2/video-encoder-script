@@ -349,6 +349,23 @@ function Invoke-VesEncodeAndValidate {
     )
     $errLogDir = Join-Path $JobRoot 'ffmpeg-logs'
     $srcSizeBytes = (Get-Item -LiteralPath $EncodeSource -Force).Length
+    # -InPlace makes $Destination literally equal $EncodeSource for a
+    # source already named *.mkv -- by the time a successful AV1 attempt
+    # returns here, Invoke-VesTwoStageEncode's staging finalize has
+    # ALREADY atomically replaced the source with the new encode (that's
+    # the whole point of -InPlace). A real, serious bug found via team
+    # review (2026-08-06, confirmed independently by two reviewers): the
+    # size-guard fallback below unconditionally deletes $Destination
+    # before trying x265, which in this specific case deletes the ONLY
+    # remaining copy of the title -- if x265 then also fails, the source
+    # is gone permanently. Matches bash's own "computed output path is
+    # identical to the source, would destroy it" refusal class of guard.
+    # Fix: skip the size-guard/x265-fallback dance entirely for this case
+    # and just accept the AV1 result unconditionally, exactly matching
+    # this port's pre-v5.1.0G behavior for -InPlace (no size guard existed
+    # then either) -- no new risk introduced, just none of the new benefit
+    # for this one mode.
+    $inPlaceCollision = ($Destination -eq $EncodeSource)
 
     $av1Result = Invoke-VesCodecEncodeAttempt -EncodeSource $EncodeSource -ProfileSource $ProfileSource -Destination $Destination -Codec av1
     if ($av1Result.NeedsHumanReview) { return $av1Result }
@@ -356,7 +373,17 @@ function Invoke-VesEncodeAndValidate {
     $finalDst = $Destination
     $ok = $false
 
-    if ($av1Result.Ok) {
+    if ($inPlaceCollision) {
+        # Skip the size-guard/x265-fallback dance entirely -- see the
+        # comment above $inPlaceCollision. Matches this port's pre-
+        # v5.1.0G behavior for -InPlace exactly: accept whatever AV1
+        # produced (or didn't), never attempt a second encode that would
+        # require deleting the only remaining copy first.
+        $ok = $av1Result.Ok
+        if (-not $ok) {
+            Write-VesLog "AV1 encode/validation failed -- -InPlace target, not attempting x265 fallback (would require deleting the only remaining copy first): $EncodeSource"
+        }
+    } elseif ($av1Result.Ok) {
         $overshootPct = if ($srcSizeBytes -gt 0) { (($av1Result.SizeBytes - $srcSizeBytes) / $srcSizeBytes) * 100 } else { 0 }
         if ($av1Result.SizeBytes -le $srcSizeBytes -or $overshootPct -le $Av1MaxOvershootPct) {
             $finalDst = $av1Result.Destination
@@ -378,7 +405,7 @@ function Invoke-VesEncodeAndValidate {
         Write-VesLog "AV1 encode/validation failed -- trying x265 fallback: $EncodeSource"
     }
 
-    if (-not $ok) {
+    if (-not $ok -and -not $inPlaceCollision) {
         # Parens around the pattern are load-bearing (found via direct
         # testing, 2026-08-06): without them, -replace's operator
         # precedence does not bind '+ "$"' to the pattern operand as a
@@ -407,6 +434,15 @@ function Invoke-VesEncodeAndValidate {
             if ($av1Retry.Ok) {
                 $finalDst = $av1Retry.Destination
                 $ok = $true
+            } else {
+                # Invoke-VesCodecEncodeAttempt's own validation-failure path
+                # doesn't clean up $Destination (its caller usually still
+                # wants the failed artifact for a future retry attempt) --
+                # here, that would leave an invalid file sitting at the
+                # canonical output path where a future scan's derived-output
+                # detection would treat it as a finished title. Found via
+                # review, 2026-08-06.
+                Remove-VesFileRobust -Path $Destination
             }
         } else {
             Remove-VesFileRobust -Path $x265Dst
@@ -517,15 +553,29 @@ function Invoke-VesFileJob {
                 $contentDir = Get-VesDiscMediaContentDir -Source $src
                 $dst = Join-Path $contentDir "$([System.IO.Path]::GetFileNameWithoutExtension($linkBase))$OutputSuffix.mkv"
 
+                # Invoke-VesProcessDiskSource's EncodeFunction contract only
+                # returns a bool -- $r.NeedsHumanReview/$r.Reason (e.g. a
+                # DoVi P5 disc source without libplacebo) was silently
+                # dropped before this, so that case just looked like an
+                # ordinary encode failure and retried every scan forever
+                # instead of being durably parked like the non-disc path.
+                # Smuggled out via a script-scoped variable since changing
+                # the EncodeFunction contract itself would touch every
+                # other caller. Found via review, 2026-08-06.
+                $script:discNeedsHumanReview = $null
                 $discResult = Invoke-VesProcessDiskSource -HandBrakeCliPath $HandBrakeCliPath -Source $src -Destination $dst `
                     -ScratchRootDir $DiscScratchDir -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -EncodeFunction {
                         param($ExtractedPath, $LogicalSource, $Destination)
                         $r = Invoke-VesEncodeAndValidate -EncodeSource $ExtractedPath -ProfileSource $LogicalSource -Destination $Destination -IsDiscSource
+                        if ($r.NeedsHumanReview) { $script:discNeedsHumanReview = $r.Reason }
                         return $r.Ok
                     }
                 if ($discResult.Action -eq 'processed' -and $discResult.Success) {
                     Write-VesLog "Disc source processed: $dst"
                     Add-VesDoneLogEntry -Status done -Source $src -DoneLogDir $doneLogDir -FfmpegPath $FfmpegPath
+                    $ok = $true
+                } elseif ($script:discNeedsHumanReview) {
+                    Write-VesBadSourceFlag -Source $src -Reason $script:discNeedsHumanReview -JobSidecarDir $JobRoot -DoneLogDir $doneLogDir -FfmpegPath $FfmpegPath
                     $ok = $true
                 } else {
                     Write-VesLog "Disc source not processed (action=$($discResult.Action) reason=$($discResult.Reason)): $src"
@@ -614,6 +664,7 @@ param(`$f)
 if (`$base -match '\.(AV1|av1|x265|X265)\.mkv$') { return `$false }
 if (`$base -match '-av1\.mkv$') { return `$false }
 if (`$base -match '$escapedSuffix\.mkv$') { return `$false }
+if (`$base -match '\.X265-WIN\.mkv$') { return `$false }
 return `$true
 "@)
     $handle = Start-VesScanProducer -SearchPath $SearchPath -ReadyQueuePath $readyQueue -ScanDonePath $scanDoneFlag -VideoExtensions $VideoExtensions -ShouldQueue $shouldQueueScript
