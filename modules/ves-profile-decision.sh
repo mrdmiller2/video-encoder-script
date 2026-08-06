@@ -35,6 +35,12 @@ is_derived_output() {
   local base="${1##*/}"
   [[ "$base" =~ \.(AV1|av1|x265|X265)\.mkv$ ]] && return 0
   [[ "$base" =~ -av1\.mkv$ ]] && return 0
+  # Windows port's own default -OutputSuffix (windows/convert.ps1).
+  # Fleet machines can share the same NAS-mounted library trees, so a
+  # bash machine must also recognize the other platform's output naming
+  # -- without this, a bash rescan would treat a Windows-produced
+  # "Title.AV1-WIN.mkv" as an unprocessed source (team review, 2026-08-05).
+  [[ "$base" =~ \.AV1-WIN\.mkv$ ]] && return 0
   return 1
 }
 

@@ -4,6 +4,78 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.0F — 2026-08-05
+
+Follow-up triage of the remaining gaps Cursor surfaced during the v5.1.0D/E
+team review that hadn't yet been addressed. Two real, severe bugs fixed;
+one gap reviewed and confirmed safe as-is; the rest assessed as genuine
+but out of scope for a quick fix (see "Known gaps" below).
+
+- **`windows/convert.ps1` — main convert-mode scan (both batch and
+  pipeline) never filtered out this port's own prior outputs.**
+  `Test-VesIsDerivedOutput` existed but was only ever called from the
+  organize phase — the actual file-collection loops that feed the
+  encode queue had zero derived-output filtering. Every full-library
+  rescan was re-queuing "Title.AV1-WIN.mkv" as if it were a fresh
+  unprocessed source, encoding it into "Title.AV1-WIN.AV1-WIN.mkv", and
+  so on indefinitely on every subsequent run — real, ongoing data/compute
+  waste with no bound. Fixed by filtering both the batch-mode
+  `Get-ChildItem` loop and the pipeline-mode background scan producer
+  (the latter needed a self-contained scriptblock, since the producer
+  runs in an isolated runspace with no access to imported modules).
+  `Test-VesIsDerivedOutput` itself also gained a `-OutputSuffix`
+  parameter (defaulting to '.AV1-WIN', matching `convert.ps1`'s own
+  default) — neither of its two historical bash-style patterns ever
+  matched this port's actual default output filename.
+- **`modules/ves-profile-decision.sh` — bash's `is_derived_output` had
+  no knowledge of the Windows port's `.AV1-WIN.mkv` convention either.**
+  Fleet machines share the same NAS-mounted library trees, so a bash
+  machine rescanning a folder a Windows machine already processed would
+  treat that output as an unprocessed source too. Fixed by adding the
+  `.AV1-WIN.mkv` pattern to bash's own check.
+- **`windows/modules/VesValidation.psm1` — `Test-VesDurationsMatch`'s
+  null-ambiguity guard was dead code.** A plain `[double]` parameter
+  coerces a `$null` argument to `0.0` during PowerShell's own parameter
+  binding, before the function body's `$null -eq $DurationA` check ever
+  runs — confirmed via direct testing. Two real callers (`convert.ps1`,
+  `VesLegacyFallback.psm1`) pass both durations straight through with no
+  null-check of their own first, so if both ffprobe duration probes
+  failed (e.g. a stalled NAS), this was scoring "0.0 vs 0.0, matched"
+  instead of "can't confirm" — risking a done-logged file that was never
+  actually duration-verified. Fixed by changing both parameters to
+  `[Nullable[double]]`, which preserves `$null` through binding; the
+  existing body logic was already correct once given a real `$null`.
+  (`VesOrphanReaper.psm1`'s own caller already null-checked before
+  calling this function, so it was unaffected either way.)
+
+**Reviewed and confirmed safe as-is** (not changed): Windows leaving a
+confirmed-invalid output in place instead of deleting it (bash's
+`remove_output_only` deletes on confirmed failure) — traced through and
+confirmed this does NOT block retries, since Windows keys "already done"
+off the done-log, not output-file-existence, and every ffmpeg encode
+invocation already uses `-y` to cleanly overwrite a stale file on the
+next attempt. A real gap from bash's behavior, but cosmetic (a bad file
+visible in the library between runs), not a correctness or retry-blocking
+issue — matches this project's "ambiguous is not proof of anything" fail-open
+philosophy already used everywhere else in the port. Also confirmed the
+mkvalidator-timeout-as-"structure OK" behavior Cursor flagged is the same
+deliberate design, not a bug (`Test-VesMkvStructureValid` returning `$null`
+on ambiguity, and callers only failing on a confirmed `$false`, mirrors
+`Get-VesMediaDurationSeconds`'s own documented contract).
+
+**Known gaps, not addressed this pass** (real, but each is a bigger design
+question rather than a quick fix — flagged for a future dedicated pass):
+cross-OS title-lock/done-log non-interop (bash and Windows use different
+lock-file and done-log conventions with no shared state, so the two
+platform families can't see each other's in-progress or completed claims
+on a shared library); Windows has no size-guard/x265 bake-off fallback
+(keeps any duration/structure-valid AV1 regardless of size, where bash
+can reject an oversized AV1 and fall back to x265); Dolby Vision Profile 5
+without libplacebo isn't parked for human review on Windows the way bash's
+`flag_bad_source_for_human` does (the job just fails and retries forever
+instead); `Write-VesLowQualityFlag` uses plain `Add-Content` without the
+symlink-neutralize/open-FD hardening bash's sidecar logs have.
+
 ## v5.1.0E — 2026-08-05
 
 Team review (Gemini, Codex, Cursor, run independently in parallel) of

@@ -433,7 +433,23 @@ if ($usePipeline) {
     Write-VesLog "Convert mode: pipeline (background scan while encoding) -- $SearchPath"
     $readyQueue = Join-Path $JobRoot 'pipeline-ready.txt'
     $scanDoneFlag = Join-Path $JobRoot 'pipeline-scandone.txt'
-    $handle = Start-VesScanProducer -SearchPath $SearchPath -ReadyQueuePath $readyQueue -ScanDonePath $scanDoneFlag -VideoExtensions $VideoExtensions
+    # Self-contained (no module calls -- the background runspace doesn't
+    # have VesOrganize.psm1 imported) equivalent of Test-VesIsDerivedOutput,
+    # with $OutputSuffix baked in as a literal via string interpolation
+    # since Start-VesScanProducer only forwards the scriptblock's .ToString()
+    # across the runspace boundary, not captured variables. Same gap/fix as
+    # the batch-mode loop above -- pipeline mode was equally queuing its own
+    # prior outputs before this (team review, 2026-08-05).
+    $escapedSuffix = [regex]::Escape($OutputSuffix)
+    $shouldQueueScript = [scriptblock]::Create(@"
+param(`$f)
+`$base = Split-Path -Leaf `$f
+if (`$base -match '\.(AV1|av1|x265|X265)\.mkv$') { return `$false }
+if (`$base -match '-av1\.mkv$') { return `$false }
+if (`$base -match '$escapedSuffix\.mkv$') { return `$false }
+return `$true
+"@)
+    $handle = Start-VesScanProducer -SearchPath $SearchPath -ReadyQueuePath $readyQueue -ScanDonePath $scanDoneFlag -VideoExtensions $VideoExtensions -ShouldQueue $shouldQueueScript
     try {
         $offset = 0
         $idx = 0
@@ -487,14 +503,21 @@ if ($usePipeline) {
         }
     } else {
         Write-VesLog "Convert mode: batch (scan everything, then encode) -- $SearchPath"
+        # Test-VesIsDerivedOutput skip is REQUIRED here, not optional --
+        # without it this loop queues this port's own prior outputs
+        # ("Title$OutputSuffix.mkv") as if they were fresh sources on
+        # every rescan (team review, 2026-08-05; see that function's
+        # comment for the full story).
         foreach ($root in $scanRoots) {
             Get-ChildItem -LiteralPath $root -Recurse -Force -File -ErrorAction SilentlyContinue |
                 Where-Object { $VideoExtensions -contains $_.Extension.TrimStart('.').ToLowerInvariant() } |
+                Where-Object { -not (Test-VesIsDerivedOutput -Path $_.FullName -OutputSuffix $OutputSuffix) } |
                 ForEach-Object { $allFiles.Add($_.FullName) }
         }
         if (Test-VesRootsNeedCatchupScan -SearchPath $SearchPath -VideoExtensions $VideoExtensions) {
             Get-ChildItem -LiteralPath $SearchPath -Force -File -ErrorAction SilentlyContinue |
                 Where-Object { $VideoExtensions -contains $_.Extension.TrimStart('.').ToLowerInvariant() } |
+                Where-Object { -not (Test-VesIsDerivedOutput -Path $_.FullName -OutputSuffix $OutputSuffix) } |
                 ForEach-Object { if (-not $allFiles.Contains($_.FullName)) { $allFiles.Add($_.FullName) } }
         }
         if ($HandBrakeCliPath) {

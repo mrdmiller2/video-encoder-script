@@ -118,11 +118,26 @@ function Test-VesIsDerivedOutput {
     Port of is_derived_output(): a cheap, name-only guess (never
     ffprobes here) used to skip this port's own prior output during a
     broad organize scan.
+
+    .PARAMETER OutputSuffix
+    Matches convert.ps1's own -OutputSuffix (default '.AV1-WIN') in
+    addition to the two historical bash-style patterns. Without this,
+    neither historical pattern ever matches this port's actual default
+    output filename ("Title.AV1-WIN.mkv") -- team review, 2026-08-05,
+    found the main convert-mode scan (both batch and pipeline) never
+    called this function at all, so every full-library rescan was
+    re-queuing its own prior outputs as if they were fresh unprocessed
+    sources, cascading into Title.AV1-WIN.AV1-WIN.mkv and beyond on each
+    subsequent run.
     #>
-    param([Parameter(Mandatory)][string]$Path)
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$OutputSuffix = '.AV1-WIN'
+    )
     $base = Split-Path -Leaf $Path
     if ($base -match '\.(AV1|av1|x265|X265)\.mkv$') { return $true }
     if ($base -match '-av1\.mkv$') { return $true }
+    if ($OutputSuffix -and $base -match ([regex]::Escape($OutputSuffix) + '\.mkv$')) { return $true }
     return $false
 }
 

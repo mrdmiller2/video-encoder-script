@@ -45,8 +45,17 @@ function Test-VesDurationsMatch {
     implying corruption.
     #>
     param(
-        [double]$DurationA,
-        [double]$DurationB,
+        # [Nullable[double]], not [double]: a plain [double] parameter
+        # coerces a $null argument to 0.0 during binding, BEFORE the body
+        # ever runs -- the null-check below was silently dead code (team
+        # review, 2026-08-05, confirmed via direct testing). Two real
+        # callers (convert.ps1, VesLegacyFallback.psm1) pass both
+        # durations straight through without their own null-check first,
+        # so a stalled-NAS probe failure on both sides was scoring as
+        # "0.0 vs 0.0, matched" instead of "can't confirm" -- risking a
+        # done-logged file that was never actually duration-verified.
+        [Nullable[double]]$DurationA,
+        [Nullable[double]]$DurationB,
         [double]$ToleranceSeconds = 2.0
     )
     if ($null -eq $DurationA -or $null -eq $DurationB) { return $false }
