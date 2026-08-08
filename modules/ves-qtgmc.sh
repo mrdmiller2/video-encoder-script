@@ -246,8 +246,31 @@ PYEOF
   # QTGMC's real deinterlace had never actually succeeded on real
   # production-length content all session; every prior "successful" test
   # used short manual clips fast enough to dodge the short timeout.
-  if ! QTGMC_SRC_PATH="$src" "$vspipe_bin" -c y4m "$script" - 2>"$stage_dir/qtgmc.log" | \
-      run_tracked_encoder "QTGMC deinterlace" "${FFMPEG_CMD[@]}" -y -v error -i - "${sar_vf_args[@]}" -c:v libx264 -crf 0 -preset veryfast -an "$intermediate"; then
+  #
+  # Outer `timeout` (not just run_tracked_encoder's own PID tracking):
+  # without `shopt -s lastpipe` (not set anywhere in this codebase),
+  # run_tracked_encoder -- the RHS of this pipe -- executes in a subshell,
+  # so ACTIVE_ENCODER_PID/the SIGINT/SIGTERM interrupt handler in the
+  # parent shell can never see or kill it; this pipe was left completely
+  # unbounded by the fix above, a real (if narrower) regression from the
+  # bug it fixed. `timeout --kill-after` bounds the whole pipeline's own
+  # process group directly, independent of that subshell/tracking gap.
+  # Generously duration-scaled (not a short fixed cap) since QTGMC is
+  # real, slow, motion-compensated work -- found by independent
+  # multi-tool review, 2026-08-08.
+  local src_dur qtgmc_timeout
+  src_dur="$(video_duration "$src" 2>/dev/null)"; src_dur="${src_dur%.*}"
+  case "$src_dur" in ''|*[!0-9]*) src_dur=0 ;; esac
+  qtgmc_timeout=$(( 1800 + src_dur * 20 ))
+  # run_with_timeout (ves-timeout-retry.sh), not a bare `timeout` call --
+  # this module is shared with macOS, which has no `timeout` binary at
+  # all unless Homebrew's `gtimeout` is installed; run_with_timeout
+  # already resolves that (and degrades to a background+poll+TERM/KILL
+  # fallback if neither exists) everywhere else in this codebase.
+  if ! run_with_timeout "$qtgmc_timeout" bash -c \
+      'QTGMC_SRC_PATH="$1" "$2" -c y4m "$3" - 2>"$4" | "${@:5}"' _ \
+      "$src" "$vspipe_bin" "$script" "$stage_dir/qtgmc.log" \
+      "${FFMPEG_CMD[@]}" -y -v error -i - "${sar_vf_args[@]}" -c:v libx264 -crf 0 -preset veryfast -an "$intermediate"; then
     warn "QTGMC deinterlace failed (see $stage_dir/qtgmc.log) — falling back to bwdif for: $src"
     rm -rf "$stage_dir"
     return 1

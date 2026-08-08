@@ -254,6 +254,22 @@ function Invoke-VesCodecEncodeAttempt {
         [Parameter(Mandatory)][string]$Destination,
         [Parameter(Mandatory)][ValidateSet('av1', 'hevc')][string]$Codec
     )
+    # Wrapped in try/finally (2026-08-08 fix): $qtgmcIntermediate is a
+    # local of THIS function, and every attempt to clean it up or measure
+    # a same-representation VMAF against it from the CALLER
+    # (Invoke-VesEncodeAndValidate) silently no-opped -- PowerShell
+    # functions don't share locals with their callers, so $videoSrc/
+    # $qtgmcIntermediate read back there were always $null. Found by
+    # independent multi-tool review (Gemini + Codex) of this exact fix,
+    # both converging on the same root cause. finally guarantees the
+    # staging-dir cleanup fires on every exit path from this function
+    # (success, encode failure, validation failure, DoVi P5 return) --
+    # mirroring bash's `trap ... RETURN` in ffmpeg_encode() exactly. The
+    # same-representation final VMAF (QTGMC_FINAL_VMAF equivalent) is
+    # computed HERE, before cleanup, and returned in the result object,
+    # since the caller can no longer safely reach the intermediate itself.
+    $qtgmcIntermediate = $null
+    try {
     $profile = if ($ForceProfile) { $ForceProfile } else { Get-VesDetectedProfileForPath -Path $ProfileSource }
 
     # Vintage-profile real deinterlace (QTGMC), confidently-detected genuine
@@ -404,7 +420,26 @@ function Invoke-VesCodecEncodeAttempt {
     }
 
     $sizeBytes = (Get-Item -LiteralPath $Destination -Force).Length
-    return [PSCustomObject]@{ Ok = $true; Destination = $Destination; SizeBytes = $sizeBytes }
+    # Same-representation final VMAF, computed here (not by the caller)
+    # while $qtgmcIntermediate still exists in THIS function's scope --
+    # comparing the output against $EncodeSource (the raw interlaced/
+    # telecined original) instead would be a meaningless comparison (see
+    # the finally block below / bash's matching QTGMC_FINAL_VMAF_* fix).
+    $qtgmcVmaf = $null
+    if ($videoSrc -ne $EncodeSource) {
+        $qtgmcVmaf = Get-VesFinalVmaf -Source $videoSrc -Output $Destination -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -TargetHeight $upscaleTarget
+    }
+    return [PSCustomObject]@{ Ok = $true; Destination = $Destination; SizeBytes = $sizeBytes; QtgmcVmaf = $qtgmcVmaf }
+    } finally {
+        # Nothing else ever removed QTGMC's staging directory on success --
+        # only Invoke-VesQtgmcDeinterlace's own failure branch did. finally
+        # guarantees this runs on every exit from this function (the four
+        # early `return`s above included), after the VMAF measurement on
+        # the success path has already consumed the intermediate.
+        if ($qtgmcIntermediate) {
+            Remove-Item -Path (Split-Path -Parent $qtgmcIntermediate) -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 function Invoke-VesEncodeAndValidate {
@@ -438,6 +473,14 @@ function Invoke-VesEncodeAndValidate {
     if ($av1Result.NeedsHumanReview) { return $av1Result }
 
     $finalDst = $Destination
+    # Tracks whichever *EncodeAttempt result object actually corresponds
+    # to $finalDst, so the final-VMAF measurement below can reach that
+    # attempt's QtgmcVmaf (computed inside Invoke-VesCodecEncodeAttempt,
+    # where $videoSrc/$qtgmcIntermediate are actually in scope -- see the
+    # 2026-08-08 fix there). Stays $null for the must-eliminate remux
+    # floor path, which never runs QTGMC at all -- correctly falls back
+    # to measuring against $EncodeSource in that case.
+    $keptResult = $null
     $ok = $false
     # Set on any silent-fallthrough path below (both AV1 and x265 rejected
     # by the size guard, non-must-eliminate source, or a must-eliminate
@@ -459,6 +502,7 @@ function Invoke-VesEncodeAndValidate {
         # produced (or didn't), never attempt a second encode that would
         # require deleting the only remaining copy first.
         $ok = $av1Result.Ok
+        $keptResult = $av1Result
         if (-not $ok) {
             Write-VesLog "AV1 encode/validation failed -- -InPlace target, not attempting x265 fallback (would require deleting the only remaining copy first): $EncodeSource"
         }
@@ -466,6 +510,7 @@ function Invoke-VesEncodeAndValidate {
         $overshootPct = if ($srcSizeBytes -gt 0) { (($av1Result.SizeBytes - $srcSizeBytes) / $srcSizeBytes) * 100 } else { 0 }
         if ($av1Result.SizeBytes -le $srcSizeBytes -or $overshootPct -le $Av1MaxOvershootPct) {
             $finalDst = $av1Result.Destination
+            $keptResult = $av1Result
             $ok = $true
         } else {
             # Size-guard rejection -- port of bash's size_keep_policy_av1
@@ -498,6 +543,7 @@ function Invoke-VesEncodeAndValidate {
 
         if ($x265Result.Ok -and ($x265Result.SizeBytes -le $srcSizeBytes -or -not $av1Result.Ok)) {
             $finalDst = $x265Result.Destination
+            $keptResult = $x265Result
             $ok = $true
             Write-VesLog "Kept x265 fallback: $finalDst"
         } elseif ($av1Result.Ok -and (Test-VesIsMustEliminateFormat -Source $ProfileSource)) {
@@ -513,6 +559,7 @@ function Invoke-VesEncodeAndValidate {
             if ($av1Retry.NeedsHumanReview) { return $av1Retry }
             if ($av1Retry.Ok) {
                 $finalDst = $av1Retry.Destination
+                $keptResult = $av1Retry
                 $ok = $true
             } else {
                 # Invoke-VesCodecEncodeAttempt's own validation-failure path
@@ -584,18 +631,27 @@ function Invoke-VesEncodeAndValidate {
         # against the source at mismatched resolutions, so libvmaf fails
         # every sample -- team review, 2026-08-05, caught this was missing.
         $upscaleTarget = Resolve-VesUpscaleTarget -Source $EncodeSource -FfprobePath $FfprobePath
-        # Reference $videoSrc (QTGMC's deinterlaced intermediate), not
-        # $EncodeSource, whenever QTGMC ran for this title -- comparing the
-        # clean deinterlaced/bobbed output against the raw interlaced/
-        # telecined original is not a meaningful VMAF measurement (they are
-        # structurally different images by design: real combing artifacts
-        # vs. a clean recombined field at the same timestamp). Mirrors the
-        # matching QTGMC_FINAL_VMAF_* fix in modules/ves-twostage-encode.sh
-        # /ves-validation.sh, found the same way: a real single-file
-        # production test measured VMAF 4.9 for a genuinely correct QTGMC
-        # encode when scored against the raw original. 2026-08-08.
-        $vmafRefSource = if ($videoSrc -ne $EncodeSource) { $videoSrc } else { $EncodeSource }
-        $finalVmaf = Get-VesFinalVmaf -Source $vmafRefSource -Output $finalDst -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -TargetHeight $upscaleTarget
+        # Use $keptResult.QtgmcVmaf (computed inside Invoke-VesCodecEncodeAttempt,
+        # against QTGMC's deinterlaced intermediate) whenever this title went
+        # through QTGMC, instead of measuring here against $EncodeSource --
+        # comparing the clean deinterlaced/bobbed output against the raw
+        # interlaced/telecined original is not a meaningful VMAF measurement
+        # (they are structurally different images by design: real combing
+        # artifacts vs. a clean recombined field at the same timestamp).
+        # $videoSrc/$qtgmcIntermediate are NOT in scope here -- they're
+        # locals of Invoke-VesCodecEncodeAttempt, a separate function; an
+        # earlier version of this fix wrongly assumed they'd still be
+        # readable here (always $null in practice), found by independent
+        # multi-tool review, 2026-08-08. Mirrors the matching
+        # QTGMC_FINAL_VMAF_* fix in modules/ves-twostage-encode.sh
+        # /ves-validation.sh -- a real single-file production test measured
+        # VMAF 4.9 for a genuinely correct QTGMC encode when scored against
+        # the raw original.
+        if ($keptResult -and $null -ne $keptResult.QtgmcVmaf) {
+            $finalVmaf = $keptResult.QtgmcVmaf
+        } else {
+            $finalVmaf = Get-VesFinalVmaf -Source $EncodeSource -Output $finalDst -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -TargetHeight $upscaleTarget
+        }
         if ($null -ne $finalVmaf) {
             Write-VesLog "Final VMAF: $finalVmaf ($finalDst)"
             if ($finalVmaf -lt $LowQualityVmafThreshold) {
@@ -625,19 +681,12 @@ function Invoke-VesEncodeAndValidate {
         }
     }
 
-    # Nothing else in this function (or Invoke-VesTwoStageEncode) ever
-    # removed QTGMC's staging directory on success -- only
-    # Invoke-VesQtgmcDeinterlace's own failure branch did. Every
-    # successful QTGMC run permanently leaked its multi-GB lossless
-    # intermediate on disk. Cleaned up here, unconditionally on every exit
-    # from this function (not just the $ok path), now that both the
-    # two-stage encode and the final VMAF measurement above are done
-    # consuming it. Mirrors the matching bash fix (trap RETURN in
-    # ffmpeg_encode()). Found via real single-file production test,
-    # 2026-08-08.
-    if ($videoSrc -ne $EncodeSource -and $qtgmcIntermediate) {
-        Remove-Item -Path (Split-Path -Parent $qtgmcIntermediate) -Recurse -Force -ErrorAction SilentlyContinue
-    }
+    # QTGMC staging-directory cleanup happens inside
+    # Invoke-VesCodecEncodeAttempt itself (a `finally` block there) --
+    # $videoSrc/$qtgmcIntermediate were never actually in scope here (a
+    # separate function's locals), so an earlier version of this cleanup
+    # placed at this exact spot was a silent no-op the entire time. Found
+    # by independent multi-tool review (Gemini + Codex), 2026-08-08.
 
     return [PSCustomObject]@{ Ok = $ok; Destination = $finalDst; NeedsHumanReview = ($null -ne $humanReviewReason); Reason = $humanReviewReason }
 }

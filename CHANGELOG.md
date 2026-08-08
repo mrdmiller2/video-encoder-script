@@ -4,6 +4,68 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.0O — 2026-08-08
+
+Multi-tool review (Gemini + Codex + a third independent reviewer) of
+v5.1.0N's own fixes, requested as a confidence pass before considering the
+QTGMC feature done. Found real problems in that fix set itself -- most
+seriously, one of the four v5.1.0N fixes was silently a complete no-op on
+Windows the whole time.
+
+1. **CRITICAL, Windows only — the v5.1.0N final-VMAF-reference and
+   staging-leak fixes never actually worked.** `$videoSrc`/
+   `$qtgmcIntermediate` were set inside `Invoke-VesCodecEncodeAttempt`, but
+   the fix code reading them lived in the *caller*,
+   `Invoke-VesEncodeAndValidate` -- a separate function. PowerShell doesn't
+   share locals across function boundaries, so both were always `$null`
+   there: `Get-VesFinalVmaf` received a null/empty source on every
+   Windows title (QTGMC or not) and threw, caught by the job-level
+   handler and logged as an ordinary failure -- every successful Windows
+   encode was being silently re-queued forever, a regression already
+   deployed to the Windows fleet. And the staging-dir cleanup check was
+   always false, so the leak fix #3 was equally a no-op. Fixed by moving
+   the same-representation VMAF computation and the cleanup inside
+   `Invoke-VesCodecEncodeAttempt` itself (wrapped in `try`/`finally`, the
+   PowerShell equivalent of bash's `trap ... RETURN`), and threading the
+   computed VMAF back to the caller through the result object instead of
+   relying on cross-function variable scope.
+2. **Bash — hardcoded `target_height=0` broke the QTGMC final-VMAF fix for
+   any upscaled title.** Genuine interlaced vintage content is SD
+   (480i/576i), which this script's own upscale logic routinely scales to
+   720p/1080p during the real encode -- the output is then a different
+   resolution than QTGMC's SD intermediate, and libvmaf rejects the
+   dimension mismatch outright on every sample. Missed in the original
+   fix because the real test title happened to be tall enough to skip
+   upscaling. Fixed by passing `$UPSCALE_TARGET_HEIGHT` (already computed
+   earlier in the same function) instead of a bare `0`.
+3. **Bash — an unguarded `rm -rf` inside the new `trap ... RETURN` could
+   abort the whole script.** Under this script's `set -e`, a failing
+   delete (NAS/SMB permission hiccup, busy file) inside the trap body
+   would silently kill the entire run immediately after a fully
+   successful encode. Fixed with `|| true`.
+4. **Bash — `QTGMC_FINAL_VMAF_SRC` cross-attempt staleness.** The cache
+   was keyed on source path alone, so a value computed for a discarded
+   attempt (e.g. an oversized AV1 output rejected by the size guard)
+   could in principle be wrongly applied to a different attempt's kept
+   output for the same source (an x265 fallback, or the must-eliminate
+   remux floor). Fixed by also keying on the destination path, and by
+   clearing the cache at the top of every `ffmpeg_encode()` call so each
+   new attempt starts clean.
+5. **Bash — the v5.1.0N timeout fix left the QTGMC transcode pipe
+   completely unbounded and untracked.** `run_tracked_encoder` on the
+   right-hand side of a shell pipe runs in a subshell (no `lastpipe` in
+   this codebase), so its PID/heartbeat tracking never reaches the
+   parent -- a hung `vspipe`/`ffmpeg` had no timeout and no interrupt
+   path at all. Fixed with a real, source-duration-scaled timeout via the
+   codebase's existing `run_with_timeout` wrapper (already handles the
+   macOS/no-`gtimeout`-available cases everywhere else); verified
+   directly that it kills the whole process group, not just the
+   immediate child.
+
+All five re-verified together via a second real, clean, uninterrupted
+production run: no crash, QTGMC succeeded, AV1 encode completed, tagged
+VMAF 89.3, staging directory gone after "Done."
+
 ## v5.1.0N — 2026-08-08
 
 Four real bugs found and fixed in v5.1.0M's QTGMC feature, all caught only

@@ -373,12 +373,18 @@ write_ves_processed_tag() {
     # -- a meaningless comparison for a QTGMC-processed title (see
     # ffmpeg_encode()'s matching comment). Cleared immediately after use so
     # a later, unrelated title can never reuse stale state.
-    if [ -n "${QTGMC_FINAL_VMAF_SRC:-}" ] && [ "$QTGMC_FINAL_VMAF_SRC" = "$src" ] && [ -n "${QTGMC_FINAL_VMAF_VALUE:-}" ]; then
+    # Matched on $mkv as well as $src (not just $src) -- see the matching
+    # comment in ffmpeg_encode() for why a $src-only match could apply a
+    # stale value from a discarded earlier attempt to the wrong output.
+    if [ -n "${QTGMC_FINAL_VMAF_SRC:-}" ] && [ "$QTGMC_FINAL_VMAF_SRC" = "$src" ] && \
+       [ -n "${QTGMC_FINAL_VMAF_DST:-}" ] && [ "$QTGMC_FINAL_VMAF_DST" = "$mkv" ] && \
+       [ -n "${QTGMC_FINAL_VMAF_VALUE:-}" ]; then
       vmaf="$QTGMC_FINAL_VMAF_VALUE"
     else
       vmaf="$(measure_final_vmaf "$src" "$mkv" "$target_height" 2>/dev/null)" || vmaf=""
     fi
     QTGMC_FINAL_VMAF_SRC=""
+    QTGMC_FINAL_VMAF_DST=""
     QTGMC_FINAL_VMAF_VALUE=""
     if [ "$upscaled" = true ]; then
       if [ -n "$vmaf" ]; then

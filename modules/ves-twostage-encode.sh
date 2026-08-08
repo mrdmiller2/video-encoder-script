@@ -279,6 +279,17 @@ ffmpeg_encode() {
   local profile hdr=false hdr_mode crf resolved_crf rc acodec abr
   local -a args sub_args
   local real_dst="$dst"
+  # Cleared unconditionally at entry, not just set on success: a prior
+  # attempt for this SAME $src (e.g. an AV1 attempt whose QTGMC succeeded
+  # and cached a value, later rejected by the size guard) must never
+  # leak into a later, different attempt for the same source (e.g. an
+  # x265 fallback whose own QTGMC failed transiently and took the bwdif
+  # path instead) -- the $src-only match in write_ves_processed_tag can't
+  # tell those two attempts' outputs apart on its own. Found by
+  # independent multi-tool review, 2026-08-08.
+  QTGMC_FINAL_VMAF_SRC=""
+  QTGMC_FINAL_VMAF_DST=""
+  QTGMC_FINAL_VMAF_VALUE=""
   dst="$(resolve_encode_stage_path "$src" "$real_dst")" || {
     warn "Cannot safely stage output for this title — skipping rather than risk the direct-write symlink race: $real_dst"
     return 1
@@ -355,7 +366,7 @@ ffmpeg_encode() {
           # this script's `set -u` immediately after a fully successful
           # encode (caught by the same real single-file production test
           # that found the leak this trap fixes).
-          trap 'rm -rf -- "$qtgmc_stage_dir" 2>/dev/null; trap - RETURN' RETURN
+          trap 'rm -rf -- "$qtgmc_stage_dir" 2>/dev/null || true; trap - RETURN' RETURN
         else
           needs_bwdif_fallback=true
         fi
@@ -575,9 +586,35 @@ ffmpeg_encode() {
   # QTGMC-processed title as a below-floor quality failure. 2026-08-08.
   if [ "$rc" -eq 0 ] && [ "$video_src" != "$src" ]; then
     local _qtgmc_final_vmaf=""
-    _qtgmc_final_vmaf="$(measure_final_vmaf "$video_src" "$dst" 0 2>/dev/null)" || _qtgmc_final_vmaf=""
+    # $UPSCALE_TARGET_HEIGHT (not a hardcoded 0): genuine interlaced
+    # vintage content is SD (480i/576i), which resolve_upscale_target's
+    # own threshold routinely upscales to 720p/1080p during the real
+    # encode -- $dst is then that upscaled size while $video_src (QTGMC's
+    # intermediate) stays SD. Without passing the target height through,
+    # _vmaf_compare_window's libvmaf filter graph rejects the mismatched
+    # dimensions outright (real ffmpeg test: "input width must match" /
+    # "Failed to configure input pad", rc=234) on every sample, this
+    # whole precomputed-VMAF path silently produces nothing, and
+    # write_ves_processed_tag falls back to the exact wrong-reference
+    # comparison this fix exists to avoid. Missed in the original fix
+    # because the real test title (Cosmos S01E10, 1412x1074) happened to
+    # be tall enough to skip upscaling -- the one case where 0 was right.
+    # Already set correctly above (line ~368's resolve_upscale_target
+    # "$src" call, nothing resets it before here). Found by independent
+    # multi-tool review, 2026-08-08.
+    _qtgmc_final_vmaf="$(measure_final_vmaf "$video_src" "$dst" "$UPSCALE_TARGET_HEIGHT" 2>/dev/null)" || _qtgmc_final_vmaf=""
     if [ -n "$_qtgmc_final_vmaf" ]; then
+      # Keyed on $real_dst (the canonical output path, the same value
+      # passed as $out/$mkv to finalize_mkv_output/write_ves_processed_tag
+      # by every caller) as well as $src -- an earlier version matched on
+      # $src alone, which could let a stale value from a DISCARDED attempt
+      # (e.g. an AV1 output rejected by the size guard) get wrongly
+      # consumed by a later, different attempt's output for the same
+      # source (an x265 fallback, or the must-eliminate remux floor, whose
+      # own QTGMC either wasn't run or failed differently). Found by
+      # independent multi-tool review, 2026-08-08.
       QTGMC_FINAL_VMAF_SRC="$src"
+      QTGMC_FINAL_VMAF_DST="$real_dst"
       QTGMC_FINAL_VMAF_VALUE="$_qtgmc_final_vmaf"
     fi
   fi
