@@ -262,15 +262,96 @@ PYEOF
   src_dur="$(video_duration "$src" 2>/dev/null)"; src_dur="${src_dur%.*}"
   case "$src_dur" in ''|*[!0-9]*) src_dur=0 ;; esac
   qtgmc_timeout=$(( 1800 + src_dur * 20 ))
-  # run_with_timeout (ves-timeout-retry.sh), not a bare `timeout` call --
-  # this module is shared with macOS, which has no `timeout` binary at
-  # all unless Homebrew's `gtimeout` is installed; run_with_timeout
-  # already resolves that (and degrades to a background+poll+TERM/KILL
-  # fallback if neither exists) everywhere else in this codebase.
-  if ! run_with_timeout "$qtgmc_timeout" bash -c \
-      'QTGMC_SRC_PATH="$1" "$2" -c y4m "$3" - 2>"$4" | "${@:5}"' _ \
-      "$src" "$vspipe_bin" "$script" "$stage_dir/qtgmc.log" \
-      "${FFMPEG_CMD[@]}" -y -v error -i - "${sar_vf_args[@]}" -c:v libx264 -crf 0 -preset veryfast -an "$intermediate"; then
+  # NOT run_with_timeout (ves-timeout-retry.sh) -- that wrapper uses
+  # `timeout --foreground` whenever available, which per GNU timeout's
+  # own docs does NOT put the command in a new process group ("children
+  # of COMMAND will not be timed out"). Confirmed directly: a
+  # `--foreground --kill-after` run against `bash -c 'yes | sleep 30'`
+  # left both `yes` and `sleep 30` running as orphans after the wrapper
+  # was killed -- the exact bug this whole timeout fix exists to close.
+  # --foreground is correct for run_with_timeout's OTHER callers (it
+  # exists specifically so a timeout signal can't kill an enclosing bash
+  # function's own redirected stdout/stderr), just wrong for this one, so
+  # this call resolves the timeout binary itself (_timeout_cmd, same
+  # macOS/gtimeout-aware resolution run_with_timeout uses) and invokes it
+  # WITHOUT --foreground -- confirmed directly that plain `timeout
+  # --kill-after` DOES put the command in its own process group and kills
+  # the whole group (including pipe-subshell children) on timeout. Found
+  # by independent multi-tool review, 2026-08-08.
+  local _qtgmc_tc="" _qtgmc_rc=0 _qtgmc_has_kill_after=0
+  if _timeout_cmd >/dev/null; then
+    _qtgmc_tc="$_TIMEOUT_CMD_RESOLVED"
+    # Probe --kill-after support (mirrors run_with_timeout's own
+    # --foreground probe below) rather than assuming every resolved
+    # "timeout" binary is GNU coreutils -- a non-GNU timeout on some
+    # future fleet member's PATH could otherwise fail this call outright
+    # before QTGMC ever runs. Found by independent multi-tool review,
+    # 2026-08-08.
+    "$_qtgmc_tc" --help 2>&1 | grep -q -- '--kill-after' && _qtgmc_has_kill_after=1
+    local -a _qtgmc_tc_args=("$qtgmc_timeout")
+    [ "$_qtgmc_has_kill_after" = 1 ] && _qtgmc_tc_args=(--kill-after=30 "$qtgmc_timeout")
+    # if/then, not a bare statement -- under this script's `set -e`, a
+    # bare command's nonzero exit aborts the whole script immediately
+    # (same bug class the team already found once in this exact module:
+    # a bare `qtgmc_intermediate="$(...)"` command-substitution
+    # assignment did the same thing). Assignments/commands inside an
+    # `if` condition are exempted from errexit.
+    if "$_qtgmc_tc" "${_qtgmc_tc_args[@]}" bash -c \
+        'QTGMC_SRC_PATH="$1" "$2" -c y4m "$3" - 2>"$4" | "${@:5}"' _ \
+        "$src" "$vspipe_bin" "$script" "$stage_dir/qtgmc.log" \
+        "${FFMPEG_CMD[@]}" -y -v error -i - "${sar_vf_args[@]}" -c:v libx264 -crf 0 -preset veryfast -an "$intermediate"; then
+      _qtgmc_rc=0
+    else
+      _qtgmc_rc=$?
+    fi
+  else
+    # No timeout/gtimeout on PATH at all. setsid (when present) gives the
+    # child its own process group so a timeout here can still killpg the
+    # whole pipeline (negative PID) instead of only the immediate child --
+    # but setsid itself is NOT guaranteed present (confirmed absent on a
+    # real fleet macOS member, MARLONJ, alongside timeout/gtimeout, before
+    # `brew install coreutils` was run there) -- without this check,
+    # `setsid: command not found` (exit 127) would silently degrade every
+    # QTGMC run to bwdif on any machine reaching this branch. Falls back
+    # further to plain backgrounding (positive PID kill only -- pipe
+    # children may survive; better than crashing the fallback entirely).
+    # Found by independent multi-tool review, 2026-08-08.
+    local -a _qtgmc_launch=(bash -c \
+        'QTGMC_SRC_PATH="$1" "$2" -c y4m "$3" - 2>"$4" | "${@:5}"' _ \
+        "$src" "$vspipe_bin" "$script" "$stage_dir/qtgmc.log" \
+        "${FFMPEG_CMD[@]}" -y -v error -i - "${sar_vf_args[@]}" -c:v libx264 -crf 0 -preset veryfast -an "$intermediate")
+    local _qtgmc_have_setsid=0
+    command -v setsid >/dev/null 2>&1 && _qtgmc_have_setsid=1
+    if [ "$_qtgmc_have_setsid" = 1 ]; then
+      setsid "${_qtgmc_launch[@]}" &
+    else
+      "${_qtgmc_launch[@]}" &
+    fi
+    local _qtgmc_pgid=$!
+    local _qtgmc_waited=0
+    while [ "$_qtgmc_waited" -lt "$qtgmc_timeout" ]; do
+      kill -0 "$_qtgmc_pgid" 2>/dev/null || break
+      sleep 1
+      _qtgmc_waited=$((_qtgmc_waited + 1))
+    done
+    if kill -0 "$_qtgmc_pgid" 2>/dev/null; then
+      if [ "$_qtgmc_have_setsid" = 1 ]; then
+        kill -TERM -"$_qtgmc_pgid" 2>/dev/null || true
+        sleep 5
+        kill -KILL -"$_qtgmc_pgid" 2>/dev/null || true
+      else
+        kill -TERM "$_qtgmc_pgid" 2>/dev/null || true
+        sleep 5
+        kill -KILL "$_qtgmc_pgid" 2>/dev/null || true
+      fi
+    fi
+    if wait "$_qtgmc_pgid" 2>/dev/null; then
+      _qtgmc_rc=0
+    else
+      _qtgmc_rc=$?
+    fi
+  fi
+  if [ "$_qtgmc_rc" -ne 0 ]; then
     warn "QTGMC deinterlace failed (see $stage_dir/qtgmc.log) — falling back to bwdif for: $src"
     rm -rf "$stage_dir"
     return 1

@@ -29,6 +29,25 @@ _timeout_cmd() {
     printf '%s' "$_TIMEOUT_CMD_RESOLVED"
     return 0
   fi
+  # Fixed Homebrew paths, not just PATH lookup: the `worker` account on
+  # this project's macOS fleet member (MARLONJ) has no .bash_profile/
+  # .zshrc/.zprofile at all, so its PATH is bash's bare compiled-in
+  # default (/usr/bin:/bin:/usr/sbin:/sbin) even after `brew install
+  # coreutils` -- confirmed directly: `command -v gtimeout` found nothing
+  # for `worker` even with the binary present and working at
+  # /opt/homebrew/bin/gtimeout via its full path. Same class of gap as
+  # ves-qtgmc.sh's own vspipe/python3 lookups, which already use fixed
+  # candidate paths instead of relying on PATH for exactly this reason.
+  # Apple Silicon prefix; /usr/local is Intel Homebrew's (not expected on
+  # this fleet, matches the native-architecture-only constant, but cheap
+  # to also check). Found by independent multi-tool review, 2026-08-08.
+  for _tc_candidate in /opt/homebrew/bin/gtimeout /usr/local/bin/gtimeout; do
+    if [ -x "$_tc_candidate" ]; then
+      _TIMEOUT_CMD_RESOLVED="$_tc_candidate"
+      printf '%s' "$_TIMEOUT_CMD_RESOLVED"
+      return 0
+    fi
+  done
   _TIMEOUT_CMD_RESOLVED=none
   if [ "${_TIMEOUT_DEGRADE_WARNED:-false}" != true ]; then
     warn "No timeout/gtimeout on PATH — using background+poll+TERM/KILL fallback (never unwrapped)"

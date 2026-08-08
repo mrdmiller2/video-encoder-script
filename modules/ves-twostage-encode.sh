@@ -279,17 +279,25 @@ ffmpeg_encode() {
   local profile hdr=false hdr_mode crf resolved_crf rc acodec abr
   local -a args sub_args
   local real_dst="$dst"
-  # Cleared unconditionally at entry, not just set on success: a prior
-  # attempt for this SAME $src (e.g. an AV1 attempt whose QTGMC succeeded
-  # and cached a value, later rejected by the size guard) must never
-  # leak into a later, different attempt for the same source (e.g. an
-  # x265 fallback whose own QTGMC failed transiently and took the bwdif
-  # path instead) -- the $src-only match in write_ves_processed_tag can't
-  # tell those two attempts' outputs apart on its own. Found by
-  # independent multi-tool review, 2026-08-08.
-  QTGMC_FINAL_VMAF_SRC=""
-  QTGMC_FINAL_VMAF_DST=""
-  QTGMC_FINAL_VMAF_VALUE=""
+  # NOT cleared here on entry -- an earlier version of this fix did clear
+  # QTGMC_FINAL_VMAF_* unconditionally at the top of every ffmpeg_encode()
+  # call, reasoning that a stale value from a discarded attempt (e.g. AV1,
+  # rejected by the size guard) must never leak into a different attempt's
+  # output (e.g. an x265 fallback). That reasoning was already fully
+  # covered by QTGMC_FINAL_VMAF_DST's own match against $mkv in
+  # write_ves_processed_tag (a stale entry for a DIFFERENT destination
+  # path simply never matches, falling through to a real measurement) --
+  # and the entry-clear introduced a real regression of its own: a
+  # must-eliminate-format source whose AV1 attempt succeeds (with QTGMC)
+  # and gets STASHED rather than finalized immediately
+  # (MUST_ELIMINATE_AV1_CANDIDATE, see must_eliminate_fallback_or_fail())
+  # can have its cached VMAF wiped out by the x265 fallback attempt's own
+  # ffmpeg_encode() entry, even when that x265 attempt fails before ever
+  # reaching its own success-path cache write -- so by the time the
+  # stashed AV1 is later salvaged and finalized, the correct cached value
+  # is already gone and it falls back to measuring against the raw
+  # interlaced original again, the exact bug this cache exists to avoid.
+  # Found by independent multi-tool review, 2026-08-08 (second round).
   dst="$(resolve_encode_stage_path "$src" "$real_dst")" || {
     warn "Cannot safely stage output for this title — skipping rather than risk the direct-write symlink race: $real_dst"
     return 1

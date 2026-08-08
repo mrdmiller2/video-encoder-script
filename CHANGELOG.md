@@ -4,6 +4,82 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.0P — 2026-08-08
+
+Fourth confidence-review round on v5.1.0O's own timeout fix, requested as
+an iterative "review + real encode test, fix, repeat until clean" loop.
+The prior round's timeout fix turned out to not actually work either --
+plus a real, live gap on the fleet's one macOS machine.
+
+1. **The `--foreground` process-group bug — v5.1.0O's own timeout fix
+   didn't actually protect against a hung QTGMC transcode.** The shared
+   `run_with_timeout` wrapper (`modules/ves-timeout-retry.sh`) uses
+   `timeout --foreground` whenever available -- GNU timeout's own docs
+   say `--foreground` does NOT put the command in a new process group
+   ("children of COMMAND will not be timed out"), confirmed directly:
+   `timeout --foreground --kill-after=3 2 bash -c 'yes | sleep 30'` left
+   both processes running as orphans after the wrapper was killed. That's
+   the exact bug v5.1.0O's timeout fix was supposed to close, and it
+   didn't, because `run_with_timeout` was the wrong tool for this
+   specific call (`--foreground` exists there for a different, legitimate
+   reason -- so a timeout signal can't kill an enclosing bash function's
+   own redirected stdout/stderr). Fixed in `modules/ves-qtgmc.sh` by
+   resolving the timeout/gtimeout binary directly (via the same
+   `_timeout_cmd()` resolution `run_with_timeout` uses internally) and
+   invoking it WITHOUT `--foreground` -- confirmed directly that plain
+   `timeout --kill-after` DOES create a new process group and kills the
+   whole group (including pipe-subshell children) on timeout.
+2. **`set -e` bare-command risk** in the new timeout-invocation code,
+   fixed by wrapping both the primary and fallback exit-status reads in
+   explicit `if`/`then` (a bare command's nonzero exit under `set -e`
+   aborts the whole script immediately -- this exact module has hit this
+   bug class before).
+3. **`QTGMC_FINAL_VMAF_*` entry-clear regression.** v5.1.0O added a
+   cache-clear at the top of every `ffmpeg_encode()` call, reasoning it
+   would prevent a stale cached VMAF from a discarded attempt (e.g. AV1,
+   rejected by the size guard) leaking onto a different attempt's kept
+   output (e.g. x265) for the same source. That reasoning was already
+   fully covered by `QTGMC_FINAL_VMAF_DST`'s own match against the
+   destination path in `write_ves_processed_tag`
+   (`modules/ves-validation.sh`) -- a stale entry for a different
+   destination simply never matches. The entry-clear itself introduced a
+   real regression: a must-eliminate-format source whose AV1 attempt
+   succeeds with QTGMC and gets STASHED (not finalized immediately, see
+   `MUST_ELIMINATE_AV1_CANDIDATE`/`must_eliminate_fallback_or_fail()` in
+   `modules/ves-twostage-encode.sh`) could have its correctly-cached VMAF
+   wiped by a later x265 fallback attempt's own `ffmpeg_encode()` call,
+   even when that x265 attempt failed before ever reaching its own
+   success-path cache write -- so when the stashed AV1 was later salvaged
+   and finalized, the correct cached value was already gone. Removed the
+   entry-clear; the SRC+DST match alone is sufficient and correct.
+4. **Real, live gap on MARLONJ (the fleet's one macOS machine): no
+   `timeout`, `gtimeout`, or `setsid` at all**, confirmed directly via
+   SSH -- meaning the new timeout code's own fallback path would have
+   silently degraded every QTGMC run there to `bwdif` (`setsid: command
+   not found`, exit 127, silently swallowed by the fallback's own error
+   handling). Fixed two ways: installed `gtimeout` via `brew install
+   coreutils` on MARLONJ directly (a real, permanent infrastructure fix,
+   verified working via its full path), and hardened
+   `modules/ves-timeout-retry.sh`'s `_timeout_cmd()` to also check fixed
+   Homebrew paths (`/opt/homebrew/bin/gtimeout`, `/usr/local/bin/gtimeout`)
+   as a last resort -- necessary because the `worker` service account on
+   MARLONJ has no `.bash_profile`/`.zshrc`/`.zprofile` at all, so its PATH
+   is bash's bare compiled-in default even after the binary was installed
+   (`command -v gtimeout` alone never would have found it). Also hardened
+   `modules/ves-qtgmc.sh`'s no-timeout-binary fallback to probe for
+   `--kill-after` support before using it (not every resolved "timeout"
+   binary is guaranteed GNU coreutils) and to check `setsid` availability
+   before using it, falling back to a plain positive-PID kill (no
+   process-group isolation, but no crash) if `setsid` is also absent.
+
+All four findings verified across four consecutive real production
+single-file encodes (Cosmos 1980 S01E10, a clip segment confirmed via
+direct `idet` probing to be ~94-100% genuinely interlaced) during this
+same review loop -- every run clean: QTGMC succeeded, AV1 encode
+completed, plausible tagged VMAF each time, staging directory confirmed
+gone after "Done." A fourth and final Gemini+Codex review round found
+nothing further.
+
 ## v5.1.0O — 2026-08-08
 
 Multi-tool review (Gemini + Codex + a third independent reviewer) of
