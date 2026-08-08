@@ -69,9 +69,16 @@ function Save-VesResumeState {
 
     $tmpPath = "$Path.tmp.$PID.$(Get-Random)"
     try {
-        $fs = [System.IO.File]::Open($tmpPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
-        $fs.Write($jsonBytes, 0, $jsonBytes.Length)
-        $fs.Close()
+        $fs = $null
+        try {
+            $fs = [System.IO.File]::Open($tmpPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+            $fs.Write($jsonBytes, 0, $jsonBytes.Length)
+        } finally {
+            # Pre-existing leak, same class as the flag writers' original
+            # bug -- Write() throwing after Open() succeeds skipped
+            # $fs.Close(). Found via second-round team review, 2026-08-06.
+            if ($fs) { $fs.Close() }
+        }
     } catch {
         Write-Warning "Could not write temp resume-state file: $($_.Exception.Message)"
         return $false

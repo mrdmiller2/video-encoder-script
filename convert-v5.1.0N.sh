@@ -344,6 +344,10 @@ Options:
   --clean-junk            Scan --path for junk (zero-byte outputs, stale IN_PROGRESS flags)
                           and report findings only, then exit
   --clean-junk-apply      Same scan, but actually delete what it finds
+  --report-source-traits  Detect telecine/interlace + B&W per file under --path,
+                          print a classification table, then exit (no encoding)
+  --no-auto-detelecine    Detect source traits but never auto-apply IVTC/deinterlace
+  --no-bw-tuning          Detect B&W but never relax the CRF/VMAF target for it
   --no-auto-reap          Skip the Phase B startup orphan-reaper sweep (default: reap on)
   --ignore-done-folders   Force a full recheck of folders marked complete by a prior run
                           (use after adding/changing files in an already-finished folder)
@@ -596,6 +600,9 @@ while [ $# -gt 0 ]; do
     --mkvalidator) TOOL_MKVALIDATOR="$2"; shift 2 ;;
     --clean-junk) CLEAN_JUNK=true; shift ;;
     --clean-junk-apply) CLEAN_JUNK=true; CLEAN_JUNK_APPLY=true; shift ;;
+    --report-source-traits) REPORT_SOURCE_TRAITS=true; shift ;;
+    --no-auto-detelecine) NO_AUTO_DETELECINE=true; shift ;;
+    --no-bw-tuning) NO_BW_TUNING=true; shift ;;
     --no-auto-reap) AUTO_REAP=false; shift ;;
     --ignore-done-folders) IGNORE_DONE_FOLDERS=true; shift ;;
     --check-tools) CHECK_TOOLS_ONLY=true; shift ;;
@@ -2333,6 +2340,12 @@ main() {
   if [ "$CLEAN_JUNK" = true ]; then
     resume_init_paths
     clean_junk_scan "$SEARCH_PATH"
+    exit 0
+  fi
+
+  if [ "$REPORT_SOURCE_TRAITS" = true ]; then
+    resume_init_paths
+    report_source_traits_for_path "$SEARCH_PATH"
     exit 0
   fi
 

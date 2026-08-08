@@ -27,6 +27,9 @@ if (-not (Get-Module -Name VesTrackedProcess)) {
 if (-not (Get-Module -Name VesValidation)) {
     Import-Module (Join-Path $PSScriptRoot 'VesValidation.psm1') -Force
 }
+if (-not (Get-Module -Name VesDoneLog)) {
+    Import-Module (Join-Path $PSScriptRoot 'VesDoneLog.psm1') -Force
+}
 
 $script:VesMustEliminateExtensions = @('ts', 'm2ts', 'vob', 'avi', 'ogm', 'mpg', 'mpeg', 'm2v', 'rm', 'rmvb', 'divx', 'wmv', 'flv', 'asf')
 
@@ -109,7 +112,12 @@ function Invoke-VesMustEliminateRemuxFloor {
 
     $errFile = $null
     if ($ErrorLogDir) {
+        # Same NAS broken-ACL-on-new-directory fix as VesTwoStageEncode's
+        # own ErrorLogDir handling -- unconditional, not just on first
+        # creation, so it self-heals a directory a past run already
+        # created with the broken ACL. See that module for the full story.
         New-Item -ItemType Directory -Path $ErrorLogDir -Force -ErrorAction SilentlyContinue | Out-Null
+        Set-VesEveryoneReadWrite -Path $ErrorLogDir
         $errFile = Join-Path $ErrorLogDir "$([System.IO.Path]::GetFileNameWithoutExtension($Source)).$PID.mustelim-remux.stderr.log"
     }
 

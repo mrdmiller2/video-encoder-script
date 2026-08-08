@@ -9,6 +9,10 @@
 orchestration/
 __pycache__/
 
+# One-off local repair-run output (JSON + logs from ad hoc maintenance
+# scripts) — real per-file run data, not source, never committed.
+logs/
+
 # Session handoff docs are local-only working notes for picking up a
 # session cold — never committed to GitHub. Content that's actually worth
 # keeping long-term belongs in CHANGELOG.md/ROADMAP.md instead.

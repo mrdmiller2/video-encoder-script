@@ -164,7 +164,12 @@ ensure_multipart_merge() {
   fi
 
   if ! multipart_parts_compatible "${parts[@]}"; then
-    printf '%s\n' "${parts[@]}" >>"${MULTIPART_MISMATCH_LOG:-/dev/null}" 2>/dev/null
+    if [ -n "${MULTIPART_MISMATCH_LOG:-}" ]; then
+      local _mtok
+      _mtok="$(_shared_mutex_acquire "${MULTIPART_MISMATCH_LOG}.appendlock")"
+      printf '%s\n' "${parts[@]}" >>"$MULTIPART_MISMATCH_LOG" 2>/dev/null || true
+      _shared_mutex_release "${MULTIPART_MISMATCH_LOG}.appendlock" "$_mtok"
+    fi
     warn "Multi-part group '$title' has incompatible parts — left as separate sources for human review"
     return 1
   fi
@@ -214,7 +219,12 @@ ensure_multipart_merge() {
   if [ "$mm_rc" -ge 2 ]; then
     rm -rf "$tmp_dir"
     warn "mkvmerge failed to append multi-part group '$title' (exit $mm_rc) — left as separate sources for human review"
-    printf '%s\n' "${parts[@]}" >>"${MULTIPART_MISMATCH_LOG:-/dev/null}" 2>/dev/null
+    if [ -n "${MULTIPART_MISMATCH_LOG:-}" ]; then
+      local _mtok
+      _mtok="$(_shared_mutex_acquire "${MULTIPART_MISMATCH_LOG}.appendlock")"
+      printf '%s\n' "${parts[@]}" >>"$MULTIPART_MISMATCH_LOG" 2>/dev/null || true
+      _shared_mutex_release "${MULTIPART_MISMATCH_LOG}.appendlock" "$_mtok"
+    fi
     return 1
   fi
   if [ ! -s "$tmp_merged" ]; then
@@ -243,7 +253,12 @@ ensure_multipart_merge() {
     if awk -v p="$dur_diff_pct" 'BEGIN { exit !(p>10.0) }'; then
       warn "Multi-part merge duration mismatch for '$title': parts sum to ${parts_dur_sum}s but merged output is ${merged_dur}s (${dur_diff_pct}% off) — discarding, left as separate sources for human review"
       rm -rf "$tmp_dir"
-      printf '%s\n' "${parts[@]}" >>"${MULTIPART_MISMATCH_LOG:-/dev/null}" 2>/dev/null
+      if [ -n "${MULTIPART_MISMATCH_LOG:-}" ]; then
+        local _mtok
+        _mtok="$(_shared_mutex_acquire "${MULTIPART_MISMATCH_LOG}.appendlock")"
+        printf '%s\n' "${parts[@]}" >>"$MULTIPART_MISMATCH_LOG" 2>/dev/null || true
+        _shared_mutex_release "${MULTIPART_MISMATCH_LOG}.appendlock" "$_mtok"
+      fi
       return 1
     fi
   fi

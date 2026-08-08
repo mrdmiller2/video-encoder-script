@@ -366,7 +366,20 @@ write_ves_processed_tag() {
         1080) res_str="1920x1080" ;;
       esac
     fi
-    vmaf="$(measure_final_vmaf "$src" "$mkv" "$target_height" 2>/dev/null)" || vmaf=""
+    # QTGMC_FINAL_VMAF_*: ffmpeg_encode() precomputes this against its own
+    # deinterlaced intermediate (the correct reference) when this title
+    # went through QTGMC, since that intermediate is gone by the time this
+    # function runs and $src here is the raw interlaced/telecined original
+    # -- a meaningless comparison for a QTGMC-processed title (see
+    # ffmpeg_encode()'s matching comment). Cleared immediately after use so
+    # a later, unrelated title can never reuse stale state.
+    if [ -n "${QTGMC_FINAL_VMAF_SRC:-}" ] && [ "$QTGMC_FINAL_VMAF_SRC" = "$src" ] && [ -n "${QTGMC_FINAL_VMAF_VALUE:-}" ]; then
+      vmaf="$QTGMC_FINAL_VMAF_VALUE"
+    else
+      vmaf="$(measure_final_vmaf "$src" "$mkv" "$target_height" 2>/dev/null)" || vmaf=""
+    fi
+    QTGMC_FINAL_VMAF_SRC=""
+    QTGMC_FINAL_VMAF_VALUE=""
     if [ "$upscaled" = true ]; then
       if [ -n "$vmaf" ]; then
         tag_value="${tag_value} — ${res_str} upscaled VMAF ${vmaf}"
@@ -525,11 +538,21 @@ record_stripped_subtitle() {
   local line
   line="$(printf '%s\t%s\ts:%s\tlang=%s\ttitle=%s\n' \
     "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$src" "$idx" "${lang:-und}" "${title:-none}")"
+  # Held FD/append-by-path avoid within-process races, but not a
+  # multi-host one: two fleet machines flagging an entry in the same
+  # show folder at the same wall-clock moment can still interleave or
+  # lose an update on NFS (team review, 2026-08-06 -- same class of gap
+  # already closed for done_log_append). Not the SMB broken-ACL-on-create
+  # failure the Windows port hit; this is NFS's lack of cross-client
+  # atomic append.
+  local _mtok
+  _mtok="$(_shared_mutex_acquire "${logf}.appendlock")"
   if [ -n "$STRIPPED_SUBTITLES_LOG_FD" ]; then
     printf '%s' "$line" >&"$STRIPPED_SUBTITLES_LOG_FD" 2>/dev/null || true
   else
     printf '%s' "$line" >>"$logf" 2>/dev/null || true
   fi
+  _shared_mutex_release "${logf}.appendlock" "$_mtok"
   maybe_chown_for_media_user "$logf"
 }
 
@@ -538,6 +561,8 @@ record_corrupt_mkv() {
   local reason="${2:-structure error}"
   local logf="${CORRUPT_FILES_LOG:-}"
   [ -n "$logf" ] || logf="${JOB_SIDECAR_DIR:-.}/corrupt_files.txt"
+  local _mtok
+  _mtok="$(_shared_mutex_acquire "${logf}.appendlock")"
   if [ -n "$CORRUPT_FILES_LOG_FD" ]; then
     printf '%s\t%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$dst" "$reason" >&"$CORRUPT_FILES_LOG_FD" 2>/dev/null || true
   else
@@ -545,6 +570,7 @@ record_corrupt_mkv() {
       printf '%s\t%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$dst" "$reason"
     } >>"$logf" 2>/dev/null || true
   fi
+  _shared_mutex_release "${logf}.appendlock" "$_mtok"
   maybe_chown_for_media_user "$logf"
 }
 
@@ -662,6 +688,8 @@ flag_bad_processed_output() {
 
   [ -n "$logf" ] || logf="${JOB_SIDECAR_DIR:-.}/reconvert_files.txt"
   warn "Bad processed output — deleting and flagging for reconversion: $out ($reason)"
+  local _mtok
+  _mtok="$(_shared_mutex_acquire "${logf}.appendlock")"
   if [ -n "$RECONVERT_FILES_LOG_FD" ]; then
     printf '%s\t%s\t%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$src" "$out" "$reason" >&"$RECONVERT_FILES_LOG_FD" 2>/dev/null || true
   else
@@ -669,6 +697,7 @@ flag_bad_processed_output() {
       printf '%s\t%s\t%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$src" "$out" "$reason"
     } >>"$logf" 2>/dev/null || true
   fi
+  _shared_mutex_release "${logf}.appendlock" "$_mtok"
   maybe_chown_for_media_user "$logf"
   record_corrupt_mkv "$out" "$reason"
   mkv_structure_cache_invalidate "$out"
@@ -717,6 +746,8 @@ flag_bad_source_for_human() {
     fi
   fi
 
+  local _mtok
+  _mtok="$(_shared_mutex_acquire "${logf}.appendlock")"
   if [ -n "$BAD_SOURCES_LOG_FD" ]; then
     printf '%s\t%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$src" "$reason" >&"$BAD_SOURCES_LOG_FD" 2>/dev/null || true
   else
@@ -724,6 +755,7 @@ flag_bad_source_for_human() {
       printf '%s\t%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$src" "$reason"
     } >>"$logf" 2>/dev/null || true
   fi
+  _shared_mutex_release "${logf}.appendlock" "$_mtok"
   maybe_chown_for_media_user "$logf"
   record_skip "$src" "bad source — human review: $reason"
 }
@@ -746,6 +778,8 @@ flag_low_quality_output_for_human() {
     return 0
   fi
 
+  local _mtok
+  _mtok="$(_shared_mutex_acquire "${logf}.appendlock")"
   if [ -n "$LOW_QUALITY_LOG_FD" ]; then
     printf '%s\t%s\t%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$vmaf" "$mkv" "$src" >&"$LOW_QUALITY_LOG_FD" 2>/dev/null || true
   else
@@ -753,6 +787,7 @@ flag_low_quality_output_for_human() {
       printf '%s\t%s\t%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$vmaf" "$mkv" "$src"
     } >>"$logf" 2>/dev/null || true
   fi
+  _shared_mutex_release "${logf}.appendlock" "$_mtok"
   maybe_chown_for_media_user "$logf"
 }
 

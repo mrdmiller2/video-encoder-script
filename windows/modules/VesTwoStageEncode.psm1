@@ -26,6 +26,9 @@ if (-not (Get-Module -Name VesSubtitleFilter)) {
 if (-not (Get-Module -Name VesStaging)) {
     Import-Module (Join-Path $PSScriptRoot 'VesStaging.psm1') -Force
 }
+if (-not (Get-Module -Name VesDoneLog)) {
+    Import-Module (Join-Path $PSScriptRoot 'VesDoneLog.psm1') -Force
+}
 
 function Get-VesAudioFilterChain {
     <#
@@ -85,12 +88,33 @@ function Invoke-VesTwoStageEncode {
         [Parameter(Mandatory)][string]$ErrorLogDir,
         [string]$StrippedSubtitlesLogPath,
         [string]$RamdiskDir,
-        [string]$LocalFallbackDir
+        [string]$LocalFallbackDir,
+        # Differs from $Source only when QTGMC produced a real (silent,
+        # video-only) deinterlaced intermediate -- audio/subtitles/
+        # chapters/metadata must still come from $Source (VideoSource has
+        # no audio track at all), matching modules/ves-twostage-encode.sh's
+        # video_src/src split. Defaults to $Source (the normal, non-QTGMC
+        # path) when not supplied.
+        [string]$VideoSource
     )
+    if (-not $VideoSource) { $VideoSource = $Source }
 
     $titleTag = [System.IO.Path]::GetFileNameWithoutExtension($Source)
     $pidTag = $PID
+    # Freshly-created directories on this NAS get the same broken default
+    # ACL as freshly-created files (see VesDoneLog.psm1's
+    # Set-VesEveryoneReadWrite for the full story) -- confirmed in
+    # production, 2026-08-06: every single Set-Content into this directory
+    # failed with Access Denied for an entire 15-episode PRINCE batch (12
+    # succeeded overall only because these stderr logs are non-fatal
+    # diagnostics, not because the ACL issue didn't happen -- it hit every
+    # job). Widen it unconditionally, not just on first creation --
+    # self-heals a directory a PAST run already created with the broken
+    # ACL, not only ones this run happens to create fresh. icacls is cheap
+    # enough that paying it once per encode attempt is worth the
+    # self-healing property.
     New-Item -ItemType Directory -Path $ErrorLogDir -Force -ErrorAction SilentlyContinue | Out-Null
+    Set-VesEveryoneReadWrite -Path $ErrorLogDir
     $errBase = Join-Path $ErrorLogDir "$titleTag.$pidTag"
     $encodeErrFile = "$errBase.stderr.log"
     $remuxErrFile = "$errBase.remux.stderr.log"
@@ -112,8 +136,20 @@ function Invoke-VesTwoStageEncode {
 
     try {
         # --- Stage 1: video + audio only ---
-        $stage1Args = @('-y', '-nostdin', '-v', 'warning', '-stats', '-thread_queue_size', '4096', '-i', $Source,
-            '-map', '0:v:0?', '-map', '0:a?', '-map_chapters', '0', '-map_metadata', '0')
+        if ($VideoSource -ne $Source) {
+            # Two-input form: video decodes from QTGMC's intermediate,
+            # audio/chapters/metadata come from the original file (input
+            # index 1) -- ffmpeg's default (copy from input 0) would
+            # otherwise silently take global metadata from the
+            # metadata-stripped intermediate.
+            $stage1Args = @('-y', '-nostdin', '-v', 'warning', '-stats',
+                '-thread_queue_size', '4096', '-i', $VideoSource,
+                '-thread_queue_size', '4096', '-i', $Source,
+                '-map', '0:v:0?', '-map', '1:a?', '-map_chapters', '1', '-map_metadata', '1')
+        } else {
+            $stage1Args = @('-y', '-nostdin', '-v', 'warning', '-stats', '-thread_queue_size', '4096', '-i', $Source,
+                '-map', '0:v:0?', '-map', '0:a?', '-map_chapters', '0', '-map_metadata', '0')
+        }
         $stage1Args += $VideoArgs
         if ($VideoFilters.Count -gt 0) {
             $stage1Args += @('-vf', ($VideoFilters -join ','))

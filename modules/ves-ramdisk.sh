@@ -59,10 +59,24 @@ _ramdisk_candidate_dirs() {
 _mem_available_bytes() {
   case "$PLATFORM" in
     macos)
-      local pagesize free_pages
+      # macOS deliberately keeps "Pages free" near zero -- it favors using
+      # spare RAM as reclaimable cache over leaving it truly idle, unlike
+      # Linux which exposes a proper MemAvailable estimate. Using only
+      # "free" here starved the ramdisk down to ~1.5GB on a 64GB machine
+      # (Crystalight/MARLONJ, confirmed in production, 2026-08-06) --
+      # CONVERT_RAMDISK_PCT was being applied to a number that basically
+      # never reflects real headroom on this platform. "Inactive" and
+      # "speculative" pages are both reclaimable on demand (the same
+      # pages Activity Monitor folds into its own "Available" figure) --
+      # counting them gives a realistic available-memory estimate instead
+      # of one that's structurally wrong for this OS. Deliberately still
+      # excludes "active" pages (genuinely in use).
+      local pagesize free_pages inactive_pages speculative_pages
       pagesize="$(sysctl -n hw.pagesize 2>/dev/null)"; pagesize="${pagesize:-4096}"
       free_pages="$(vm_stat 2>/dev/null | awk '/Pages free/{gsub("\\.","",$3); print $3}')" || free_pages=""
-      printf '%s' "$(( ${free_pages:-0} * pagesize ))"
+      inactive_pages="$(vm_stat 2>/dev/null | awk '/Pages inactive/{gsub("\\.","",$3); print $3}')" || inactive_pages=""
+      speculative_pages="$(vm_stat 2>/dev/null | awk '/Pages speculative/{gsub("\\.","",$3); print $3}')" || speculative_pages=""
+      printf '%s' "$(( (${free_pages:-0} + ${inactive_pages:-0} + ${speculative_pages:-0}) * pagesize ))"
       ;;
     *)
       awk '/MemAvailable/{print $2*1024}' /proc/meminfo 2>/dev/null

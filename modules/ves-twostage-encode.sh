@@ -285,6 +285,86 @@ ffmpeg_encode() {
   }
 
   profile="$(profile_for_source "$src")" || return $?
+
+  # Vintage-profile real deinterlace (QTGMC), confidently-detected genuine
+  # interlace only -- never telecine/progressive/ambiguous, and never
+  # outside the two vintage profiles (see modules/ves-qtgmc.sh header +
+  # approved plan, which explicitly scopes this to "old movies/TV" -- i.e.
+  # BOTH `vintage` (Movies/*/Vintage/*) AND `vtv` (Television/*/Vintage/*),
+  # not movies only). REAL BUG found and fixed 2026-08-08, caught only by
+  # running an actual real-content encode through the unmocked production
+  # profile-detection path: this check originally read `[ "$profile" =
+  # vintage ]` alone, so every vintage TV title -- including Cosmos (1980)
+  # S01E10, this whole feature's own positive-control interlaced test file
+  # -- silently never triggered QTGMC OR the bwdif fallback in real
+  # production, despite passing every test all session (every test up to
+  # this point either force-set PROFILE_CONTEXT=vintage directly or used
+  # SEARCH_PATH override, never exercising real detect_profile_for_path()
+  # against a real vtv-classified library path). video_src is what
+  # actually gets decoded for the encode (and for CRF search below, so the
+  # search is calibrated against the same pixels the final encode uses --
+  # an interlaced-vs-deinterlaced CRF/VMAF mismatch would make the search
+  # meaningless). $src stays the original file for everything else (audio,
+  # subtitles, chapters, attachments, HDR/DoVi metadata) -- QTGMC's
+  # intermediate is a silent, metadata-stripped video-only file and must
+  # never become the source for those.
+  local video_src="$src"
+  local needs_bwdif_fallback=false
+  if { [ "$profile" = vintage ] || [ "$profile" = vtv ]; } && [ "$NO_AUTO_DETELECINE" != true ]; then
+    detect_source_traits "$src" >/dev/null
+    if [ "$(source_traits_field_mode "$src")" = interlaced ]; then
+      if [ "$DRY_RUN" = true ]; then
+        # Dry-run only reports what would happen — the real QTGMC pass is a
+        # full transcode (minutes of real work), not cheap inspection like
+        # the rest of this function's DRY_RUN-safe classification calls.
+        log "[dry-run] would run QTGMC real deinterlace on: $(basename "$src")"
+      elif qtgmc_available; then
+        # NOT `local qtgmc_intermediate="$(...)"` -- under this script's
+        # `set -euo pipefail`, a bare failing command substitution assignment
+        # (unlike one combined with `local`) triggers errexit immediately,
+        # aborting ffmpeg_encode() before `needs_bwdif_fallback=true` below
+        # ever runs. Reproduced directly (team review, 2026-08-07): every
+        # QTGMC failure -- missing vspipe, bad VS script, empty output, any
+        # of qtgmc_deinterlace_to_intermediate's own documented failure
+        # modes -- silently killed the whole encode instead of falling back
+        # to bwdif. The `if` here is load-bearing, not stylistic.
+        local qtgmc_intermediate=""
+        if qtgmc_intermediate="$(qtgmc_deinterlace_to_intermediate "$src")" && \
+           [ -n "$qtgmc_intermediate" ] && [ -s "$qtgmc_intermediate" ]; then
+          video_src="$qtgmc_intermediate"
+          # Nothing else in this codebase ever removed this staging
+          # directory on the success path (only qtgmc_deinterlace_to_
+          # intermediate's own failure branches did) -- every successful
+          # QTGMC run permanently leaked its multi-GB lossless intermediate
+          # on the RAM disk / staging location. `trap RETURN` fires on
+          # every exit from this function (early returns included), so it
+          # cleans up regardless of which path out of ffmpeg_encode() is
+          # taken from here on. Found via the same real single-file
+          # production test that found the QTGMC_FINAL_VMAF_* bug just
+          # below, 2026-08-08.
+          local qtgmc_stage_dir="$(dirname "$qtgmc_intermediate")"
+          # trap - RETURN as the trap body's own first action is load-
+          # bearing, not defensive: ffmpeg_encode() is called as the tail
+          # statement of encode_dispatch() (no `return` after it), and a
+          # RETURN trap fires once for the function that sets it AND AGAIN
+          # for that function's caller's own return when the call was a
+          # tail position -- reproduced directly in isolation, 2026-08-08.
+          # Without self-clearing, the second firing ran inside
+          # encode_dispatch()'s frame, where qtgmc_stage_dir was never
+          # local, and crashed the whole job with "unbound variable" under
+          # this script's `set -u` immediately after a fully successful
+          # encode (caught by the same real single-file production test
+          # that found the leak this trap fixes).
+          trap 'rm -rf -- "$qtgmc_stage_dir" 2>/dev/null; trap - RETURN' RETURN
+        else
+          needs_bwdif_fallback=true
+        fi
+      else
+        needs_bwdif_fallback=true
+      fi
+    fi
+  fi
+
   resolve_upscale_target "$src"
   log "Encoder profile: $profile ($codec) — $(upscale_status_desc)"
   # determine_hdr_mode classifies plain HDR10/HLG AND every Dolby Vision case
@@ -301,14 +381,42 @@ ffmpeg_encode() {
     *) hdr=false ;;
   esac
 
-  resolve_crf_for_encode "$src" "$codec" "$profile" "$hdr" resolved_crf
+  # PROFILE_CONTEXT save/set/restore: when video_src is QTGMC's temp
+  # intermediate (a path like .convert-stage-qtgmc-XXXXXX/qtgmc-deinterlaced.mkv,
+  # nothing like the real library layout), resolve_crf_for_encode's own
+  # internal vmaf_target_for_source() call re-derives the profile by parsing
+  # that path -- which fails to classify as `vintage` (or anything), silently
+  # degrading every QTGMC-processed title from real VMAF-targeted CRF search
+  # down to a fixed CRF. PROFILE_CONTEXT is the existing, already-honored
+  # override profile_for_source() checks first (see vmaf_crf_search_internal's
+  # own save/restore of this same variable for its sample-encode helper) --
+  # setting it here makes that internal lookup return the already-known-
+  # correct `$profile` instead of trying to path-parse the temp file.
+  local _saved_profile_context="$PROFILE_CONTEXT"
+  PROFILE_CONTEXT="$profile"
+  resolve_crf_for_encode "$video_src" "$codec" "$profile" "$hdr" resolved_crf
   crf="$resolved_crf"
+  PROFILE_CONTEXT="$_saved_profile_context"
 
   rc=0
+  # build_ffmpeg_video_args gets $src, not $video_src, even when QTGMC
+  # succeeded: it only uses its `src` arg for metadata lookups (DoVi
+  # profile, HDR10 static mastering/CLL SEI, upscale-target resolution) --
+  # never for actual pixel data -- and QTGMC's intermediate is a silent,
+  # metadata-stripped file that would make those lookups fail. Safe to
+  # always pass $src here because QTGMC never changes frame width/height
+  # (only frame rate, via FPSDivisor), so the resolution-based decisions
+  # inside this function land on the same answer either way.
   build_ffmpeg_video_args "$codec" "$crf" "$src" "$profile" "$hdr" "$hdr_mode" || rc=$?
   if [ "$rc" -eq 2 ]; then
     flag_bad_source_for_human "$src" "Dolby Vision profile 5 requires libplacebo (not in this ffmpeg build)"
     return 1
+  fi
+  if [ "$needs_bwdif_fallback" = true ]; then
+    local bwdif_parity="0"
+    [ "$(source_traits_field_order "$src")" = bff ] && bwdif_parity="1"
+    FF_VF=("bwdif=mode=send_field:parity=${bwdif_parity}" "${FF_VF[@]}")
+    log "QTGMC unavailable/failed — using bwdif (parity=$bwdif_parity) as the deinterlace fallback: $(basename "$src")"
   fi
 
   case "$codec" in
@@ -361,10 +469,23 @@ ffmpeg_encode() {
   stage1="${dst}.video-audio-only.$$"
   ACTIVE_FFMPEG_STAGE1_FILE="$stage1"
 
-  args=(-y -nostdin -v warning -stats -thread_queue_size 4096 -i "$src"
-        -map 0:v:0 -map "0:a?"
-        -map_chapters 0
-        "${FF_VIDEO_ARGS[@]}")
+  # video_src differs from src only when QTGMC produced a real (silent,
+  # video-only) deinterlaced intermediate -- in that case audio must still
+  # come from the original file, via a second input, or it would be lost
+  # entirely (QTGMC's intermediate has no audio track at all).
+  if [ "$video_src" != "$src" ]; then
+    args=(-y -nostdin -v warning -stats
+          -thread_queue_size 4096 -i "$video_src"
+          -thread_queue_size 4096 -i "$src"
+          -map 0:v:0 -map "1:a?"
+          -map_chapters 1 -map_metadata 1
+          "${FF_VIDEO_ARGS[@]}")
+  else
+    args=(-y -nostdin -v warning -stats -thread_queue_size 4096 -i "$src"
+          -map 0:v:0 -map "0:a?"
+          -map_chapters 0
+          "${FF_VIDEO_ARGS[@]}")
+  fi
   local vf_joined=""
   if [ "${#FF_VF[@]}" -gt 0 ]; then
     vf_joined="$(IFS=,; printf '%s' "${FF_VF[*]}")"
@@ -440,6 +561,25 @@ ffmpeg_encode() {
   if [ "$rc" -eq 0 ] && [ ! -s "$dst" ]; then
     warn "ffmpeg reported success but output is missing/empty: $dst"
     rc=1
+  fi
+  # QTGMC_FINAL_VMAF_*: computed here, against $video_src (QTGMC's
+  # deinterlaced intermediate), while that intermediate still exists --
+  # the trap RETURN above deletes it as soon as this function returns.
+  # write_ves_processed_tag's own measure_final_vmaf call only ever has
+  # the ORIGINAL (raw interlaced/telecined) $src, and scoring a clean
+  # deinterlaced output against a raw combed frame at the same timestamp
+  # is not a meaningful comparison -- they are structurally different
+  # images by design, not a quality regression. Real single-file
+  # production test measured this as VMAF 4.9 for a genuinely correct
+  # QTGMC encode, which would have wrongly flagged every future
+  # QTGMC-processed title as a below-floor quality failure. 2026-08-08.
+  if [ "$rc" -eq 0 ] && [ "$video_src" != "$src" ]; then
+    local _qtgmc_final_vmaf=""
+    _qtgmc_final_vmaf="$(measure_final_vmaf "$video_src" "$dst" 0 2>/dev/null)" || _qtgmc_final_vmaf=""
+    if [ -n "$_qtgmc_final_vmaf" ]; then
+      QTGMC_FINAL_VMAF_SRC="$src"
+      QTGMC_FINAL_VMAF_VALUE="$_qtgmc_final_vmaf"
+    fi
   fi
   # Script cleans up after itself: a clean encode with nothing logged at
   # -v warning gets its (empty) stderr file removed rather than left as

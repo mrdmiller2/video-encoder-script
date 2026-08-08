@@ -64,12 +64,14 @@ param(
     [switch]$NoAutoReap,
     [switch]$NoResume,
     [switch]$UseRamDisk,
+    [switch]$NoRamDisk,
     [switch]$InPlace,
     [string]$OutputSuffix = '.AV1-WIN',
     [switch]$DryRun,
     [switch]$OrganizeOnly,
     [switch]$Pipeline,
     [switch]$NoPipeline,
+    [switch]$NoAutoDetelecine,
     [string[]]$VideoExtensions = @('mkv', 'mp4', 'avi', 'm4v', 'mov', 'ts', 'wmv')
 )
 
@@ -81,7 +83,7 @@ foreach ($m in @(
         'VesRamDisk', 'VesOrphanReaper', 'VesShardedScan',
         'VesSubtitleFilter', 'VesProfileDecision', 'VesVmafCrfSearch', 'VesTwoStageEncode',
         'VesTelegram', 'VesOrganize', 'VesPipelineScan', 'VesHandBrake', 'VesDiscSource',
-        'VesLegacyFallback', 'VesHwDetect'
+        'VesLegacyFallback', 'VesHwDetect', 'VesSourceTraits', 'VesQtgmc'
     )) {
     Import-Module (Join-Path $ModuleDir "modules\$m.psm1") -Force
 }
@@ -209,9 +211,16 @@ if (-not $NoAutoReap) {
 }
 
 # --- RAM disk job lifecycle ---
+# On by default now (was opt-in via -UseRamDisk, still accepted but no
+# longer required) -- matches bash's own CONVERT_NO_RAMDISK=false
+# default-on posture. Found in production, 2026-08-06: none of the 3
+# live Windows fleet machines' actual launch invocations ever passed
+# -UseRamDisk, so all three had been running with zero RAM-backed
+# staging the whole time, silently taking the full NFS/SMB-write-path
+# hit on every single output file. -NoRamDisk is the new opt-out.
 $ramDiskJob = $null
 $stageDir = $LocalStagingDir
-if ($UseRamDisk -and -not $DryRun) {
+if (-not $NoRamDisk -and -not $DryRun) {
     $ramDiskJob = New-VesRamDiskJob
     if ($ramDiskJob) {
         Write-VesLog "RAM disk staging: $($ramDiskJob.RootPath) ($($ramDiskJob.StagePath))"
@@ -246,6 +255,53 @@ function Invoke-VesCodecEncodeAttempt {
         [Parameter(Mandatory)][ValidateSet('av1', 'hevc')][string]$Codec
     )
     $profile = if ($ForceProfile) { $ForceProfile } else { Get-VesDetectedProfileForPath -Path $ProfileSource }
+
+    # Vintage-profile real deinterlace (QTGMC), confidently-detected genuine
+    # interlace only -- never telecine/progressive/ambiguous, and never
+    # outside the two vintage profiles ('vintage' = Movies/*/Vintage/*,
+    # 'vtv' = Television/*/Vintage/* -- the approved plan explicitly scopes
+    # this to "old movies/TV", not movies only). REAL BUG found and fixed
+    # 2026-08-08 on both platforms, caught only by running an actual
+    # real-content encode through the unmocked production profile-
+    # detection path: this check originally read `$profile -eq 'vintage'`
+    # alone, so every vintage TV title -- including this whole feature's
+    # own positive-control interlaced test file, Cosmos (1980) S01E10 --
+    # silently never triggered QTGMC OR the bwdif fallback in real
+    # production, despite passing every test all session (every prior test
+    # forced the profile directly, never exercising real
+    # Get-VesDetectedProfileForPath against a real vtv-classified path).
+    # $videoSrc is what actually gets decoded for the encode (and for CRF
+    # search below, so the search is calibrated against the same pixels
+    # the final encode uses). $EncodeSource stays the original file for
+    # everything else (audio, subtitles, chapters, attachments, HDR/DoVi
+    # metadata, profile/upscale-target detection) -- QTGMC's intermediate
+    # is a silent, metadata-stripped video-only file and must never become
+    # the source for those. Mirrors modules/ves-twostage-encode.sh's
+    # ffmpeg_encode() exactly, including the multi-tool-review fixes found
+    # there 2026-08-07 (see project_qtgmc_phase_bc_wiring_2026_08_07
+    # memory).
+    $videoSrc = $EncodeSource
+    $needsBwdifFallback = $false
+    if (($profile -eq 'vintage' -or $profile -eq 'vtv') -and -not $NoAutoDetelecine) {
+        $traits = Get-VesSourceTraits -Source $EncodeSource -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath
+        if ($traits.FieldMode -eq 'interlaced') {
+            if ($DryRun) {
+                Write-VesLog "[dry-run] would run QTGMC real deinterlace on: $([System.IO.Path]::GetFileName($EncodeSource))"
+            } elseif (Test-VesQtgmcAvailable) {
+                $stageBase = if ($ramDiskJob) { $ramDiskJob.RootPath } else { $stageDir }
+                $qtgmcIntermediate = Invoke-VesQtgmcDeinterlace -Source $EncodeSource -FieldOrder $traits.FieldOrder `
+                    -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -StageDir $stageBase
+                if ($qtgmcIntermediate -and (Test-Path $qtgmcIntermediate) -and (Get-Item $qtgmcIntermediate).Length -gt 0) {
+                    $videoSrc = $qtgmcIntermediate
+                } else {
+                    $needsBwdifFallback = $true
+                }
+            } else {
+                $needsBwdifFallback = $true
+            }
+        }
+    }
+
     $hdrMode = Resolve-VesHdrMode -Source $EncodeSource -FfprobePath $FfprobePath
     $isHdr = $hdrMode -in @('pq', 'pq_reconstruct', 'hlg')
     $upscaleTarget = Resolve-VesUpscaleTarget -Source $EncodeSource -FfprobePath $FfprobePath
@@ -254,7 +310,11 @@ function Invoke-VesCodecEncodeAttempt {
 
     if ($Codec -eq 'av1') {
         $svtParams = Get-VesProfileSvtParams -Profile $profile -FfmpegPath $FfmpegPath
-        $crf = Resolve-VesCrfForEncode -Source $EncodeSource -Codec av1 -Profile $profile -IsHdr $isHdr -TargetHeight $upscaleTarget `
+        # $videoSrc (not $EncodeSource): the VMAF sample-encode this search
+        # runs must be calibrated against the same pixels the final encode
+        # actually uses, or an interlaced-vs-deinterlaced mismatch makes
+        # the search meaningless -- same reasoning as the bash port's fix.
+        $crf = Resolve-VesCrfForEncode -Source $videoSrc -Codec av1 -Profile $profile -IsHdr $isHdr -TargetHeight $upscaleTarget `
             -FixedCrf $fixedCrf -VmafTarget $VmafTarget -AbAv1Path $AbAv1Path -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -EncoderArgs @('--svt', $svtParams)
     } else {
         # x265 is a size-guard fallback here, not the primary quality-search
@@ -306,9 +366,16 @@ function Invoke-VesCodecEncodeAttempt {
         return [PSCustomObject]@{ Ok = $false; Destination = $Destination; SizeBytes = 0 }
     }
 
+    $videoFilters = $videoArgsResult.VideoFilters
+    if ($needsBwdifFallback) {
+        $bwdifParity = if ((Get-VesSourceTraits -Source $EncodeSource -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath).FieldOrder -eq 'bff') { '1' } else { '0' }
+        $videoFilters = @("bwdif=mode=send_field:parity=$bwdifParity") + @($videoFilters)
+        Write-VesLog "QTGMC unavailable/failed -- using bwdif (parity=$bwdifParity) as the deinterlace fallback: $([System.IO.Path]::GetFileName($EncodeSource))"
+    }
+
     $errLogDir = Join-Path $JobRoot 'ffmpeg-logs'
-    $result = Invoke-VesTwoStageEncode -Source $EncodeSource -Destination $Destination -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath `
-        -VideoArgs $videoArgsResult.VideoArgs -VideoFilters $videoArgsResult.VideoFilters -ColorArgs $videoArgsResult.ColorArgs `
+    $result = Invoke-VesTwoStageEncode -Source $EncodeSource -VideoSource $videoSrc -Destination $Destination -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath `
+        -VideoArgs $videoArgsResult.VideoArgs -VideoFilters $videoFilters -ColorArgs $videoArgsResult.ColorArgs `
         -AudioCodec $AudioCodec -AudioBitrate $AudioBitrate -ErrorLogDir $errLogDir `
         -RamdiskDir $(if ($ramDiskJob) { $ramDiskJob.RootPath }) -LocalFallbackDir $stageDir
 
@@ -372,6 +439,18 @@ function Invoke-VesEncodeAndValidate {
 
     $finalDst = $Destination
     $ok = $false
+    # Set on any silent-fallthrough path below (both AV1 and x265 rejected
+    # by the size guard, non-must-eliminate source, or a must-eliminate
+    # rescue that itself fails) -- found in production, 2026-08-06: three
+    # Batman (1943) episodes silently vanished from a batch with "12 ok, 3
+    # failed" and zero explanation anywhere in the log or done-log, because
+    # every branch that could reach here fell through with neither a
+    # Write-VesLog call nor NeedsHumanReview set. Real, deleted work (the
+    # x265 fallback WAS staged to its destination, then silently removed)
+    # with no trace of why -- exactly the class of failure this project's
+    # "never rely on exit codes, always capture/log the actual reason"
+    # convention exists to prevent.
+    $humanReviewReason = $null
 
     if ($inPlaceCollision) {
         # Skip the size-guard/x265-fallback dance entirely -- see the
@@ -431,6 +510,7 @@ function Invoke-VesEncodeAndValidate {
             Remove-VesFileRobust -Path $x265Dst
             Write-VesLog "Source is a must-eliminate format -- re-encoding AV1 to keep despite exceeding the size guardrail: $EncodeSource"
             $av1Retry = Invoke-VesCodecEncodeAttempt -EncodeSource $EncodeSource -ProfileSource $ProfileSource -Destination $Destination -Codec av1
+            if ($av1Retry.NeedsHumanReview) { return $av1Retry }
             if ($av1Retry.Ok) {
                 $finalDst = $av1Retry.Destination
                 $ok = $true
@@ -443,6 +523,8 @@ function Invoke-VesEncodeAndValidate {
                 # detection would treat it as a finished title. Found via
                 # review, 2026-08-06.
                 Remove-VesFileRobust -Path $Destination
+                $humanReviewReason = "must-eliminate format, AV1 re-encode also failed validation after x265 fallback was already discarded"
+                Write-VesLog "AV1 re-encode also failed validation for must-eliminate source -- needs human review: $EncodeSource"
             }
         } else {
             Remove-VesFileRobust -Path $x265Dst
@@ -452,7 +534,42 @@ function Invoke-VesEncodeAndValidate {
                     Write-VesLog "Must-eliminate remux floor succeeded: $($floor.Path)"
                     $finalDst = $floor.Path
                     $ok = $true
+                } else {
+                    # Every fallback for a format we're required to eliminate
+                    # is now exhausted (both codec attempts and the last-
+                    # resort stream-copy remux) -- a genuinely unusual case
+                    # worth a human look, not an ordinary retry. Reason
+                    # reflects what actually failed (the remux), not a size
+                    # rejection -- team review, 2026-08-06 caught the
+                    # original message here claiming "size guard" even when
+                    # AV1 never produced a valid oversized result to reject
+                    # in the first place.
+                    $humanReviewReason = "must-eliminate format, all fallbacks exhausted (AV1/x265 encode failed and the remux floor also failed: $($floor.Reason))"
+                    Write-VesLog "Must-eliminate remux floor also failed -- needs human review: $EncodeSource"
                 }
+            } elseif ($av1Result.Ok -and $x265Result.Ok) {
+                # Both encodes genuinely SUCCEEDED and were merely rejected
+                # by the size guard -- a real policy decision (the Batman
+                # 1943 production case), safe to park durably since a retry
+                # would just reproduce the same oversized results.
+                $humanReviewReason = "both AV1 ($([math]::Round((($av1Result.SizeBytes - $srcSizeBytes) / [math]::Max($srcSizeBytes,1)) * 100,1))% over) and x265 fallback exceeded the size guard -- source kept as-is, needs human review"
+                Write-VesLog "Both AV1 and x265 exceeded the size guard, source not a must-eliminate format -- discarding both outputs, needs human review: $EncodeSource"
+            } else {
+                # At least one of the two attempts failed OUTRIGHT (ffmpeg
+                # error, structure/duration validation failure) rather than
+                # merely exceeding the size guard -- an ordinary operational
+                # failure (network blip, NAS hiccup, transient OOM), not a
+                # policy rejection. Team review, 2026-08-06 (independently
+                # caught by all three reviewers): the original version of
+                # this fix set NeedsHumanReview unconditionally here, which
+                # durably skipped every dual-encode-failure case forever
+                # (Write-VesBadSourceFlag + done-log 'skip') instead of
+                # leaving it to retry on the next scan like this port's
+                # behavior before the size guard existed at all -- a real
+                # regression the fix for the *original* Batman silent-
+                # failure bug would have introduced if shipped as first
+                # written. Log only; $ok stays false, no human-review flag.
+                Write-VesLog "AV1 and/or x265 encode failed outright (not a size-guard rejection) -- leaving as a retryable failure: $EncodeSource"
             }
         }
     }
@@ -467,16 +584,62 @@ function Invoke-VesEncodeAndValidate {
         # against the source at mismatched resolutions, so libvmaf fails
         # every sample -- team review, 2026-08-05, caught this was missing.
         $upscaleTarget = Resolve-VesUpscaleTarget -Source $EncodeSource -FfprobePath $FfprobePath
-        $finalVmaf = Get-VesFinalVmaf -Source $EncodeSource -Output $finalDst -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -TargetHeight $upscaleTarget
+        # Reference $videoSrc (QTGMC's deinterlaced intermediate), not
+        # $EncodeSource, whenever QTGMC ran for this title -- comparing the
+        # clean deinterlaced/bobbed output against the raw interlaced/
+        # telecined original is not a meaningful VMAF measurement (they are
+        # structurally different images by design: real combing artifacts
+        # vs. a clean recombined field at the same timestamp). Mirrors the
+        # matching QTGMC_FINAL_VMAF_* fix in modules/ves-twostage-encode.sh
+        # /ves-validation.sh, found the same way: a real single-file
+        # production test measured VMAF 4.9 for a genuinely correct QTGMC
+        # encode when scored against the raw original. 2026-08-08.
+        $vmafRefSource = if ($videoSrc -ne $EncodeSource) { $videoSrc } else { $EncodeSource }
+        $finalVmaf = Get-VesFinalVmaf -Source $vmafRefSource -Output $finalDst -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -TargetHeight $upscaleTarget
         if ($null -ne $finalVmaf) {
             Write-VesLog "Final VMAF: $finalVmaf ($finalDst)"
             if ($finalVmaf -lt $LowQualityVmafThreshold) {
-                Write-VesLowQualityFlag -JobSidecarDir $JobRoot -OutputPath $finalDst -SourcePath $EncodeSource -Vmaf $finalVmaf -Threshold $LowQualityVmafThreshold
+                # $JobRoot is the whole scan root (e.g. a library-wide run),
+                # not this title's own folder -- flagging into it would dump
+                # every flagged episode across every show into one shared
+                # directory instead of next to the title it's about. Same
+                # per-source-directory logic as $doneLogDir in the main
+                # loop (that variable isn't in scope here). Found via team
+                # review, 2026-08-06.
+                #
+                # Use $ProfileSource, not $EncodeSource -- for a disc source
+                # $EncodeSource is the temporary extracted scratch MKV (gone
+                # the moment the disc-source finally-block cleanup runs),
+                # while $ProfileSource is the logical disc path on the NAS,
+                # same identity $doneLogDir/$src use in the main loop.
+                # $EncodeSource == $ProfileSource for ordinary (non-disc)
+                # files, so this is correct for both. A second-round team
+                # review (2026-08-06) caught the first version of this fix
+                # using $EncodeSource here too -- would have silently failed
+                # to write any disc-source flag at all (wrong dir -> Test-Path
+                # container check fails) and, worse, pointed at an
+                # already-deleted scratch path even if it had written.
+                $flagDir = if ($IsDiscSource) { Get-VesDiscMediaContentDir -Source $ProfileSource } else { Split-Path -Parent $ProfileSource }
+                Write-VesLowQualityFlag -JobSidecarDir $flagDir -OutputPath $finalDst -SourcePath $ProfileSource -Vmaf $finalVmaf -Threshold $LowQualityVmafThreshold
             }
         }
     }
 
-    return [PSCustomObject]@{ Ok = $ok; Destination = $finalDst }
+    # Nothing else in this function (or Invoke-VesTwoStageEncode) ever
+    # removed QTGMC's staging directory on success -- only
+    # Invoke-VesQtgmcDeinterlace's own failure branch did. Every
+    # successful QTGMC run permanently leaked its multi-GB lossless
+    # intermediate on disk. Cleaned up here, unconditionally on every exit
+    # from this function (not just the $ok path), now that both the
+    # two-stage encode and the final VMAF measurement above are done
+    # consuming it. Mirrors the matching bash fix (trap RETURN in
+    # ffmpeg_encode()). Found via real single-file production test,
+    # 2026-08-08.
+    if ($videoSrc -ne $EncodeSource -and $qtgmcIntermediate) {
+        Remove-Item -Path (Split-Path -Parent $qtgmcIntermediate) -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    return [PSCustomObject]@{ Ok = $ok; Destination = $finalDst; NeedsHumanReview = ($null -ne $humanReviewReason); Reason = $humanReviewReason }
 }
 
 # --- Full per-item lifecycle: done-log/title-lock/resume-state/telegram,
@@ -575,7 +738,7 @@ function Invoke-VesFileJob {
                     Add-VesDoneLogEntry -Status done -Source $src -DoneLogDir $doneLogDir -FfmpegPath $FfmpegPath
                     $ok = $true
                 } elseif ($script:discNeedsHumanReview) {
-                    Write-VesBadSourceFlag -Source $src -Reason $script:discNeedsHumanReview -JobSidecarDir $JobRoot -DoneLogDir $doneLogDir -FfmpegPath $FfmpegPath
+                    Write-VesBadSourceFlag -Source $src -Reason $script:discNeedsHumanReview -JobSidecarDir $doneLogDir -DoneLogDir $doneLogDir -FfmpegPath $FfmpegPath
                     $ok = $true
                 } else {
                     Write-VesLog "Disc source not processed (action=$($discResult.Action) reason=$($discResult.Reason)): $src"
@@ -601,7 +764,7 @@ function Invoke-VesFileJob {
                 # identically every time, so mark 'skip' (matches bash's
                 # flag_bad_source_for_human) instead of leaving this to
                 # retry forever on every future scan.
-                Write-VesBadSourceFlag -Source $src -Reason $r.Reason -JobSidecarDir $JobRoot -DoneLogDir $doneLogDir -FfmpegPath $FfmpegPath
+                Write-VesBadSourceFlag -Source $src -Reason $r.Reason -JobSidecarDir $doneLogDir -DoneLogDir $doneLogDir -FfmpegPath $FfmpegPath
                 $ok = $true
             } else {
                 $ok = $false

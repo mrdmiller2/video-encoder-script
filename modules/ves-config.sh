@@ -6,7 +6,7 @@
 # MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
 # bug fix) -- see its own comment.
 
-VERSION="5.1.0I"
+VERSION="5.1.0N"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
 # as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
@@ -75,6 +75,21 @@ AV1_MAX_OVERSHOOT_PCT=20
 MUST_ELIMINATE_TIE_PCT=5
 MUST_ELIMINATE_AV1_CANDIDATE=""
 MUST_ELIMINATE_AV1_CANDIDATE_SIZE=""
+# Set by ffmpeg_encode() right after a successful QTGMC-processed encode:
+# a same-representation VMAF (encoded output vs. QTGMC's deinterlaced
+# intermediate, not the raw interlaced/telecined original) computed while
+# the intermediate still exists, since write_ves_processed_tag's own
+# measure_final_vmaf call only ever has the original $src available and
+# runs after ffmpeg_encode() has already cleaned that intermediate up.
+# Comparing a clean deinterlaced frame against a raw combed/interlaced
+# frame at the same timestamp is not a meaningful VMAF measurement (they
+# are structurally different images by design), and was seen to collapse
+# to single-digit VMAF for genuinely correct QTGMC output -- found via a
+# real single-file production test, 2026-08-08. Cleared immediately after
+# write_ves_processed_tag consumes it so a later, unrelated title can
+# never reuse stale state.
+QTGMC_FINAL_VMAF_SRC=""
+QTGMC_FINAL_VMAF_VALUE=""
 # Set by try_av1_convert/try_x265_convert's logical_source param (defaults
 # to their own $src when not a disc-extraction job) -- lets
 # record_conversion_result and done_log_append account size/identity
@@ -159,7 +174,7 @@ PREEXISTING_X265_SMALL_SKIP_MAX_MB="${CONVERT_PREEXISTING_X265_SMALL_SKIP_MAX_MB
 # destination as one sequential transfer. Percentage is of *available* (free)
 # memory at the moment a ramdisk needs to be created, not total installed RAM,
 # and only applies when no suitable ramdisk/tmpfs is discovered already.
-CONVERT_RAMDISK_PCT="${CONVERT_RAMDISK_PCT:-40}"
+CONVERT_RAMDISK_PCT="${CONVERT_RAMDISK_PCT:-50}"
 CONVERT_NO_RAMDISK="${CONVERT_NO_RAMDISK:-false}"
 CONVERT_RAMDISK_DIR="${CONVERT_RAMDISK_DIR:-}"
 RAMDISK_SIZE_ESTIMATE_MARGIN_PCT=10
@@ -418,6 +433,24 @@ FF_HEVC_HW=""           # best functional hw HEVC encoder
 declare -A VMAF_CRF_CACHE=()
 declare -A UPSCALE_TARGET_CACHE=()
 UPSCALE_TARGET_HEIGHT=0
+declare -A SOURCE_TRAITS_CACHE=()  # $src -> "field_mode=<progressive|telecine|interlaced|ambiguous>;is_bw=<0|1>"
+NO_AUTO_DETELECINE=false           # --no-auto-detelecine: detect+log only, never insert IVTC/deinterlace filter
+NO_BW_TUNING=false                 # --no-bw-tuning: detect+log only, never relax CRF/VMAF target for B&W sources
+REPORT_SOURCE_TRAITS=false         # --report-source-traits: Phase 1 validation mode, detect+log across the queue, no encoding
+
+# Source-traits classification thresholds. Tunable without touching
+# detect_source_traits() itself. See project plan
+# ~/.claude/plans/how-can-we-chaneg-cheeky-goose.md -- these encode the
+# 3-tier field-mode classification (progressive/telecine/interlaced) plus
+# the ambiguity guard (window-to-window disagreement forces "ambiguous"
+# rather than trusting a noisy average), and the B&W saturation floor.
+SOURCE_TRAITS_PROBE_WIDTH_SECS=10
+SOURCE_TRAITS_PROGRESSIVE_MIN=0.95     # avg progressive-frame ratio >= this -> progressive, no filter
+SOURCE_TRAITS_TELECINE_REPEAT_MIN=0.12 # avg repeated-field ratio in [MIN,MAX] -> telecine cadence (IVTC)
+SOURCE_TRAITS_TELECINE_REPEAT_MAX=0.30
+SOURCE_TRAITS_INTERLACE_MIN=0.10       # avg interlaced-frame ratio >= this (repeat ratio out of telecine band) -> interlaced (deinterlace)
+SOURCE_TRAITS_WINDOW_SPREAD_MAX=0.25   # max-min progressive ratio across sample windows above this -> ambiguous, never guess
+SOURCE_TRAITS_BW_SATAVG_MAX=4.0        # avg signalstats SATAVG at/below this -> classified black-and-white
 
 # Phase F resolved constants. These complete strings are shared by sample
 # search and final encode so profile tuning cannot drift (the v5.0.29 lesson).

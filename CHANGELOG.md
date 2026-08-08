@@ -4,6 +4,462 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.0N — 2026-08-08
+
+Four real bugs found and fixed in v5.1.0M's QTGMC feature, all caught only
+by running a genuine, unmocked, real-content single-file encode through
+the actual production script -- every prior test in v5.1.0M either used
+artificially short manual clips or bypassed real path-based profile
+detection, and none of these four would have surfaced any other way.
+
+1. **Validation-timeout bug (bash only) — QTGMC's real transcode had never
+   actually succeeded on real production-length content.**
+   `qtgmc_deinterlace_to_intermediate()` used `run_ffmpeg_validation` (a
+   bounded wrapper that scales its timeout off a real file found via
+   `-i <file>` or a bare filename argument) for the real vspipe-to-ffmpeg
+   transcode -- but that call passes `-i -` (a pipe) and its output file
+   doesn't exist yet when the timeout is calculated, so the scaling logic
+   always fell back to the short validation-probe-sized base timeout.
+   `_run_timeout_retry` killed the real transcode mid-write on any content
+   longer than that short window. Fixed by switching to
+   `run_tracked_encoder` (the same unbounded wrapper the real encode
+   itself uses) in `modules/ves-qtgmc.sh`.
+2. **Final-VMAF wrong-reference bug (both platforms) — every successful
+   QTGMC job would have been falsely flagged for human review.** The
+   quality-gate VMAF measurement (`measure_final_vmaf`/`Get-VesFinalVmaf`)
+   compared the encoded output against the raw interlaced/telecined
+   original, not QTGMC's deinterlaced intermediate. A clean deinterlaced
+   frame and a raw combed frame at the same timestamp are structurally
+   different images by design -- this isn't a temporal-alignment glitch,
+   it's an inherently meaningless comparison, and it measured VMAF 4.9 for
+   a genuinely correct encode. Fixed via a same-representation VMAF
+   computed while the intermediate still exists (`QTGMC_FINAL_VMAF_SRC`/
+   `QTGMC_FINAL_VMAF_VALUE` side-channel in bash, `$vmafRefSource` in
+   Windows).
+3. **Staging-directory leak (both platforms) — every successful QTGMC job
+   permanently leaked its multi-GB lossless intermediate.** Only the
+   failure branch of `qtgmc_deinterlace_to_intermediate`/
+   `Invoke-VesQtgmcDeinterlace` ever removed the staging directory;
+   nothing on the success path did. Confirmed via a real run leaving a
+   9GB `.convert-stage-qtgmc-*` directory behind after "Done." Fixed with
+   a `trap ... RETURN` in `ffmpeg_encode()` (bash) and an explicit
+   `Remove-Item` after the final VMAF measurement in `convert.ps1`
+   (Windows).
+4. **Trap double-fire crash (bash only, introduced by this session's own
+   fix for #3) — a real bash gotcha.** `ffmpeg_encode()` is called as the
+   tail statement of `encode_dispatch()` (no `return` after it); a
+   `trap ... RETURN` set inside `ffmpeg_encode()` fired correctly once for
+   its own return, then fired again for `encode_dispatch()`'s return --
+   where the trap's variable was never in scope -- crashing the whole job
+   with "unbound variable" immediately after a fully successful encode.
+   Reproduced in isolation before fixing. Fixed by making the trap body
+   self-clearing (`trap - RETURN` as its own first action).
+
+All four verified via a real production run through the actual deployed
+`convert-v5.1.0N.sh` (not a custom test harness): QTGMC succeeded (no
+bwdif fallback), the AV1 encode completed, tagged VMAF 92.2 (plausible,
+not a false below-floor flag), and the staging directory was gone after
+the job finished. This is the first real end-to-end QTGMC success this
+whole effort has produced on genuine production-length content.
+
+## v5.1.0M — 2026-08-07
+
+Real field-based deinterlace for the `vintage` profile, both platforms.
+Previously there was no auto-deinterlace filter at all -- genuinely
+interlaced vintage TV content encoded with visible combing baked in.
+
+**New: source-traits detector.** `modules/ves-source-traits.sh` (bash) /
+`VesSourceTraits.psm1` (Windows, built from scratch -- nothing like this
+existed on Windows before this release) classify a source's field mode
+(progressive/telecine/interlaced/ambiguous) via ffmpeg's `idet` filter at
+3 complexity-representative sample points (reusing the same low/median/
+high sampling already used for the AV1-vs-x265 bake-off decision), plus
+black-and-white detection via `signalstats` SATAVG. Ambiguous or
+window-disagreeing reads never trigger an auto-filter -- this module only
+ever says "confidently interlaced" or stays silent.
+
+**New: QTGMC real deinterlace.** `modules/ves-qtgmc.sh` (bash/macOS,
+shared) / `VesQtgmc.psm1` (Windows) run QTGMC (VapourSynth, classic
+havsfunc.py, `InputType=0` genuine bob+weave motion-compensated
+deinterlace) as a pipeline pre-process stage when `profile=vintage` and
+field mode is confidently `interlaced` -- never for telecine/progressive/
+ambiguous. `FPSDivisor=1` (explicit): full bob output, every real field
+kept as its own distinct temporal sample, no data blended/discarded,
+consistent with this project's #1 priority (no data loss) outranking #3
+(size) -- confirmed with the user this doubles the delivered frame rate
+(e.g. 25i -> 50p) and that this is intended. A real `bwdif` ffmpeg-filter
+fallback (also new) engages when the QTGMC toolchain is unavailable or
+fails -- e.g. RANDYJ, whose 2009-era Xeons lack AVX2 and can't run the
+prebuilt `mvtools.dll` (confirmed, documented, deliberately deferred
+hardware gap, not something this release fixes).
+
+**Fleet-wide QTGMC toolchain deployment**, verified on 9 of 10 machines
+across all 4 platform families (Fedora, Ubuntu, macOS, Windows) via real
+QTGMC frame renders, not just "the plugin loaded":
+`fleet-tools/install-qtgmc-{fedora,ubuntu,macos,windows}.ps1` (new files).
+Ubuntu needed a from-source VapourSynth core build (no package exists);
+Windows turned out the easiest platform (every plugin is a real
+`vsrepo`/pip-wheel package with a prebuilt binary).
+
+**Critical bug found and fixed (bash), via multi-tool review (Gemini +
+Cursor independently converged, Codex found it too):** under this
+script's `set -euo pipefail`, `qtgmc_intermediate="$(qtgmc_deinterlace_to_intermediate
+"$src")"` as a bare assignment triggered errexit on ANY QTGMC failure,
+aborting the whole encode before the bwdif-fallback flag could ever be
+set. Every QTGMC failure mode (missing toolchain, vspipe issue, bad
+script, empty output) silently killed the encode instead of degrading
+gracefully. Reproduced directly (a minimal repro script under `set -e`)
+before and after the fix; the fix moves the assignment into an `if`
+condition, which bash exempts from errexit.
+
+**Independently found and fixed during this same effort (not from the
+formal review, from the author's own pixel-level verification), also
+critical:** `ChromaEdi='none'` in the QTGMC call was corrupting every
+processed frame's chroma into visible green noise -- confirmed by dumping
+raw chroma-plane pixel values (wild noise instead of the correct
+near-flat ~127-128 for real content) and rendering actual frames. This
+had been present since the very first "working" QTGMC test of this whole
+effort and stayed invisible through multiple rounds of "verified working"
+because every check up to that point only inspected ffprobe metadata
+(duration/frame count/codec), never an actual rendered frame. Fixed by
+leaving `ChromaEdi` unset (QTGMC then mirrors `EdiMode`, i.e. NNEDI3 for
+chroma too). New standing project rule as a result: any pixel-transform
+change must be visually verified on a real rendered frame, not just
+metadata -- see `feedback_visual_verify_pixel_transforms` in the AI
+assistant's memory.
+
+**Other real bugs found by multi-tool review and fixed (bash):**
+a filename containing a single quote crashed the generated Python script
+(shell-interpolated into a `r'...'` literal) -- fixed by passing the
+source path via a process environment variable instead; VMAF-targeted
+CRF search was silently degrading to a fixed CRF for every QTGMC-processed
+title, because the internal VMAF-target lookup re-derives profile by
+parsing the source path, and QTGMC's temp intermediate path doesn't match
+any real library layout -- fixed with a `PROFILE_CONTEXT` save/restore
+around the CRF-search call (an existing override mechanism, already used
+elsewhere in this codebase for the same purpose); `build_ffmpeg_video_args`
+was reading HDR/DoVi metadata from QTGMC's metadata-stripped intermediate
+instead of the original file -- fixed (zero-cost fix, since QTGMC never
+changes frame dimensions); `--no-auto-detelecine` was silently not
+honored by the new wiring -- fixed with an early gate; global container
+metadata (title/tags) was at risk of being lost on the two-input ffmpeg
+command -- fixed with an explicit `-map_metadata`; a genuinely anamorphic
+source's SAR/DAR was at risk of silently resetting to square pixels in
+QTGMC's intermediate -- fixed by reading the real SAR via ffprobe and
+stamping it onto the intermediate; `qtgmc_available()`'s Python probe only
+ever tried loading `mvtools.so`, so a fully-working macOS install
+(`mvtools.dylib`) could cache "unavailable" forever -- fixed. One reviewer
+claim (a supposedly too-narrow `vspipe` path-search list) was checked
+against this session's own real successful runs and rejected as a false
+positive -- documented in the assistant's memory with the reasoning.
+
+**Windows port bug found during its own end-to-end verification:** .NET's
+`Process.WaitForExit(int)` and `Task.WaitAll(..., int)` both return a
+`bool` that PowerShell puts on the pipeline unless explicitly suppressed
+-- unsuppressed, these leaked into `Invoke-VesQtgmcDeinterlace`'s own
+return value, so a caller doing `$intermediate = Invoke-VesQtgmcDeinterlace
+...` received `"True True True <path>"` as a single joined string instead
+of just the path. Fixed with explicit `[void]` casts. Found and fixed via
+a real end-to-end test on ELVIS (not a mock) before this shipped.
+
+Windows source-traits detection and QTGMC wiring verified end-to-end on
+real hardware (ELVIS): real `idet`-based field-mode detection matched the
+bash side's results almost exactly on the same real interlaced source
+(Cosmos (1980) S01E10, a genuine 1980 video-broadcast documentary used as
+this project's positive-control interlaced title -- Batman (1943), used
+earlier in this effort, turned out to be an already-progressive digital
+transfer and only ever validated the negative-control path); real QTGMC
+deinterlace produced correct colors and a real, combing-free frame,
+visually verified; the full two-stage-encode pipeline (QTGMC intermediate
+for video, original file for audio/metadata) and the forced-failure
+bwdif-fallback path were both verified with real ffmpeg output, not a
+mock.
+
+**Second, final review round (Gemini + Codex + Cursor again) found four
+more real bugs, all fixed and re-verified before fleet deploy:**
+1. **`-aspect` sets display aspect ratio (DAR), not sample aspect ratio
+   (SAR)** -- the anamorphic-SAR fix from the first review round was
+   itself wrong, on both bash and Windows. Confirmed by a direct empirical
+   test: `-aspect 8:9` on a 720x480 frame produced
+   `sample_aspect_ratio=16:27` (wrong) and `display_aspect_ratio=8:9`,
+   while `-vf setsar=8/9` correctly produced `sample_aspect_ratio=8:9`
+   and the correctly-derived `display_aspect_ratio=4:3`. Same class of
+   bug as `ChromaEdi` -- a plausible-looking fix that no duration/codec/
+   frame-count check would ever catch. Fixed on both platforms by
+   switching to a `setsar` video filter.
+2. **Windows: `Invoke-VesQtgmcDeinterlace` never checked `vspipe`'s own
+   exit code**, only ffmpeg's -- if vspipe crashed partway through
+   rendering, ffmpeg would see the resulting partial y4m stream as a
+   normal EOF, exit 0, and write a real but truncated intermediate, which
+   would have been accepted as a successful QTGMC run instead of falling
+   back to bwdif. Fixed by requiring both processes' exit codes, plus
+   checking the byte-copy task didn't fault/cancel.
+3. **Windows: a hung ffmpeg process after the byte-copy completed was
+   never killed** -- the timeout was only enforced while the copy itself
+   was in progress; if ffmpeg then hung while flushing/muxing, the
+   `WaitForExit` call could return `false` (still running) and the code
+   would silently discard that signal and read `.ExitCode` from a process
+   that might still be alive. Fixed by explicitly killing either process
+   if its post-copy `WaitForExit` doesn't report a real exit.
+4. **Windows: `[double]::TryParse`/string-formatting without
+   `InvariantCulture`** in the source-traits detector -- confirmed by
+   direct testing under a comma-decimal locale (de-DE): the default
+   `TryParse` overload doesn't fail on `"180.123"`, it silently
+   *mis-parses* it as `180123` (period read as a thousands separator),
+   and the `-f` format operator renders `180.123` as `"180,123"`,
+   producing an invalid ffprobe `-read_intervals` spec. Either would
+   silently break complexity sampling and B&W detection on any
+   non-US-locale Windows machine. Fixed with explicit
+   `CultureInfo.InvariantCulture` throughout. (Two other claims from this
+   same finding -- a supposed `$null`-crash in the SAR helper and a
+   supposed culture-sensitivity bug in plain string interpolation of a
+   double -- were checked by direct test and found to be false positives;
+   not changed.)
+
+All four fixes re-verified end-to-end on real ELVIS hardware (real QTGMC
+success path, correct dimensions/frame rate, real audio/video output)
+before redeploying to every already-deployed fleet machine.
+
+## v5.1.0L — 2026-08-07
+
+Two real bugs found in a live 15-episode PRINCE batch (Batman, 1943) that
+finished "12 ok, 3 failed" -- both windows-only, both in
+`Invoke-VesEncodeAndValidate` and its supporting error-log-directory
+handling.
+
+**Bug 1 -- silent, unexplained job failure, real encode work discarded
+with zero trace.** `Invoke-VesEncodeAndValidate`'s size-guard/x265-
+fallback flow (AV1 tried first; if it's more than `Av1MaxOvershootPct`
+over the source size, x265 is tried; x265 must be no larger than the
+source at all to be kept) had three silent-fallthrough exit points when
+neither codec produced a keepable result and the source wasn't a "must-
+eliminate" legacy container: no `Write-VesLog` call, no
+`NeedsHumanReview`/`Reason` set, `$ok` just stayed `$false`. The
+function's own log line (`Staging: moved finished output to
+...X265-WIN.mkv`, an internal staging-completion message printed
+regardless of whether the outer size check will ultimately keep or
+discard the result) looked exactly like success right up until the point
+nothing was left on disk but the original source. Confirmed via direct
+`Get-ChildItem` on the real NAS path: only the source `.mp4`/`.srt`
+remained for all 3 "failed" titles -- two real, multi-minute encode
+attempts each, silently thrown away.
+
+Fixed: a new `$humanReviewReason` variable, set with a specific message
+at each of the three sites, feeding into the function's return object
+(`NeedsHumanReview`/`Reason` fields, additive -- both existing call sites
+already had `if ($r.NeedsHumanReview) { ... }` handling in place from
+earlier this session's work on a different failure class, so this wires
+into an already-proven mechanism rather than adding a new one).
+
+**Regression caught by team review before it shipped.** All three
+reviewers (Gemini, Codex, Cursor -- independent parallel review)
+converged on the same finding: the first version of this fix set
+`NeedsHumanReview` unconditionally on every one of the three
+fallthrough sites, which meant an *ordinary, transient, retriable*
+dual-encode failure (network blip, NAS hiccup, ffmpeg crash -- not a
+size-guard rejection) now got durably blacklisted forever
+(`Write-VesBadSourceFlag` + done-log `skip`) instead of just failing and
+retrying on the next scan like this port's behavior before the size
+guard existed at all -- a real regression in the fix meant to close a
+different bug. Cursor caught a second, related defect: the `Reason`
+string for a dual-*failure* case computed a nonsensical
+`(-100% over)` (dividing by a `SizeBytes` of `0`, since neither encode
+actually produced a valid result to measure). Fixed: the size-guard
+`NeedsHumanReview` path now only fires when `$av1Result.Ok -and
+$x265Result.Ok` are both genuinely true (both codecs produced a valid,
+merely-oversized result -- the real Batman production case); a dual
+*outright failure* now logs clearly but leaves `$ok = $false` with no
+human-review flag, exactly matching this port's pre-size-guard retry
+behavior. Also fixed along the way: the must-eliminate-format AV1-retry
+path wasn't checking `$av1Retry.NeedsHumanReview` (a real but
+low-probability gap, same class as the other two call sites which
+already did), and the must-eliminate remux-floor-failure message
+previously claimed "size guard" even on a path only reachable when AV1
+never produced a valid oversized result to reject in the first place.
+
+**Bug 2 -- `ffmpeg-logs` directory hits the NAS's broken-ACL-on-new-
+directory bug (also confirmed in production).** Every single job in the
+same 15-episode batch (not just the 3 failures) logged `Set-Content:
+Access to the path '...\ffmpeg-logs\...stderr.log' is denied` for both
+the main encode and remux stderr captures. Root cause: `New-Item
+-ItemType Directory -Path $ErrorLogDir` creates this directory fresh on
+first use, and this NAS gives freshly-created directories the same
+broken default ACL already fixed for files via `Set-VesEveryoneReadWrite`
+earlier this session (v5.1.0J) -- a gap a reviewer had explicitly flagged
+as worth a separate follow-up at the time, now confirmed happening in
+production and fixed. `VesTwoStageEncode.psm1` and
+`VesLegacyFallback.psm1`'s must-eliminate remux floor both now call
+`Set-VesEveryoneReadWrite` on `$ErrorLogDir` right after creating it,
+**unconditionally on every call** (not gated on "did this call just
+create it") -- deliberately, so a directory a *past* run already created
+with the broken ACL self-heals too, not just ones created fresh this
+run; team review confirmed this tradeoff (one cheap `icacls` spawn per
+encode attempt vs. real encode runtime) is the right one. Non-fatal on
+its own (12/15 jobs still succeeded despite every stderr write failing),
+but meant stderr diagnostic logs were silently never captured on this
+NAS -- a real gap if an encode ever fails with a genuine ffmpeg error
+needing that log to diagnose.
+
+**Bug found and fixed by team review, not in the original diff:**
+`VesLegacyFallback.psm1` called the newly-added `Set-VesEveryoneReadWrite`
+without importing `VesDoneLog.psm1` (the module it's defined in) --
+masked by `convert.ps1`'s own top-level import order already loading
+`VesDoneLog` first, but a real `CommandNotFoundException` (hard abort of
+the remux floor, worse than the missing stderr log it was fixing) if this
+module is ever loaded standalone or that import order changes. Codex
+empirically reproduced the failure standalone before the fix, and
+reproduced success after. Fixed with an explicit import, matching
+`VesTwoStageEncode.psm1`'s own pattern.
+
+Team-reviewed twice (Gemini/Codex/Cursor, independent parallel review):
+once against the initial fix (all three independently found the same
+regression), once more after the corrected version (not run again in
+full -- the fix was narrow, targeted, and independently traced/verified
+via logic walkthrough of both the original production scenario and the
+regression scenario before shipping).
+
+## v5.1.0K — 2026-08-06
+
+RAM disk staging audit and fixes, prompted directly by user request now
+that PRINCE/GruntBox2 no longer run WSL2 (removing the constraint that
+originally motivated conservative sizing): "make use of as much memory
+as possible to offset network/disk latency issues."
+
+**Biggest finding**: none of the 3 live Windows fleet machines (PRINCE,
+ELVIS, RANDYJ) had ever actually been using RAM-backed staging.
+`convert.ps1`'s `-UseRamDisk` is an opt-in switch, and no launch
+invocation across the whole session -- including every batch-test
+Scheduled Task built this week -- ever passed it. All three had been
+taking the full NAS network-write-path hit on every single output file
+since Phase 5 onboarding. Fixed structurally, not just for this one
+launch: `-UseRamDisk` is now on by default (mirrors bash's own
+`CONVERT_NO_RAMDISK=false` default-on posture), with a new `-NoRamDisk`
+opt-out following the same convention as the existing `-Pipeline`/
+`-NoPipeline` pair. Verified via a real end-to-end test on PRINCE
+(`New-VesRamDiskJob` create → write → `Remove-VesRamDiskJob` teardown,
+all confirmed working) before trusting this dormant-until-now code path
+in production.
+
+**Sizing raised, both platforms**: `CONVERT_RAMDISK_PCT` (bash) and
+`PercentOfAvailable` (`VesRamDisk.psm1`) both 40% → 50% of currently-
+available memory. Windows' `MaxSizeBytes` hard cap also raised from
+32GB to 256GB -- bash has no equivalent absolute cap, and 32GB was
+silently clamping high-RAM machines (RANDYJ alone has 144GB, 133GB free
+at time of writing) to well under half of what 50%-of-available would
+otherwise allow.
+
+**Real bug fixed, macOS-specific**: `_mem_available_bytes()`'s macOS
+branch used only `vm_stat`'s "Pages free" count. macOS deliberately
+keeps this near zero -- unlike Linux, which exposes a proper
+`MemAvailable` figure (free + reclaimable cache/buffers), macOS favors
+holding spare RAM as reclaimable "inactive"/"speculative" cache rather
+than reporting it free. Confirmed in production: this starved
+Crystalight/MARLONJ's RAM disk down to 1.5GB on a 64GB machine. Fixed
+to include inactive + speculative pages (the same pages Activity
+Monitor folds into its own "Available" figure, still excluding "active"
+pages genuinely in use) -- verified against Crystalight's real `vm_stat`
+output, giving ~40GB available (~20GB at the new 50%) instead of 1.5GB.
+
+Linux fleet machines were not touched code-wise -- audited and found
+already effectively RAM-backed via each distro's own `/tmp` or
+`/dev/shm` tmpfs (discovered and used as-is by `ramdisk_discover()`
+before `ramdisk_create()` would ever run), sized generously by the OS
+default in every case checked (32-64GB tmpfs against 60-93GB total RAM
+per machine) -- the `CONVERT_RAMDISK_PCT` bump still applies on any
+machine where discovery finds nothing and falls through to creating one
+itself.
+
+## v5.1.0J — 2026-08-06
+
+Real production failure on PRINCE mid-batch: `Superman S01E17`'s
+low-quality flag write threw `UnauthorizedAccessException` while an
+earlier episode's flag write (moments before, same run) succeeded --
+traced to a NAS/SMB-specific bug already on record for this project:
+freshly-created files on this NAS get a broken default ACL over SMB
+(`Everyone: R`-only, not inheriting the parent folder's write grant), so
+a *second* open (reopening an already-created file to append) is
+unreliable, persistently not transiently. This is exactly what already
+forced the done-log's 2026-08-02 redesign away from shared-file append
+to one-file-per-entry -- `Write-VesLowQualityFlag`/`Write-VesBadSourceFlag`
+(`windows/modules/VesValidation.psm1`) never got that same fix.
+
+**Windows port, fixed:**
+- `Write-VesLowQualityFlag`/`Write-VesBadSourceFlag`: ported to the same
+  one-file-per-entry atomic-create pattern as `Add-VesDoneLogEntry` --
+  each event is its own uniquely-named file (`.quality-flag`/
+  `.bad-source-flag` extensions, chosen so `Import-VesDoneLog`'s `*.tsv`
+  glob never picks them up) written directly into the show/title folder,
+  never a fresh subdirectory (creating a *new* directory on this NAS has
+  its own broken-ACL bug, already on record). This trades a single
+  flat human-readable `bad_sources.txt`/`low_quality_review.txt` for
+  scattered per-entry files -- reliability over the old format-parity
+  convenience; `cat *.quality-flag`/`Get-Content *.quality-flag` recovers
+  the same view either platform.
+- New shared helper `Set-VesEveryoneReadWrite` (`VesDoneLog.psm1`): widens
+  every newly-created sidecar file's ACL immediately after creation
+  (`icacls ... /grant '*S-1-1-0:(M)'` -- the well-known SID for Everyone,
+  not the literal localized name, which would silently no-op on non-English
+  Windows) rather than trusting this NAS's default. Wired into all three
+  one-file-per-entry writers (done-log, low-quality flag, bad-source flag).
+- **Pre-existing bug, found via team review**: `convert.ps1` passed
+  `$JobRoot` (the whole scan root) instead of each title's own folder to
+  both flag writers at all 3 call sites -- in a real library-wide scan,
+  every flagged episode across every show would land in one shared
+  top-level directory instead of next to its title. Only looked correct
+  during the PRINCE incident because that batch's `-SearchPath` happened
+  to already be a single show folder. Fixed at all 3 call sites.
+- **Same bug class, bigger blast radius**: pipeline mode's
+  `pipeline-ready.txt` (`VesPipelineScan.psm1`) does the identical
+  create-then-reopen-append for *every* discovered file (not just the
+  rare flagged-episode case) and silently dropped items after 5 failed
+  retries with zero logging -- and pipeline mode auto-activates for any
+  UNC path, making this a real fleet-wide risk. Fixed the root cause
+  (ACL-widen right after creation) and made exhausted retries loud.
+  Redesigning the whole subsystem to one-file-per-entry would also
+  require rewriting the consumer's byte-offset incremental reader --
+  deferred as a larger follow-up, consistent with this module's own
+  documented priority (throughput optimization, not correctness).
+- `VesSubtitleFilter.psm1`'s `Write-VesStrippedSubtitleRecord`: same
+  hardening applied ahead of need -- nothing currently wires
+  `-StrippedSubtitlesLogPath` to a NAS path, but it would hit the exact
+  same failure the moment it did.
+- `FileStream` handle-leak fix (`try`/`finally`) in all one-file-per-entry
+  writers: if `Write()` threw after `Open()` succeeded, the handle was
+  never closed, leaving a partially-created sidecar locked until process
+  exit.
+
+**Bash, hardened:** the human-review logs
+(`bad_sources.txt`/`low_quality_review.txt`/`corrupt_files.txt`/
+`reconvert_files.txt`/`stripped_subtitles.txt`/`multipart_mismatch.txt`)
+already avoid within-process reopen (a held FD opened once at job start),
+but writes were never serialized against *other* fleet machines the way
+`done_log_append` already is via the shared mutex -- two hosts flagging an
+entry in the same show folder at the same moment could interleave or lose
+an update on NFS (a different failure mode than Windows' SMB ACL bug: NFS
+lacks atomic cross-client append, not a broken-ACL-on-create issue).
+Low-probability (rare human-review events), but real -- all six writers
+now acquire the existing `_shared_mutex_acquire`/`_shared_mutex_release`
+lockdir around their write, matching `done_log_append`'s own convention.
+
+Team-reviewed twice (Gemini/Codex/Cursor, independent parallel review):
+once to find the above (all three converged independently on the JobRoot
+bug and the pipeline-ready.txt gap), once more after implementing every
+fix to confirm nothing new was introduced. The second pass earned its
+keep: all three reviewers independently found a real bug in the first
+fix for the JobRoot issue -- the disc-source branch used `$EncodeSource`
+(the temporary extracted scratch file, deleted moments later) instead of
+`$ProfileSource` (the logical disc path on the NAS), which would have
+silently failed to write any low-quality flag for a disc source at all.
+Fixed. Also fixed from that second pass: two more `FileStream`
+handle-leak sites (`pipeline-ready.txt`'s append path; pre-existing ones
+in `VesResumeState.psm1` and `VesSharedMutex.psm1`, unrelated to this
+week's work but the same easy fix), the pipeline scan producer's
+"queue exhausted" warning being emitted inside a background runspace
+where `Stop-VesScanProducer` never actually surfaced it to the caller,
+and a bash mutex-release-safety gap in the new `multipart_mismatch.txt`
+locking (a failed write inside the critical section could exit under
+`set -e` before the lock was released).
+
 ## v5.1.0I — 2026-08-06
 
 Real bug found resuming the 27-file fleet production test: `-p` targeting

@@ -125,9 +125,34 @@ function Write-VesLowQualityFlag {
     gets logged for human review. Log-only, matching the bash design: the
     output stays exactly where the pipeline expects it (moving it would
     make "already done" detection blind to it and cause an endless
-    re-encode-to-the-same-VMAF loop on every future scan). Same TSV shape
-    (timestamp, VMAF, output path, source path) as bash's
-    low_quality_review.txt so both platforms produce one comparable log.
+    re-encode-to-the-same-VMAF loop on every future scan). Same TSV field
+    shape (timestamp, VMAF, output path, source path) as bash's
+    low_quality_review.txt.
+
+    One-file-per-entry instead of a single shared-file append, mirroring
+    Add-VesDoneLogEntry's fix for the same underlying problem (see that
+    function's docs): appending to an existing shared file on this NAS
+    (Samba/SMB from Windows clients, the same NAS the Linux fleet reaches
+    over NFS) is unreliable -- confirmed in production 2026-08-06 when a
+    second episode's flag write on PRINCE threw UnauthorizedAccessException
+    while the first episode's write (a fresh-file create, not an append)
+    succeeded moments earlier in the same run. A single new *file* append
+    can throw Access Denied on this NAS the same way a single new
+    *directory* create gets a broken ACL (see [[project_elvis_nas_smb_quirks_2026_08_02]])
+    -- both are "modify an existing network object after the fact"
+    operations, and both are avoided here the same way: only ever create
+    brand-new, uniquely-named objects, never reopen one.
+
+    Deliberately does NOT put entries in a subdirectory (unlike a
+    from-scratch design might) -- creating a *new* directory on this NAS
+    gets a broken ACL (Everyone -> read-only, unfixable from the Windows
+    client, see the same NAS-quirks note) where writing into an
+    *existing* directory has always been reliable. $JobSidecarDir is the
+    show folder itself, which by construction already exists, so entry
+    files land directly there -- exactly where Add-VesDoneLogEntry
+    already puts its own per-source entries. Uses a distinct extension
+    (.quality-flag, not .tsv) specifically so Import-VesDoneLog's
+    *.tsv glob never picks these up as done-log entries.
     #>
     param(
         [Parameter(Mandatory)][string]$JobSidecarDir,
@@ -137,26 +162,27 @@ function Write-VesLowQualityFlag {
         [Parameter(Mandatory)][double]$Threshold
     )
     Write-Warning "Kept output below VMAF $Threshold floor ($Vmaf) -- flagged for human review: $OutputPath"
-    $logf = Join-Path $JobSidecarDir 'low_quality_review.txt'
-    # Mirrors bash's _neutralize_symlink_sidecar_path: refuse to append
-    # through a symlink at a predictable path, closing the class of risk
-    # where a planted link could redirect this write into an arbitrary
-    # file. Not a full match for bash's hardening -- bash opens its FD
-    # once at job start and holds it for the run's lifetime (immune to
-    # the path being swapped after that one check), whereas this
-    # re-checks on every call since there's no long-lived handle plumbed
-    # through here yet. Still closes the gap the team review flagged
-    # (team review, 2026-08-06) -- a real improvement over no check at all.
-    if ((Test-Path -LiteralPath $logf) -and (Test-VesPathIsReparsePoint -Path $logf)) {
-        Write-Warning "Low-quality log path is a reparse point -- removing the link only (target untouched) before use: $logf"
-        Remove-Item -LiteralPath $logf -Force -ErrorAction SilentlyContinue
+    if (-not (Test-Path -LiteralPath $JobSidecarDir -PathType Container)) {
+        Write-Warning "Low-quality flag: sidecar directory does not exist, cannot record -- $JobSidecarDir"
+        return
     }
-    $line = "{0}`t{1}`t{2}`t{3}" -f (Get-Date -AsUTC -Format 'yyyy-MM-ddTHH:mm:ssZ'), $Vmaf, $OutputPath, $SourcePath
+    $token = [System.IO.Path]::GetRandomFileName() -replace '[.]', ''
+    $entryPath = Join-Path $JobSidecarDir "low_quality_review-$env:COMPUTERNAME-$PID-$token.quality-flag"
+    $line = "{0}`t{1}`t{2}`t{3}`n" -f (Get-Date -AsUTC -Format 'yyyy-MM-ddTHH:mm:ssZ'), $Vmaf, $OutputPath, $SourcePath
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($line)
     try {
-        Add-Content -LiteralPath $logf -Value $line -Encoding utf8 -ErrorAction Stop
+        $fs = $null
+        try {
+            $fs = [System.IO.File]::Open($entryPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
+            $fs.Write($bytes, 0, $bytes.Length)
+        } finally {
+            if ($fs) { $fs.Close() }
+        }
     } catch {
-        Write-Warning "Could not write low-quality flag to $logf -- ${_}"
+        Write-Warning "Could not write low-quality flag to $entryPath -- $_"
+        return
     }
+    Set-VesEveryoneReadWrite -Path $entryPath
 }
 
 function Write-VesBadSourceFlag {
@@ -168,9 +194,16 @@ function Write-VesBadSourceFlag {
     so future scans stop re-attempting a job that will always fail the
     same way. Never deletes or moves the source, matching bash. Same
     3-field TSV shape (timestamp, source, reason) as bash's
-    bad_sources.txt, and the same log filename, so both platforms'
-    human-review backlogs can be read as one combined list on a shared
-    library.
+    bad_sources.txt.
+
+    One-file-per-entry, not a shared-file append -- same NAS-reliability
+    fix and same reasoning as Write-VesLowQualityFlag (see that
+    function's docs for the full story): a second write into an
+    already-existing file on this NAS is unreliable, a brand-new
+    uniquely-named file is not. Entries land directly in $JobSidecarDir
+    (never a fresh subdirectory -- new directories get a broken ACL on
+    this NAS) with a distinct .bad-source-flag extension so
+    Import-VesDoneLog's *.tsv glob never picks these up.
 
     Unlike bash (which never deletes a source, only skips future
     conversion attempts on it), this reuses the existing done-log 'skip'
@@ -185,16 +218,27 @@ function Write-VesBadSourceFlag {
         [Parameter(Mandatory)][string]$FfmpegPath
     )
     Write-Warning "Bad source -- durably skipping, needs human review: $Source ($Reason)"
-    $logf = Join-Path $JobSidecarDir 'bad_sources.txt'
-    if ((Test-Path -LiteralPath $logf) -and (Test-VesPathIsReparsePoint -Path $logf)) {
-        Write-Warning "Bad-sources log path is a reparse point -- removing the link only (target untouched) before use: $logf"
-        Remove-Item -LiteralPath $logf -Force -ErrorAction SilentlyContinue
-    }
-    $line = "{0}`t{1}`t{2}" -f (Get-Date -AsUTC -Format 'yyyy-MM-ddTHH:mm:ssZ'), $Source, $Reason
-    try {
-        Add-Content -LiteralPath $logf -Value $line -Encoding utf8 -ErrorAction Stop
-    } catch {
-        Write-Warning "Could not write bad-source flag to $logf -- ${_}"
+    if (-not (Test-Path -LiteralPath $JobSidecarDir -PathType Container)) {
+        Write-Warning "Bad-source flag: sidecar directory does not exist, cannot record -- $JobSidecarDir"
+    } else {
+        $token = [System.IO.Path]::GetRandomFileName() -replace '[.]', ''
+        $entryPath = Join-Path $JobSidecarDir "bad_sources-$env:COMPUTERNAME-$PID-$token.bad-source-flag"
+        $line = "{0}`t{1}`t{2}`n" -f (Get-Date -AsUTC -Format 'yyyy-MM-ddTHH:mm:ssZ'), $Source, $Reason
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($line)
+        $wrote = $false
+        try {
+            $fs = $null
+            try {
+                $fs = [System.IO.File]::Open($entryPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
+                $fs.Write($bytes, 0, $bytes.Length)
+                $wrote = $true
+            } finally {
+                if ($fs) { $fs.Close() }
+            }
+        } catch {
+            Write-Warning "Could not write bad-source flag to $entryPath -- $_"
+        }
+        if ($wrote) { Set-VesEveryoneReadWrite -Path $entryPath }
     }
     Add-VesDoneLogEntry -Status skip -Source $Source -DoneLogDir $DoneLogDir -FfmpegPath $FfmpegPath
 }

@@ -24,6 +24,9 @@
 if (-not (Get-Module -Name VesSharedMutex)) {
     Import-Module (Join-Path $PSScriptRoot 'VesSharedMutex.psm1') -Force
 }
+if (-not (Get-Module -Name VesDoneLog)) {
+    Import-Module (Join-Path $PSScriptRoot 'VesDoneLog.psm1') -Force
+}
 
 $script:VesPipelineFileThreshold = 500
 $script:VesEncodeInspectBatchSize = 5
@@ -117,17 +120,43 @@ function Start-VesScanProducer {
                 foreach ($f in [System.IO.Directory]::EnumerateFiles($SearchPath, "*.$ext", [System.IO.SearchOption]::AllDirectories)) {
                     if (-not (& $shouldQueue $f)) { continue }
                     $attempt = 0
+                    $queued = $false
+                    $lastError = $null
                     while ($attempt -lt 5) {
                         try {
-                            $fs = [System.IO.File]::Open($ReadyQueuePath, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
-                            $bytes = [System.Text.Encoding]::UTF8.GetBytes("$f`n")
-                            $fs.Write($bytes, 0, $bytes.Length)
-                            $fs.Close()
+                            $fs = $null
+                            try {
+                                $fs = [System.IO.File]::Open($ReadyQueuePath, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+                                $bytes = [System.Text.Encoding]::UTF8.GetBytes("$f`n")
+                                $fs.Write($bytes, 0, $bytes.Length)
+                                $queued = $true
+                            } finally {
+                                # A leaked handle here (Write() throwing after
+                                # Open() succeeds) would keep the file open
+                                # for the rest of this loop's remaining
+                                # retries too, not just this one attempt --
+                                # found via second-round team review,
+                                # 2026-08-06 (same class as the one-file
+                                # writers' original leak).
+                                if ($fs) { $fs.Close() }
+                            }
                             break
                         } catch {
+                            $lastError = $_
                             $attempt++
                             Start-Sleep -Milliseconds 100
                         }
+                    }
+                    if (-not $queued) {
+                        # Previously silent -- a title that hit this after
+                        # retries exhausted just vanished from the run with
+                        # no trace anywhere. Found via team review,
+                        # 2026-08-06: same NAS reopen-and-append hazard as
+                        # the flag writers, but here every discovered file
+                        # goes through this path, not just the rare
+                        # human-review case, so a silent drop has a much
+                        # bigger real-world blast radius.
+                        Write-Warning "Pipeline scan: could not queue $f after 5 attempts -- $lastError"
                     }
                 }
             }
@@ -142,6 +171,12 @@ function Start-VesScanProducer {
     if (Test-Path -LiteralPath $ReadyQueuePath) { [System.IO.File]::Delete($ReadyQueuePath) }
     if (Test-Path -LiteralPath $ScanDonePath) { [System.IO.File]::Delete($ScanDonePath) }
     [System.IO.File]::WriteAllText($ReadyQueuePath, '')
+    # This file gets reopened for append on every single discovered file
+    # (inside the background runspace below) -- widen its ACL immediately
+    # after creation so those reopens don't hit this NAS's broken
+    # default ACL on freshly-created files (see VesDoneLog.psm1's
+    # Set-VesEveryoneReadWrite for the full story; team review, 2026-08-06).
+    Set-VesEveryoneReadWrite -Path $ReadyQueuePath
 
     $asyncResult = $ps.BeginInvoke()
     return [PSCustomObject]@{ PowerShell = $ps; Runspace = $rs; AsyncResult = $asyncResult; ScanDonePath = $ScanDonePath }
@@ -164,6 +199,18 @@ function Stop-VesScanProducer {
             $Handle.PowerShell.Stop() | Out-Null
         }
         $Handle.PowerShell.EndInvoke($Handle.AsyncResult) | Out-Null
+    } catch { }
+    # Write-Warning inside the background runspace's scriptblock lands in
+    # that PowerShell instance's OWN Streams.Warning collection, not the
+    # caller's warning stream -- the "could not queue after 5 attempts"
+    # warning was silently unreachable from here even though the producer
+    # scriptblock itself does call Write-Warning. Found via second-round
+    # team review, 2026-08-06: forward every collected warning now, before
+    # disposing the instance that's holding them.
+    try {
+        foreach ($w in $Handle.PowerShell.Streams.Warning) {
+            Write-Warning "$w"
+        }
     } catch { }
     try { $Handle.PowerShell.Dispose() } catch { }
     try { $Handle.Runspace.Close(); $Handle.Runspace.Dispose() } catch { }

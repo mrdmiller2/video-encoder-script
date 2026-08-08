@@ -85,9 +85,16 @@ function New-VesRamDiskJob {
     graceful-degradation intent in bash).
     #>
     param(
-        [int]$PercentOfAvailable = 40,
+        [int]$PercentOfAvailable = 50,
         [long]$MinSizeBytes = 256MB,
-        [long]$MaxSizeBytes = 32GB
+        # No longer WSL2-constrained (bash's own ramdisk_create has no
+        # equivalent absolute cap, only the percentage) -- raised well
+        # past what any current fleet machine's 50%-of-available would
+        # ever hit (RANDYJ alone has 144GB RAM; 32GB was silently
+        # clamping it to under half of what 50% of its available memory
+        # would actually allow). Kept as a safety valve, not a real
+        # constraint for today's fleet.
+        [long]$MaxSizeBytes = 256GB
     )
 
     $avail = Get-VesAvailableMemoryBytes

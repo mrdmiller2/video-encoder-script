@@ -63,9 +63,19 @@ function Enter-VesSharedMutex {
             # with "Access is denied" on this NAS (an SMB oplock-break
             # timing issue), even though the file itself exists and is
             # otherwise writable moments later.
-            $fs = [System.IO.File]::Open($LockPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
-            $fs.Write($tokenBytes, 0, $tokenBytes.Length)
-            $fs.Close()
+            $fs = $null
+            try {
+                $fs = [System.IO.File]::Open($LockPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
+                $fs.Write($tokenBytes, 0, $tokenBytes.Length)
+            } finally {
+                # Pre-existing leak, same class as the flag writers'
+                # original bug -- a leaked handle here would keep this
+                # lock file open indefinitely, blocking every other
+                # host's own CreateNew attempt regardless of the mutex's
+                # own stale-reclaim logic. Found via second-round team
+                # review, 2026-08-06.
+                if ($fs) { $fs.Close() }
+            }
             break
         } catch [System.IO.IOException] {
             $waited++
@@ -123,9 +133,13 @@ function Enter-VesSharedMutexOnce {
 
     for ($attempt = 0; $attempt -lt 2; $attempt++) {
         try {
-            $fs = [System.IO.File]::Open($LockPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
-            $fs.Write($tokenBytes, 0, $tokenBytes.Length)
-            $fs.Close()
+            $fs = $null
+            try {
+                $fs = [System.IO.File]::Open($LockPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
+                $fs.Write($tokenBytes, 0, $tokenBytes.Length)
+            } finally {
+                if ($fs) { $fs.Close() }
+            }
             return $myToken
         } catch [System.IO.IOException] {
             if ($attempt -eq 1) { return $null }

@@ -27,6 +27,43 @@
 # else ever touches. Import-VesDoneLog enumerates and reads every file
 # in the directory instead of parsing one flat file.
 
+function Set-VesEveryoneReadWrite {
+    <#
+    .SYNOPSIS
+    Explicitly grants Everyone Modify on a just-created file, defending
+    against this NAS's broken default ACL for freshly-created objects
+    (Everyone: R only instead of inheriting the parent directory's
+    broader grant -- see this module's top-of-file comment for the full
+    story, confirmed via icacls 2026-08-02). The one-file-per-entry
+    pattern's atomic CreateNew avoids the *reopen-to-append* failure
+    mode, but a file left with that default restrictive ACL is still a
+    landmine for anything that later needs to read or touch it from a
+    different session/identity (a different machine's SMB connection,
+    antivirus, a future report tool) -- this closes that gap immediately
+    after creation rather than relying on nobody ever needing broader
+    access later.
+
+    Best-effort, matching this project's general NAS-write posture
+    (bash's maybe_chown_for_media_user is the same idea for the
+    NFS/Unix-permissions side): never treat a failed ACL fixup as fatal,
+    since the file itself was already written successfully by the time
+    this runs.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    try {
+        # *S-1-1-0 (the well-known SID for Everyone), not the literal name
+        # -- "Everyone" is localized on non-English Windows (e.g. "Jeder",
+        # "Todos") and icacls would fail to resolve it there. Quoted path:
+        # library paths routinely contain spaces (team review, 2026-08-06).
+        icacls "$Path" /grant '*S-1-1-0:(M)' /Q *>$null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Could not widen ACL on $Path (icacls exit code $LASTEXITCODE)"
+        }
+    } catch {
+        Write-Warning "Could not widen ACL on $Path -- $_"
+    }
+}
+
 function Get-VesMkvStructureStatKey {
     <#
     .SYNOPSIS
@@ -271,13 +308,21 @@ function Add-VesDoneLogEntry {
     $line = "$Status`t$size`t$mtime`t$Source`t$fp`n"
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($line)
     try {
-        $fs = [System.IO.File]::Open($entryPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
-        $fs.Write($bytes, 0, $bytes.Length)
-        $fs.Close()
+        $fs = $null
+        try {
+            $fs = [System.IO.File]::Open($entryPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
+            $fs.Write($bytes, 0, $bytes.Length)
+        } finally {
+            # A leaked open handle (if Write() throws after Open() succeeds)
+            # would leave the entry file locked until process exit -- found
+            # via team review, 2026-08-06.
+            if ($fs) { $fs.Close() }
+        }
     } catch {
         Write-Warning "Done-log: failed to record entry for $Source -- $_"
         return
     }
+    Set-VesEveryoneReadWrite -Path $entryPath
     $script:DoneSet[$Source] = "$key#$fp"
 }
 
@@ -314,6 +359,6 @@ function Test-VesDoneLogShouldSkip {
 }
 
 Export-ModuleMember -Function `
-    Get-VesMkvStructureStatKey, Get-VesCurrentSvtAv1MajorMinor, Get-VesCurrentX265MajorMinor, `
+    Set-VesEveryoneReadWrite, Get-VesMkvStructureStatKey, Get-VesCurrentSvtAv1MajorMinor, Get-VesCurrentX265MajorMinor, `
     Get-VesCurrentToolsFingerprint, Get-VesFingerprintField, Test-VesVersionMajorMinorNewer, `
     Test-VesToolsFingerprintStale, Import-VesDoneLog, Add-VesDoneLogEntry, Test-VesDoneLogShouldSkip

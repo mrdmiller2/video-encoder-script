@@ -23,6 +23,9 @@
 if (-not (Get-Module -Name VesTimeoutRetry)) {
     Import-Module (Join-Path $PSScriptRoot 'VesTimeoutRetry.psm1') -Force
 }
+if (-not (Get-Module -Name VesDoneLog)) {
+    Import-Module (Join-Path $PSScriptRoot 'VesDoneLog.psm1') -Force
+}
 
 $script:StrippedSubtitleLogged = @{}
 
@@ -187,6 +190,24 @@ function New-VesRealSubtitleMapArgs {
 }
 
 function Write-VesStrippedSubtitleRecord {
+    <#
+    .SYNOPSIS
+    Records a stripped-subtitle-stream event. One-file-per-entry, not a
+    shared-file append -- hardened ahead of need (2026-08-06 team
+    review): nothing currently wires -StrippedSubtitlesLogPath to a NAS
+    path (falls back to a name in the process's cwd today), but the
+    exact same Add-Content-against-a-network-path failure mode already
+    confirmed in production for Write-VesLowQualityFlag/
+    Write-VesBadSourceFlag would hit this the moment it is. See
+    VesValidation.psm1's Write-VesLowQualityFlag for the full story.
+
+    .PARAMETER LogPath
+    Despite the name (kept for caller-compatibility), this is a
+    DIRECTORY entries are written into, not a single flat file --
+    mirrors $JobSidecarDir elsewhere in this port. Defaults to the
+    process's current directory if not supplied, matching the old
+    default's location (just no longer a fixed filename within it).
+    #>
     param(
         [Parameter(Mandatory)][string]$Source,
         [Parameter(Mandatory)][int]$Index,
@@ -202,14 +223,27 @@ function Write-VesStrippedSubtitleRecord {
     $lang = "$((Invoke-VesFfprobe -FfprobePath $FfprobePath -ProbeArgs $langArgs).StdOut)".Trim()
     $title = "$((Invoke-VesFfprobe -FfprobePath $FfprobePath -ProbeArgs $titleArgs).StdOut)".Trim()
 
-    if (-not $LogPath) { $LogPath = Join-Path (Get-Location) 'stripped_subtitles.txt' }
+    $logDir = if ($LogPath) { $LogPath } else { (Get-Location).Path }
+    if (-not (Test-Path -LiteralPath $logDir -PathType Container)) { return }
     $timestamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
     $langOut = if ($lang) { $lang } else { 'und' }
     $titleOut = if ($title) { $title } else { 'none' }
-    $line = "$timestamp`t$Source`ts:$Index`tlang=$langOut`ttitle=$titleOut"
+    $line = "$timestamp`t$Source`ts:$Index`tlang=$langOut`ttitle=$titleOut`n"
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($line)
+    $token = [System.IO.Path]::GetRandomFileName() -replace '[.]', ''
+    $entryPath = Join-Path $logDir "stripped_subtitles-$env:COMPUTERNAME-$PID-$token.subtitle-flag"
+    $wrote = $false
     try {
-        Add-Content -Path $LogPath -Value $line -ErrorAction Stop
+        $fs = $null
+        try {
+            $fs = [System.IO.File]::Open($entryPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
+            $fs.Write($bytes, 0, $bytes.Length)
+            $wrote = $true
+        } finally {
+            if ($fs) { $fs.Close() }
+        }
     } catch { }
+    if ($wrote) { Set-VesEveryoneReadWrite -Path $entryPath }
 }
 
 Export-ModuleMember -Function Test-VesSubtitleStreamHasRealContent, New-VesRealSubtitleMapArgs, Write-VesStrippedSubtitleRecord
