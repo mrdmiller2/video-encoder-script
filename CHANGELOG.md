@@ -4,6 +4,30 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.0Q — 2026-08-09
+
+Real fleet-monitoring session turned up a genuine gap in the remux-shortcut
+path (existing-desired-codec sources that only need a container change, no
+re-encode) — found on 5 "Marvel's Jessica Jones" S03 mp4 sources on Plex.
+
+1. **`remux_copy_to_mkv()` had no subtitle-failure fallback at all.** The
+   main two-stage encode path (`ffmpeg_encode()`) already retries its final
+   remux without subtitle/attachment streams if the first attempt fails —
+   but this separate remux-shortcut function (shared by the must-eliminate-
+   format floor, the HEVC-in-MKV lossless-remux shortcut, and the legacy-
+   container "x265 remux to MKV" path) had no such fallback, so a single
+   malformed subtitle track failed the *entire* remux (0 bytes written,
+   video and audio lost too) instead of just dropping the bad subtitle.
+   Reproduced on Jessica Jones S03E09-E13: each source's `mov_text` track
+   threw `Task finished with error code: -22 (Invalid argument)` at mux
+   time even though `build_real_subtitle_map_args` had already filtered it
+   as "real" (non-empty) content — the track passes the emptiness check but
+   is still internally malformed. Fixed by adding the same retry-without-
+   subtitles fallback `ffmpeg_encode()` already has. Verified against a
+   real failing file (S03E09): first attempt fails identically, fallback
+   produces a full-length (52:05), `mkvalidator`-clean MKV with video+audio
+   intact.
+
 ## v5.1.0P — 2026-08-08
 
 Fourth confidence-review round on v5.1.0O's own timeout fix, requested as

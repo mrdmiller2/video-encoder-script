@@ -1385,6 +1385,26 @@ remux_copy_to_mkv() {
     -map "0:v?" -map "0:a?" -map "0:t?" -map "0:d?" "${REAL_SUBTITLE_MAP_ARGS[@]}" \
     -map_chapters 0 -map_metadata 0 \
     -c:v copy -c:a copy -c:s "$sub_codec" "$dst" || rc=$?
+  # Retry-without-subtitles fallback, same shape as ffmpeg_encode's stage-2
+  # remux fallback: a subtitle track that is present and non-empty (so it
+  # passed build_real_subtitle_map_args' filter) can still be internally
+  # malformed in a way that only breaks at mux time -- found 2026-08-09 on
+  # a batch of "Marvel's Jessica Jones" S03 mp4 sources whose mov_text
+  # track threw "Task finished with error code: -22 (Invalid argument)",
+  # aborting the whole remux (0 bytes written) even though video+audio
+  # were perfectly fine. This shortcut path had no fallback at all before
+  # this, unlike the main two-stage encode path -- real gap, not just a
+  # one-off source defect, since remux_copy_to_mkv is shared by every
+  # remux-shortcut call site (must-eliminate-format floor, HEVC-in-MKV
+  # shortcut, legacy-container remux).
+  if [ "$rc" -ne 0 ]; then
+    warn "ffmpeg remux with subtitle/attachment streams failed (rc=$rc) — retrying without subtitle/attachment streams: $(basename "$src")"
+    rc=0
+    run_tracked_encoder "ffmpeg remux (no subtitles)" "${FFMPEG_CMD[@]}" -y -nostdin -stats -loglevel warning -i "$src" \
+      -map "0:v?" -map "0:a?" \
+      -map_chapters 0 -map_metadata 0 \
+      -c:v copy -c:a copy "$dst" || rc=$?
+  fi
   if [ "$rc" -eq 0 ] && [ ! -s "$dst" ]; then
     warn "remux reported success but output is missing/empty: $dst"
     rc=1
