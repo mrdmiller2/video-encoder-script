@@ -47,6 +47,96 @@ function Invoke-VesFfmpegValidation {
     Invoke-VesWithTimeoutRetry -FilePath $FfmpegPath -ArgumentList $FfmpegArgs -TimeoutSeconds $TimeoutSeconds
 }
 
+function Invoke-VesFfmpegSrtEarlyExit {
+    <#
+    .SYNOPSIS
+    Early-exit port of the bash text-decode probe's `| head -1` SIGPIPE
+    short-circuit (2026-08-11) -- found via real fleet monitoring that
+    PRINCE was hitting this probe's full retry budget (3x60s) repeatedly
+    across many Sabrina episodes, since Invoke-VesFfmpegValidation's
+    ReadToEndAsync always waits for the full decode to finish. Reads
+    ffmpeg's stdout line-by-line via ReadLineAsync (same Task-based
+    approach as Invoke-VesWithTimeoutRetry, for the same
+    PowerShell-event-loop-independence reason) and kills the process the
+    moment ONE real (non cue-number/timing/blank) line is found -- this
+    only short-circuits the CONFIRMED-non-empty case; a track that's
+    ambiguous or genuinely empty throughout still reads to EOF and
+    reports ffmpeg's own real exit code, so the
+    never-treat-ambiguous-as-empty invariant this whole probe exists for
+    is unchanged.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$FfmpegPath,
+        [Parameter(Mandatory)][string[]]$FfmpegArgs,
+        [int]$TimeoutSeconds = 60,
+        [int]$MaxRetries = 2
+    )
+    $attempt = 0
+    while ($true) {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $FfmpegPath
+        foreach ($a in $FfmpegArgs) { $psi.ArgumentList.Add($a) }
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+
+        $proc = New-Object System.Diagnostics.Process
+        $proc.StartInfo = $psi
+        $foundReal = $false
+        $timedOut = $false
+        try {
+            $proc.Start() | Out-Null
+            $stderrTask = $proc.StandardError.ReadToEndAsync()
+            $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+            while ($true) {
+                $remainingMs = [Math]::Max(0, ($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+                if ($remainingMs -le 0) { $timedOut = $true; break }
+                $lineTask = $proc.StandardOutput.ReadLineAsync()
+                $completedIdx = [System.Threading.Tasks.Task]::WaitAny(@($lineTask), [int]$remainingMs)
+                if ($completedIdx -eq -1) { $timedOut = $true; break }
+                $line = $lineTask.Result
+                if ($null -eq $line) { break }  # EOF -- ffmpeg finished writing stdout
+                $clean = $line -replace '\{\\[^}]*\}', '' -replace '<[^>]*>', ''
+                if ($clean -notmatch '^\d+$' -and $clean -notmatch '^[0-9:,]+ --> [0-9:,]+$' -and $clean.Trim() -ne '') {
+                    $foundReal = $true
+                    break
+                }
+            }
+
+            if ($timedOut) {
+                try { $proc.Kill($true) } catch { }
+                $proc.WaitForExit()
+                try { [System.Threading.Tasks.Task]::WaitAll(@($stderrTask)) } catch { }
+                $attempt++
+                if ($attempt -gt $MaxRetries) {
+                    return [PSCustomObject]@{ FoundReal = $false; ExitCode = 124; TimedOut = $true }
+                }
+                continue
+            }
+
+            if ($foundReal) {
+                # Confirmed non-empty -- no need to wait for the rest of
+                # the episode. Killing here (not letting it exit
+                # naturally) is what delivers the early-exit time win.
+                try { $proc.Kill($true) } catch { }
+                $proc.WaitForExit()
+                return [PSCustomObject]@{ FoundReal = $true; ExitCode = 0; TimedOut = $false }
+            }
+
+            # EOF reached with no real line found -- ffmpeg has already
+            # exited by construction (ReadLineAsync only returns $null at
+            # end of stream); reap it and trust its own real exit code,
+            # exactly like the non-early-exit path did before this change.
+            $proc.WaitForExit()
+            try { [System.Threading.Tasks.Task]::WaitAll(@($stderrTask)) } catch { }
+            return [PSCustomObject]@{ FoundReal = $false; ExitCode = $proc.ExitCode; TimedOut = $false }
+        } finally {
+            $proc.Dispose()
+        }
+    }
+}
+
 function Test-VesSubtitleStreamHasRealContent {
     <#
     .SYNOPSIS
@@ -96,47 +186,23 @@ function Test-VesSubtitleStreamHasRealContent {
         return $true
     }
 
-    # --- Text-decode probe ---
+    # --- Text-decode probe (early-exit, 2026-08-11 -- see
+    # Invoke-VesFfmpegSrtEarlyExit's own doc comment for why) ---
     $decodeArgs = @('-v', 'error', '-i', $Source, '-map', "0:s:$Index", '-f', 'srt', '-')
-    $decodeResult = Invoke-VesFfmpegValidation -FfmpegPath $FfmpegPath -FfmpegArgs $decodeArgs
-    $rawSrt = $decodeResult.StdOut
+    $decodeResult = Invoke-VesFfmpegSrtEarlyExit -FfmpegPath $FfmpegPath -FfmpegArgs $decodeArgs
 
-    # Team-review fix (2026-08-02): checking ExitCode independently of
-    # whether $rawSrt is empty, not "empty AND nonzero" -- if ffmpeg
-    # crashes/times out AFTER already flushing some real (or garbage)
-    # partial SRT text to stdout, the old "both" check let a nonzero
-    # exit slip past unflagged, then fed that partial output into the
-    # line-stripper below, which could legitimately net 0 dialogue
-    # lines and return $false (discard) -- silently treating a genuine
-    # subprocess failure as proof of emptiness, the exact invariant
-    # this whole function exists to prevent. Any nonzero exit is now
-    # always ambiguous, regardless of what partial output exists.
+    # Team-review fix (2026-08-02, preserved across the early-exit port):
+    # any nonzero/failed/timed-out outcome is always ambiguous, never
+    # treated as proof of emptiness -- the exact invariant this whole
+    # probe exists to prevent violating. $decodeResult.FoundReal is only
+    # $true when a genuine non-cue-number/timing/blank line was actually
+    # observed in ffmpeg's own output before it was killed.
     if ($decodeResult.ExitCode -ne 0) {
         Write-Warning "Subtitle stream s:${Index} in ${Source}: text-decode probe failed/timed out (exit $($decodeResult.ExitCode)) -- keeping rather than risk discarding real content"
         return $true
     }
 
-    if ([string]::IsNullOrEmpty($rawSrt)) {
-        return $false
-    }
-
-    # Strip cue numbers/timing lines/blank lines, ASS override blocks
-    # ({\an5}, {\pos(...)}, etc.), and <tag>/</tag> wrappers ffmpeg's srt
-    # encoder adds for styled ASS cues. A track can have packets but
-    # still be functionally empty (every cue authored as "" or as
-    # position-only override codes with no dialogue).
-    $lines = $rawSrt -split "`r?`n"
-    $cueNumberRe = '^\d+$'
-    $timingRe = '^[0-9:,]+ --> [0-9:,]+$'
-    $decodeOut = foreach ($line in $lines) {
-        $stripped = $line -replace '\{\\[^}]*\}', '' -replace '<[^>]*>', ''
-        if ($stripped -match $cueNumberRe) { continue }
-        if ($stripped -match $timingRe) { continue }
-        if ($stripped.Trim() -eq '') { continue }
-        $stripped
-    }
-
-    return (@($decodeOut).Count -gt 0)
+    return $decodeResult.FoundReal
 }
 
 function New-VesRealSubtitleMapArgs {

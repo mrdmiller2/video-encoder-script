@@ -284,16 +284,25 @@ subtitle_stream_has_real_content() {
     -of default=nw=1:nk=1 "$src" 2>/dev/null)"
   case "$codec" in
     subrip|srt|ass|ssa|mov_text|webvtt|text)
-      # Capture ffmpeg's raw SRT output and check ITS OWN exit status
-      # first (not the exit status of a trailing sed/grep filter pipeline,
-      # which would mask a real ffmpeg failure behind grep's own routine
-      # "found nothing" rc=1 -- found in the same 2026-08-02 review).
-      raw_srt="$(run_ffmpeg_validation -v error -i "$src" -map "0:s:$idx" -f srt - 2>/dev/null)" && dec_rc=0 || dec_rc=$?
-      if [ -z "$raw_srt" ] && [ "$dec_rc" -ne 0 ]; then
-        warn "Subtitle stream s:$idx in $src: text-decode probe failed/timed out -- keeping rather than risk discarding real content"
-        return 0
-      fi
-      # Strip cue numbers/timing lines/blank lines, then ASS override
+      # Early-exit optimization (2026-08-11): same idea as the
+      # packet-presence probe's `head -1` short-circuit above, applied to
+      # the decode probe -- found via real fleet monitoring that PRINCE
+      # was hitting this probe's full 3x60s retry budget repeatedly
+      # across many Sabrina episodes (safe fallback each time, no data
+      # loss, but wasted minutes per file). The full-file decode was
+      # previously unavoidable because the old form captured $raw_srt
+      # first and filtered afterward -- piping the filter directly onto
+      # ffmpeg's stdout lets `head -1` SIGPIPE ffmpeg (rc 141) the moment
+      # ONE real (non cue-number/timing/blank) line is found, without
+      # waiting for the rest of the episode. This only short-circuits the
+      # CONFIRMED-non-empty case; a track that's ambiguous or genuinely
+      # empty throughout still requires the full decode to prove it (the
+      # pipeline never sees a match to short-circuit on), so the
+      # never-treat-ambiguous-as-empty invariant is unchanged -- 141 joins
+      # the same "not a real failure" allowance the packet probe already
+      # has for exactly this reason.
+      #
+      # Strips cue numbers/timing lines/blank lines, then ASS override
       # blocks ({\an5}, {\pos(...)}, etc.) and any <tag>/</tag> wrapper
       # ffmpeg's srt encoder adds for styled ASS cues -- anything left
       # over is real text. A track can have packets but still be
@@ -302,9 +311,14 @@ subtitle_stream_has_real_content() {
       # direct testing (2026-08-02): an ASS cue containing only "{\an5}"
       # survived the original cue-number/timing-only strip as
       # "<font size=...>{\an5}</font>", a false negative.
-      decode_out="$(printf '%s\n' "$raw_srt" \
+      decode_out="$(run_ffmpeg_validation -v error -i "$src" -map "0:s:$idx" -f srt - 2>/dev/null \
         | sed -E 's/\{\\[^}]*\}//g; s/<[^>]*>//g' \
-        | grep -vE '^[0-9]+$|^[0-9:,]+ --> [0-9:,]+$|^[[:space:]]*$')"
+        | grep -vE '^[0-9]+$|^[0-9:,]+ --> [0-9:,]+$|^[[:space:]]*$' \
+        | head -1)" && dec_rc=0 || dec_rc=$?
+      if [ -z "$decode_out" ] && [ "$dec_rc" -ne 0 ] && [ "$dec_rc" -ne 141 ]; then
+        warn "Subtitle stream s:$idx in $src: text-decode probe failed/timed out -- keeping rather than risk discarding real content"
+        return 0
+      fi
       [ -n "$decode_out" ]
       ;;
     *)

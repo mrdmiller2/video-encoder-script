@@ -192,5 +192,21 @@ season_retry_pass() {
       end_convert_job "$file" "$idx" "$total" "$ok"
     done <<<"${SEASON_NO_SHRINK_FILES[$key]}"
     SEASON_RETRY_IN_PROGRESS=false
+    # Defensive verification (2026-08-11): found via real fleet monitoring
+    # that a season-retry pass on JJACKSON logged "retrying 3 episode(s)"
+    # but only "Job 1 of 3" ever appeared before the run reported "Done" --
+    # root cause not pinned down despite an isolated repro of this exact
+    # loop (with a mocked always-rejecting try_x265_convert) behaving
+    # correctly through all 3 iterations, and every begin_convert_job
+    # failure path already warn()s on skip (none of those warnings
+    # appeared either). Whatever the mechanism, silently completing fewer
+    # retries than promised, with zero trace, is exactly the kind of gap
+    # this project's whole "verify before trusting" posture exists to
+    # catch -- this makes any future recurrence loud and diagnosable
+    # instead of invisible, without changing behavior when idx and total
+    # already agree (the overwhelmingly common case).
+    if [ "$idx" -ne "$total" ]; then
+      warn "Season $season ($dir): retry pass only processed $idx of $total promised episode(s) — investigate before trusting this run's season-retry results"
+    fi
   done
 }

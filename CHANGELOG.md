@@ -4,6 +4,44 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.0R — 2026-08-11
+
+Two fixes found monitoring PRINCE and JJACKSON's live batches.
+
+1. **Subtitle text-decode probe now short-circuits on confirmed real
+   content, both platforms.** `subtitle_stream_has_real_content()` (bash)
+   /`Test-VesSubtitleStreamHasRealContent` (Windows) already had a
+   `head -1`-style early exit for the packet-presence probe, but the
+   text-decode probe (the one that actually decodes to SRT to check for
+   real dialogue) always ran to full completion regardless of platform --
+   found via real fleet monitoring that PRINCE was repeatedly burning its
+   full 3x60s retry budget on this probe across many Sabrina episodes
+   (safe fallback each time, no data loss, but wasted minutes per file).
+   Fixed on both platforms by piping the filter directly onto the
+   decode's own stdout (bash: `| head -1`, letting `pipefail` capture
+   ffmpeg's real exit code including 141/SIGPIPE the same way the packet
+   probe already does; Windows: a new `Invoke-VesFfmpegSrtEarlyExit`
+   using incremental `ReadLineAsync` + kill-on-first-real-line instead of
+   the shared `Invoke-VesWithTimeoutRetry`'s `ReadToEndAsync`) -- only
+   short-circuits the CONFIRMED-non-empty case, so the never-treat-
+   ambiguous-as-empty invariant this probe exists for is unchanged.
+   Verified against a real file (`The Man in the High Castle` S01E03):
+   old approach still running past 2 minutes, new approach found real
+   content and returned in 43.5s.
+2. **`season_retry_pass()` now self-verifies it processed every promised
+   retry candidate.** Found on JJACKSON: a season-shrink-heuristic retry
+   logged "retrying 3 episode(s)" but only "Job 1 of 3" ever appeared
+   before the run reported "Done" -- 2 candidates silently skipped with
+   zero trace. Root cause not pinned down despite an isolated repro of
+   the exact loop (with a mocked always-rejecting encode call) behaving
+   correctly through all 3 iterations on real data, and every
+   `begin_convert_job` failure path already warning on skip (none of
+   those warnings appeared in the real log either). Added a defensive
+   check: if the loop's actual processed count doesn't match the
+   promised total, it now warns loudly instead of silently reporting
+   success -- doesn't change behavior in the normal case, but turns any
+   future recurrence from invisible into immediately diagnosable.
+
 ## v5.1.0Q — 2026-08-09
 
 Real fleet-monitoring session turned up a genuine gap in the remux-shortcut
