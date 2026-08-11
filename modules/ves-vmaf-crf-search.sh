@@ -17,18 +17,43 @@
 # writing temp files at all. target_height set means out was upscaled: the
 # source is scaled up to match before comparison, same filter chain as the
 # CRF-search scorer.
+#
+# Both streams are also normalized to src's nominal r_frame_rate via an fps=
+# filter before comparison (2026-08-11 fix): a VFR source (duplicate/dropped
+# frames scattered through the file -- a common web-rip artifact, its
+# avg_frame_rate differing from r_frame_rate is the fingerprint) plays back
+# at a genuinely different per-frame wall-clock timing than the CFR output
+# the encoder produces. Two independent -ss seeks to "the same" timestamp
+# then land on different underlying frames every few frames as the two
+# timings drift apart, and libvmaf silently scores each of those misaligned
+# pairs near 0 -- found via a real fleet-wide false-positive spike (dozens of
+# episodes across Snowpiercer/Jessica Jones/Man in High Castle/Westworld/
+# Battlestar Galactica flagged as "below VMAF floor" on five different
+# machines) that a still-frame comparison showed looked visually fine; the
+# per-frame VMAF log for one flagged file showed a literal ~3-frame-period
+# pattern of 90-100 alternating with 0.0, and forcing both streams to the
+# same CFR before comparison took that exact file's window score from 74.6
+# to 97.8 with no other change. A failed/garbage r_frame_rate probe falls
+# back to the unnormalized comparison rather than failing the whole
+# measurement -- a wrong-but-harmless fps value would just reintroduce this
+# same drift, not corrupt anything further.
 _vmaf_compare_window() {  # src out start secs model target_height
   local src="$1" out="$2" start="$3" secs="$4" model="$5" target_height="${6:-0}"
-  local scale_filter="" vlog v
+  local scale_filter="" vlog v fps_rate fps_filter=""
   case "$target_height" in
     720) scale_filter='scale=1280:720:flags=lanczos:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,' ;;
     1080) scale_filter='scale=1920:1080:flags=lanczos:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,' ;;
   esac
+  fps_rate="$(run_ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate \
+    -of default=nw=1:nk=1 "$src" 2>/dev/null)" || fps_rate=""
+  if [[ "$fps_rate" =~ ^[0-9]+/[0-9]+$ ]] && [ "${fps_rate#*/}" -gt 0 ] && [ "${fps_rate%/*}" -gt 0 ]; then
+    fps_filter="fps=${fps_rate},"
+  fi
   vlog="$(mktemp "${TMPDIR:-/tmp}/ves-vmaf-XXXXXX.json")" || return 1
   # run_ffmpeg_validation (timeout-wrapped) -- same short-bounded-window
   # hang risk as the CRF-search VMAF scorer (fixed 2026-07-29).
   run_ffmpeg_validation -y -v error -ss "$start" -t "$secs" -i "$out" -ss "$start" -t "$secs" -i "$src" -lavfi \
-    "[0:v]setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]${scale_filter}setpts=PTS-STARTPTS,format=yuv420p10le[r];[d][r]libvmaf=model=$model:n_threads=$(nproc 2>/dev/null || sysctl -n hw.ncpu):log_fmt=json:log_path=$vlog" \
+    "[0:v]${fps_filter}setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]${fps_filter}${scale_filter}setpts=PTS-STARTPTS,format=yuv420p10le[r];[d][r]libvmaf=model=$model:n_threads=$(nproc 2>/dev/null || sysctl -n hw.ncpu):log_fmt=json:log_path=$vlog" \
     -f null - 2>/dev/null || { rm -f "$vlog"; return 1; }
   v="$(python3 -c "import json;print(round(json.load(open('$vlog'))['pooled_metrics']['vmaf']['mean'],2))" 2>/dev/null)" || { rm -f "$vlog"; return 1; }
   rm -f "$vlog"

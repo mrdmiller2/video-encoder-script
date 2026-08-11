@@ -461,6 +461,48 @@ function Get-VesFinalVmaf {
     }
     $nThreads = [Environment]::ProcessorCount
 
+    # Both streams are normalized to Source's nominal r_frame_rate via an
+    # fps= filter before comparison (2026-08-11 fix, ported from the bash
+    # side same day): a VFR source (duplicate/dropped frames scattered
+    # through the file -- a common web-rip artifact) plays back at a
+    # genuinely different per-frame wall-clock timing than the CFR $Output
+    # the encoder produces, so two independent -ss seeks to "the same"
+    # timestamp land on different underlying frames every few frames as the
+    # two timings drift apart -- libvmaf then silently scores each
+    # misaligned pair near 0, dragging the pooled mean far below the real
+    # quality (found via a real fleet-wide false-positive spike across
+    # multiple shows/machines; see ves-vmaf-crf-search.sh's matching
+    # comment for the full empirical writeup). A failed/garbage
+    # r_frame_rate probe falls back to the unnormalized comparison rather
+    # than failing the whole measurement.
+    $fpsFilter = ''
+    $rFrameRateArgs = @('-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=r_frame_rate', '-of', 'default=nw=1:nk=1', $Source)
+    $rfrPsi = New-Object System.Diagnostics.ProcessStartInfo
+    $rfrPsi.FileName = $FfprobePath
+    foreach ($a in $rFrameRateArgs) { $rfrPsi.ArgumentList.Add($a) }
+    $rfrPsi.RedirectStandardOutput = $true
+    $rfrPsi.RedirectStandardError = $true
+    $rfrPsi.UseShellExecute = $false
+    $rfrProc = [System.Diagnostics.Process]::Start($rfrPsi)
+    try {
+        $rfrTask = $rfrProc.StandardOutput.ReadToEndAsync()
+        if ($rfrProc.WaitForExit(30000)) {
+            $rfrTask.Wait()
+            $rFrameRate = $rfrTask.Result.Trim()
+            if ($rFrameRate -match '^\d+/\d+$') {
+                $parts = $rFrameRate -split '/'
+                if ([int]$parts[0] -gt 0 -and [int]$parts[1] -gt 0) {
+                    $fpsFilter = "fps=$rFrameRate,"
+                }
+            }
+        } else {
+            try { $rfrProc.Kill($true) } catch { }
+            $rfrProc.WaitForExit()
+        }
+    } finally {
+        $rfrProc.Dispose()
+    }
+
     $vsum = 0.0
     $n = 0
     for ($i = 1; $i -le $nsamples; $i++) {
@@ -478,7 +520,7 @@ function Get-VesFinalVmaf {
         # just the bare filename with the process's working directory set
         # to the temp folder sidesteps the escaping question entirely --
         # also verified working end-to-end on PRINCE.
-        $lavfi = "[0:v]setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]${scaleFilter}setpts=PTS-STARTPTS,format=yuv420p10le[r];[d][r]libvmaf=model=$model`:n_threads=$nThreads`:log_fmt=json:log_path=$vlogName"
+        $lavfi = "[0:v]${fpsFilter}setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]${fpsFilter}${scaleFilter}setpts=PTS-STARTPTS,format=yuv420p10le[r];[d][r]libvmaf=model=$model`:n_threads=$nThreads`:log_fmt=json:log_path=$vlogName"
         $ffArgs = @('-y', '-v', 'error', '-ss', "$start", '-t', "$SampleSeconds", '-i', $Output,
             '-ss', "$start", '-t', "$SampleSeconds", '-i', $Source, '-lavfi', $lavfi, '-f', 'null', '-')
         $run = Invoke-VesProbeFfmpegRun -FfmpegPath $FfmpegPath -Args $ffArgs -TimeoutSeconds $TimeoutSeconds -WorkingDirectory $vlogDir

@@ -4,6 +4,39 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.0S — 2026-08-11
+
+**Fixed a false-positive "below VMAF floor" bug affecting VFR sources on
+both platforms** -- found while sweeping fleet logs for issues: dozens of
+episodes across five different shows (Snowpiercer, Marvel's Jessica Jones,
+The Man in the High Castle, Westworld, Battlestar Galactica 1978) on five
+different machines (AI-PROCESSOR, Plex, MJACKSON, JJACKSON, MARLONJ) had
+their finished AV1/x265 output flagged as "Kept output below VMAF 85.00
+floor" with scores as low as 50-84, despite the CRF search that picked
+their encode settings having predicted ~94. Root cause: `measure_final_vmaf()`
+(bash) / `Get-VesFinalVmaf` (Windows) independently `-ss`-seeks into the
+original source and the finished output to grab a matching same-timestamp
+window for libvmaf comparison -- fine for a constant-frame-rate source, but
+a VFR source (duplicate/dropped frames scattered through the file, a common
+web-rip artifact -- its `avg_frame_rate` differing from `r_frame_rate` is
+the fingerprint) plays back at a genuinely different per-frame wall-clock
+timing than the CFR output the encoder produces. The two independent seeks
+then land on different underlying frames every few frames as the two
+timings drift apart, and libvmaf silently scores each misaligned pair near
+0. Confirmed via a real reproduction (Snowpiercer S01E01): a still-frame
+grab at the flagged timestamp showed the two frames were visually
+near-identical, but the per-frame VMAF log showed a literal ~3-frame-period
+pattern of 90-100 alternating with 0.0. **The encoded output quality itself
+was fine all along** -- this was purely a measurement bug. Fixed by
+normalizing both streams to the source's nominal `r_frame_rate` via an
+`fps=` filter before the libvmaf comparison on both platforms; verified
+end-to-end through the real `measure_final_vmaf()` function against the
+same file: pooled score went from 53.0 (flagged) to 92.2 (correctly above
+floor), no other change. A failed/garbage frame-rate probe falls back to
+the old unnormalized comparison rather than failing the whole measurement.
+Every file already flagged under the old measurement should be considered
+a false positive pending re-verification, not a confirmed quality problem.
+
 ## v5.1.0R — 2026-08-11
 
 Two fixes found monitoring PRINCE and JJACKSON's live batches.
