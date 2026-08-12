@@ -18,37 +18,43 @@
 # source is scaled up to match before comparison, same filter chain as the
 # CRF-search scorer.
 #
-# Both streams are also normalized to src's nominal r_frame_rate via an fps=
-# filter before comparison (2026-08-11 fix): a VFR source (duplicate/dropped
-# frames scattered through the file -- a common web-rip artifact, its
-# avg_frame_rate differing from r_frame_rate is the fingerprint) plays back
-# at a genuinely different per-frame wall-clock timing than the CFR output
-# the encoder produces. Two independent -ss seeks to "the same" timestamp
-# then land on different underlying frames every few frames as the two
-# timings drift apart, and libvmaf silently scores each of those misaligned
-# pairs near 0 -- found via a real fleet-wide false-positive spike (dozens of
-# episodes across Snowpiercer/Jessica Jones/Man in High Castle/Westworld/
-# Battlestar Galactica flagged as "below VMAF floor" on five different
-# machines) that a still-frame comparison showed looked visually fine; the
-# per-frame VMAF log for one flagged file showed a literal ~3-frame-period
-# pattern of 90-100 alternating with 0.0, and forcing both streams to the
-# same CFR before comparison took that exact file's window score from 74.6
-# to 97.8 with no other change. A failed/garbage r_frame_rate probe falls
-# back to the unnormalized comparison rather than failing the whole
-# measurement -- a wrong-but-harmless fps value would just reintroduce this
-# same drift, not corrupt anything further.
-_vmaf_compare_window() {  # src out start secs model target_height
-  local src="$1" out="$2" start="$3" secs="$4" model="$5" target_height="${6:-0}"
-  local scale_filter="" vlog v fps_rate fps_filter=""
+# A VFR source (duplicate/dropped frames scattered through the file -- a
+# common web-rip artifact) plays back at a genuinely different per-frame
+# wall-clock timing than the CFR output the encoder produces. Two
+# independent -ss seeks to "the same" timestamp then land on different
+# underlying frames every few frames as the two timings drift apart, and
+# libvmaf silently scores each of those misaligned pairs near 0 -- found via
+# a real fleet-wide false-positive spike (dozens of episodes across
+# Snowpiercer/Jessica Jones/Man in High Castle/Westworld flagged as "below
+# VMAF floor" on multiple machines) that a still-frame comparison showed
+# looked visually fine; the per-frame VMAF log for one flagged file showed a
+# literal ~3-frame-period pattern of 90-100 alternating with 0.0.
+#
+# Normalizing both streams to a common frame rate (fps=) before comparison
+# fixes that -- but is NOT safe to apply unconditionally (2026-08-12
+# correction to the 2026-08-11 fix above): Battlestar Galactica (1978)
+# episodes have real, if subtle, frame-timing irregularities (confirmed via
+# ffmpeg's own "non monotonically increasing dts" warnings) while sitting at
+# an unusual native rate (500/21) where avg_frame_rate and r_frame_rate are
+# EXACTLY equal despite that -- forcing fps=500/21 on an already-matching
+# stream introduced its own resampling artifacts and made one file's score
+# WORSE (81.7->69.3), while the unfiltered comparison actually scored it
+# fine (89.9 on the same window). Since real misalignment can only ever drag
+# a score spuriously LOW (never inflate it), and unnecessary resampling can
+# also only ever drag a score LOW, never invent quality that isn't there --
+# taking whichever of the two measurements is HIGHER is safe in both
+# directions: a genuinely bad encode still scores low both ways, while
+# either failure mode (misalignment without the filter, or resampling
+# artifacts from the filter) is masked by the other measurement not being
+# subject to that specific failure. Costs one extra ffmpeg pass per sample
+# window -- acceptable for this occasional tagging/diagnostic path.
+_vmaf_compare_window_once() {  # src out start secs model target_height fps_filter
+  local src="$1" out="$2" start="$3" secs="$4" model="$5" target_height="${6:-0}" fps_filter="${7:-}"
+  local scale_filter="" vlog v
   case "$target_height" in
     720) scale_filter='scale=1280:720:flags=lanczos:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,' ;;
     1080) scale_filter='scale=1920:1080:flags=lanczos:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,' ;;
   esac
-  fps_rate="$(run_ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate \
-    -of default=nw=1:nk=1 "$src" 2>/dev/null)" || fps_rate=""
-  if [[ "$fps_rate" =~ ^[0-9]+/[0-9]+$ ]] && [ "${fps_rate#*/}" -gt 0 ] && [ "${fps_rate%/*}" -gt 0 ]; then
-    fps_filter="fps=${fps_rate},"
-  fi
   vlog="$(mktemp "${TMPDIR:-/tmp}/ves-vmaf-XXXXXX.json")" || return 1
   # run_ffmpeg_validation (timeout-wrapped) -- same short-bounded-window
   # hang risk as the CRF-search VMAF scorer (fixed 2026-07-29).
@@ -58,6 +64,26 @@ _vmaf_compare_window() {  # src out start secs model target_height
   v="$(python3 -c "import json;print(round(json.load(open('$vlog'))['pooled_metrics']['vmaf']['mean'],2))" 2>/dev/null)" || { rm -f "$vlog"; return 1; }
   rm -f "$vlog"
   printf '%s' "$v"
+}
+
+_vmaf_compare_window() {  # src out start secs model target_height
+  local src="$1" out="$2" start="$3" secs="$4" model="$5" target_height="${6:-0}"
+  local fps_rate fps_filter="" v_plain v_fps
+  fps_rate="$(run_ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate \
+    -of default=nw=1:nk=1 "$src" 2>/dev/null)" || fps_rate=""
+  if [[ "$fps_rate" =~ ^[0-9]+/[0-9]+$ ]] && [ "${fps_rate#*/}" -gt 0 ] && [ "${fps_rate%/*}" -gt 0 ]; then
+    fps_filter="fps=${fps_rate},"
+  fi
+  v_plain="$(_vmaf_compare_window_once "$src" "$out" "$start" "$secs" "$model" "$target_height" "")" || v_plain=""
+  if [ -z "$fps_filter" ]; then
+    [ -n "$v_plain" ] && printf '%s' "$v_plain"
+    return $([ -n "$v_plain" ] && echo 0 || echo 1)
+  fi
+  v_fps="$(_vmaf_compare_window_once "$src" "$out" "$start" "$secs" "$model" "$target_height" "$fps_filter")" || v_fps=""
+  if [ -z "$v_plain" ] && [ -z "$v_fps" ]; then
+    return 1
+  fi
+  awk -v a="${v_plain:--1}" -v b="${v_fps:--1}" 'BEGIN{print (a>b)?a:b}'
 }
 
 # Sampled full-output VMAF for the VES tag -- distinct from vmaf_crf_search's

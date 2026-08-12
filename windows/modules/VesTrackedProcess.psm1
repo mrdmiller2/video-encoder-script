@@ -52,7 +52,32 @@ function Invoke-VesTrackedProcess {
 
         $stderrContent = $stderrTask.Result
         if ($stderrContent) {
-            Set-Content -Path $ErrorLogPath -Value $stderrContent -NoNewline
+            # Best-effort only (2026-08-12 fix): this is a diagnostic
+            # sidecar, not part of the encode's success/failure contract --
+            # every caller already treats these stderr logs as non-fatal
+            # (see VesTwoStageEncode.psm1's comment on this exact point).
+            # But a bare Set-Content throws on any write failure, and an
+            # uncaught exception here propagates out of this function
+            # entirely, past the caller's try/finally (finally does not
+            # swallow it), and up to the job-loop's own try/catch, which
+            # aborts the WHOLE job -- discarding an already-fully-completed
+            # real encode over nothing but a diagnostic-log write failure.
+            # Found via a real production incident on RANDYJ (ex-GruntBox2):
+            # every one of 36 jobs in an overnight Orville batch (~40+ hours
+            # of real encoding) threw "Access to the path ... stderr.log is
+            # denied" and was discarded with zero output, because icacls
+            # couldn't widen this particular NAS share's ACL (Set-
+            # VesEveryoneReadWrite's own self-heal also failed there, a
+            # separate NAS-permission issue not fixed here) and every
+            # resulting Set-Content threw. Source files were never touched
+            # (this write is output-side only), but the wasted compute was
+            # total. A failed diagnostic write should degrade to a warning,
+            # never take down the job whose real work already succeeded.
+            try {
+                Set-Content -Path $ErrorLogPath -Value $stderrContent -NoNewline
+            } catch {
+                Write-Warning "Could not write stderr sidecar log (non-fatal, continuing): $ErrorLogPath -- $_"
+            }
         }
 
         return [PSCustomObject]@{

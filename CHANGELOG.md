@@ -4,6 +4,51 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.0T — 2026-08-12
+
+Two fixes found while re-verifying v5.1.0S's own fix against the real
+flagged-file list, plus one severe unrelated bug found investigating why
+RANDYJ had an unexpected ffmpeg process running.
+
+1. **v5.1.0S's VMAF frame-rate normalization corrected — it was NOT safe to
+   apply unconditionally.** Re-running `measure_final_vmaf`/`Get-VesFinalVmaf`
+   against every file flagged under the old (pre-S) measurement confirmed
+   39 straight false positives across Snowpiercer/Jessica Jones/Man in the
+   High Castle/Westworld — but Battlestar Galactica (1978) showed mixed
+   results, including two files that got WORSE after the v5.1.0S fix
+   (81.7→69.3, 70.9→61.3). Root cause: these episodes sit at an unusual
+   native rate (500/21) where `avg_frame_rate` exactly equals
+   `r_frame_rate` despite real, subtle frame-timing irregularities
+   (confirmed via ffmpeg's own "non monotonically increasing dts"
+   warnings) — forcing `fps=500/21` onto an already-matching stream
+   introduced its own resampling artifacts. Fixed by measuring each sample
+   window BOTH ways (with and without the fps filter) and keeping whichever
+   score is higher: misalignment can only ever drag a score spuriously low,
+   and unnecessary resampling can only ever drag it low too, so taking the
+   max is safe in both directions — a genuinely bad encode still scores low
+   either way. Verified: the regressed Battlestar Galactica file's score
+   went from 61.3 (broken v5.1.0S) to 75.9 (still below floor, but no
+   longer artificially suppressed, and better than even the original 70.9).
+2. **A real uncaught-exception bug destroyed 100% of a 36-episode overnight
+   batch on RANDYJ (ex-GruntBox2).** `Invoke-VesTrackedProcess`'s stderr
+   sidecar-log write (`Set-Content`) had no error handling; when the
+   diagnostic log's NAS-share ACL-widen also failed (a separate, still-open
+   NAS-permission issue), every `Set-Content` threw, and since it ran last
+   in the function, the exception propagated all the way out through the
+   caller's try/finally (finally doesn't suppress it) to the job loop's own
+   try/catch, discarding an already-fully-completed real encode over
+   nothing but a failed diagnostic write. Every one of 36 jobs in an
+   Orville batch (~40+ hours of real encoding) hit this and produced zero
+   output — source files were never touched (this write is output-side
+   only), so no data was lost, but the compute was a total loss. Fixed by
+   wrapping the write in try/catch that degrades to a warning, matching
+   what the surrounding code already documented as the intended contract
+   ("these stderr logs are non-fatal diagnostics"). The identical bug
+   existed in the HandBrake disc-source path (`VesHandBrake.psm1`) and was
+   fixed the same way. The underlying NAS ACL-widen failure itself (why
+   `icacls`/`Set-VesEveryoneReadWrite` can't fix this particular share's
+   permissions) remains open, unrelated to this fix.
+
 ## v5.1.0S — 2026-08-11
 
 **Fixed a false-positive "below VMAF floor" bug affecting VFR sources on

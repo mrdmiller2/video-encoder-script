@@ -272,7 +272,16 @@ function Invoke-VesHandBrakeWithProgress {
         # Safe to await now -- the stdout loop above has already hit EOF.
         $stderrContent = $stderrTask.Result
         if ($stderrContent) {
-            Set-Content -Path $ErrorLogPath -Value $stderrContent -NoNewline
+            # Best-effort only -- same fix as VesTrackedProcess.psm1's
+            # Invoke-VesTrackedProcess (2026-08-12): this is a diagnostic
+            # sidecar, and a bare Set-Content throwing here would otherwise
+            # take down the whole job over a failed diagnostic write, not
+            # the disc-source encode/rip work that already succeeded.
+            try {
+                Set-Content -Path $ErrorLogPath -Value $stderrContent -NoNewline
+            } catch {
+                Write-Warning "Could not write stderr sidecar log (non-fatal, continuing): $ErrorLogPath -- $_"
+            }
         }
 
         return [PSCustomObject]@{

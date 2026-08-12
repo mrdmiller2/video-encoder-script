@@ -461,20 +461,21 @@ function Get-VesFinalVmaf {
     }
     $nThreads = [Environment]::ProcessorCount
 
-    # Both streams are normalized to Source's nominal r_frame_rate via an
-    # fps= filter before comparison (2026-08-11 fix, ported from the bash
-    # side same day): a VFR source (duplicate/dropped frames scattered
-    # through the file -- a common web-rip artifact) plays back at a
-    # genuinely different per-frame wall-clock timing than the CFR $Output
-    # the encoder produces, so two independent -ss seeks to "the same"
-    # timestamp land on different underlying frames every few frames as the
-    # two timings drift apart -- libvmaf then silently scores each
-    # misaligned pair near 0, dragging the pooled mean far below the real
-    # quality (found via a real fleet-wide false-positive spike across
-    # multiple shows/machines; see ves-vmaf-crf-search.sh's matching
-    # comment for the full empirical writeup). A failed/garbage
-    # r_frame_rate probe falls back to the unnormalized comparison rather
-    # than failing the whole measurement.
+    # Both streams are optionally normalized to Source's nominal
+    # r_frame_rate via an fps= filter before comparison, ported from the
+    # bash side (see ves-vmaf-crf-search.sh's matching comment for the full
+    # empirical writeup): a VFR source misaligns two independent -ss seeks
+    # into $Output/$Source, and libvmaf silently scores each misaligned
+    # pair near 0. But forcing the filter unconditionally is NOT safe
+    # (2026-08-12 correction) -- some sources have real-but-subtle frame-
+    # timing irregularities while sitting at an unusual native rate where
+    # avg_frame_rate exactly equals r_frame_rate anyway, and forcing fps=
+    # on an already-matching stream can itself introduce resampling
+    # artifacts that make the score WORSE, not better. Since misalignment
+    # only ever drags a score spuriously low (never inflates it), and
+    # unnecessary resampling also only ever drags it low, never invents
+    # quality -- each sample window is measured BOTH ways below and the
+    # higher of the two is kept, which is safe in both directions.
     $fpsFilter = ''
     $rFrameRateArgs = @('-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=r_frame_rate', '-of', 'default=nw=1:nk=1', $Source)
     $rfrPsi = New-Object System.Diagnostics.ProcessStartInfo
@@ -503,10 +504,8 @@ function Get-VesFinalVmaf {
         $rfrProc.Dispose()
     }
 
-    $vsum = 0.0
-    $n = 0
-    for ($i = 1; $i -le $nsamples; $i++) {
-        $start = [int]([math]::Floor($durInt * (2 * $i - 1) / ($nsamples * 2)))
+    $measureOnce = {
+        param($Start, $FilterPrefix)
         $vlogDir = [System.IO.Path]::GetTempPath()
         $vlogName = "ves-vmaf-$([guid]::NewGuid().ToString('N')).json"
         $vlog = Join-Path $vlogDir $vlogName
@@ -520,25 +519,39 @@ function Get-VesFinalVmaf {
         # just the bare filename with the process's working directory set
         # to the temp folder sidesteps the escaping question entirely --
         # also verified working end-to-end on PRINCE.
-        $lavfi = "[0:v]${fpsFilter}setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]${fpsFilter}${scaleFilter}setpts=PTS-STARTPTS,format=yuv420p10le[r];[d][r]libvmaf=model=$model`:n_threads=$nThreads`:log_fmt=json:log_path=$vlogName"
-        $ffArgs = @('-y', '-v', 'error', '-ss', "$start", '-t', "$SampleSeconds", '-i', $Output,
-            '-ss', "$start", '-t', "$SampleSeconds", '-i', $Source, '-lavfi', $lavfi, '-f', 'null', '-')
+        $lavfi = "[0:v]${FilterPrefix}setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]${FilterPrefix}${scaleFilter}setpts=PTS-STARTPTS,format=yuv420p10le[r];[d][r]libvmaf=model=$model`:n_threads=$nThreads`:log_fmt=json:log_path=$vlogName"
+        $ffArgs = @('-y', '-v', 'error', '-ss', "$Start", '-t', "$SampleSeconds", '-i', $Output,
+            '-ss', "$Start", '-t', "$SampleSeconds", '-i', $Source, '-lavfi', $lavfi, '-f', 'null', '-')
         $run = Invoke-VesProbeFfmpegRun -FfmpegPath $FfmpegPath -Args $ffArgs -TimeoutSeconds $TimeoutSeconds -WorkingDirectory $vlogDir
         if (-not $run.Ok -or -not (Test-Path -LiteralPath $vlog)) {
             Remove-Item -LiteralPath $vlog -Force -ErrorAction SilentlyContinue
-            continue
+            return $null
         }
         try {
             $json = Get-Content -LiteralPath $vlog -Raw | ConvertFrom-Json
-            $v = [double]$json.pooled_metrics.vmaf.mean
-            $vsum += $v
-            $n++
+            return [double]$json.pooled_metrics.vmaf.mean
         } catch {
-            # Malformed/partial JSON -- skip this sample, same as bash's
-            # python3-parse failure falling through to `continue`.
+            # Malformed/partial JSON, same as bash's python3-parse failure.
+            return $null
         } finally {
             Remove-Item -LiteralPath $vlog -Force -ErrorAction SilentlyContinue
         }
+    }
+
+    $vsum = 0.0
+    $n = 0
+    for ($i = 1; $i -le $nsamples; $i++) {
+        $start = [int]([math]::Floor($durInt * (2 * $i - 1) / ($nsamples * 2)))
+        $vPlain = & $measureOnce $start ''
+        $vFps = $null
+        if ($fpsFilter) { $vFps = & $measureOnce $start $fpsFilter }
+        $v = $null
+        if ($null -ne $vPlain -and $null -ne $vFps) { $v = [math]::Max($vPlain, $vFps) }
+        elseif ($null -ne $vPlain) { $v = $vPlain }
+        elseif ($null -ne $vFps) { $v = $vFps }
+        if ($null -eq $v) { continue }
+        $vsum += $v
+        $n++
     }
     if ($n -eq 0) { return $null }
     return [math]::Round($vsum / $n, 1)
