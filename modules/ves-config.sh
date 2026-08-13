@@ -6,7 +6,7 @@
 # MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
 # bug fix) -- see its own comment.
 
-VERSION="5.1.0V"
+VERSION="5.1.0W"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
 # as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
@@ -434,7 +434,7 @@ FF_HEVC_HW=""           # best functional hw HEVC encoder
 declare -A VMAF_CRF_CACHE=()
 declare -A UPSCALE_TARGET_CACHE=()
 UPSCALE_TARGET_HEIGHT=0
-declare -A SOURCE_TRAITS_CACHE=()  # $src -> "field_mode=<progressive|telecine|interlaced|ambiguous>;is_bw=<0|1>"
+declare -A SOURCE_TRAITS_CACHE=()  # $src -> "field_mode=<progressive|telecine|interlaced|ambiguous>;is_bw=<0|1>;field_order=<tff|bff>;frame_rate_mode=<cfr|vfr|unknown>;baseline_vmaf=<N.N>"
 NO_AUTO_DETELECINE=false           # --no-auto-detelecine: detect+log only, never insert IVTC/deinterlace filter
 NO_BW_TUNING=false                 # --no-bw-tuning: detect+log only, never relax CRF/VMAF target for B&W sources
 REPORT_SOURCE_TRAITS=false         # --report-source-traits: Phase 1 validation mode, detect+log across the queue, no encoding
@@ -452,6 +452,18 @@ SOURCE_TRAITS_TELECINE_REPEAT_MAX=0.30
 SOURCE_TRAITS_INTERLACE_MIN=0.10       # avg interlaced-frame ratio >= this (repeat ratio out of telecine band) -> interlaced (deinterlace)
 SOURCE_TRAITS_WINDOW_SPREAD_MAX=0.25   # max-min progressive ratio across sample windows above this -> ambiguous, never guess
 SOURCE_TRAITS_BW_SATAVG_MAX=4.0        # avg signalstats SATAVG at/below this -> classified black-and-white
+
+# Source frame-rate mode (CFR/VFR) + baseline self-VMAF. Added 2026-08-13
+# after the VMAF-VFR false-positive bug (v5.1.0S/T): that bug was only
+# ever caught reactively, by noticing a suspiciously low encode-vs-source
+# score after the fact. These two checks run proactively, once per source,
+# so a source with unreliable measurement characteristics is flagged
+# BEFORE any encode-vs-source comparison is ever trusted for it.
+# SOURCE_TRAITS_VFR_CV_MAX is deliberately untuned (same caveat as the
+# field-mode thresholds above) -- calibrate against real confirmed-CFR and
+# confirmed-VFR sources before relying on it for anything beyond logging.
+SOURCE_TRAITS_VFR_CV_MAX=0.05          # packet dts-delta coefficient of variation at/below this -> CFR, above -> VFR
+SOURCE_BASELINE_VMAF_MIN=97.0          # self-vs-self VMAF below this -> measurement methodology unreliable for this source, flag for human review
 
 # Phase F resolved constants. These complete strings are shared by sample
 # search and final encode so profile tuning cannot drift (the v5.0.29 lesson).

@@ -400,6 +400,18 @@ ffmpeg_encode() {
     *) hdr=false ;;
   esac
 
+  # Frame-rate mode + baseline self-VMAF (ves-source-traits.sh, added
+  # 2026-08-13). Unconditional -- unlike the vintage-only telecine/B&W
+  # detection above, the VMAF-VFR false-positive bug this guards against
+  # hit modern-profile titles (Godfather of Harlem, Snowpiercer, Jessica
+  # Jones, Westworld), not just vintage ones. Runs on $video_src (the
+  # actual pixels that will be CRF-searched and encoded, same reasoning as
+  # the QTGMC video_src substitution above) so a source that fails its own
+  # baseline gets flagged before resolve_crf_for_encode ever trusts a
+  # comparison against it. Read-only probing, safe under --dry-run.
+  detect_frame_rate_mode "$video_src" >/dev/null
+  measure_source_baseline_vmaf "$video_src" >/dev/null
+
   # PROFILE_CONTEXT save/set/restore: when video_src is QTGMC's temp
   # intermediate (a path like .convert-stage-qtgmc-XXXXXX/qtgmc-deinterlaced.mkv,
   # nothing like the real library layout), resolve_crf_for_encode's own

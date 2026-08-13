@@ -67,6 +67,156 @@ _signalstats_probe_window() {  # src start width
   printf '%s' "$avg"
 }
 
+# Merges key=value into SOURCE_TRAITS_CACHE[$src]'s semicolon-delimited
+# string, replacing an existing key or appending a new one -- lets
+# detect_source_traits() (telecine/B&W, vintage-only) and
+# detect_frame_rate_mode()/measure_source_baseline_vmaf() (universal, every
+# profile) populate the same cache entry independently of call order,
+# without either clobbering fields the other already wrote.
+_source_traits_cache_set() {  # src key value
+  local src="$1" key="$2" value="$3"
+  local cur="${SOURCE_TRAITS_CACHE[$src]:-}"
+  if [[ "$cur" =~ (^|\;)${key}=[^\;]* ]]; then
+    SOURCE_TRAITS_CACHE["$src"]="$(printf '%s' "$cur" | sed -E "s/(^|;)${key}=[^;]*/\1${key}=${value}/")"
+  elif [ -n "$cur" ]; then
+    SOURCE_TRAITS_CACHE["$src"]="${cur};${key}=${value}"
+  else
+    SOURCE_TRAITS_CACHE["$src"]="${key}=${value}"
+  fi
+}
+
+source_traits_frame_rate_mode() {  # src -> cfr|vfr|unknown ("unknown" if never detected)
+  local v="${SOURCE_TRAITS_CACHE[$1]:-}"
+  [[ "$v" =~ frame_rate_mode=([a-z]+) ]] && printf '%s' "${BASH_REMATCH[1]}" || printf 'unknown'
+}
+
+source_traits_baseline_vmaf() {  # src -> N.N or "" if never measured
+  local v="${SOURCE_TRAITS_CACHE[$1]:-}"
+  [[ "$v" =~ baseline_vmaf=([0-9.]+) ]] && printf '%s' "${BASH_REMATCH[1]}" || printf ''
+}
+
+# Computes the coefficient of variation (stddev/mean) of packet dts-time
+# deltas within one sample window, sorted into presentation order first
+# (raw ffprobe packet order is decode order, which B-frames make
+# non-monotonic -- sorting before diffing is required for the deltas to
+# reflect actual playback frame spacing). A tightly-clustered CFR source
+# scores near 0; genuine VFR timing scores much higher. Prints nothing and
+# returns 1 on failure (too few packets, zero mean, etc).
+_dts_delta_cv() {  # src start width
+  local src="$1" start="$2" width="$3"
+  local out
+  out="$(run_ffprobe -v error -select_streams v:0 -show_entries packet=dts_time \
+    -of csv=p=0 -read_intervals "${start}%+${width}" "$src" 2>/dev/null)" || return 1
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out" | awk '
+    NF==0 { next }
+    # ffprobe prints the literal string "N/A" for a packets dts_time when
+    # the decoder has not yet filled its B-frame reordering buffer near a
+    # -ss seek boundary -- discovered live against a real Battlestar
+    # Galactica sample window, 2026-08-13, where these polluted the
+    # numeric sort/delta math and made every probe window silently fail.
+    $1 !~ /^[0-9.]+$/ { next }
+    { t[n++] = $1 }
+    END {
+      if (n < 4) { exit 1 }
+      for (i=0;i<n;i++) for (j=i+1;j<n;j++) if (t[j]<t[i]) { tmp=t[i]; t[i]=t[j]; t[j]=tmp }
+      m=0
+      for (i=1;i<n;i++) { d[i-1]=t[i]-t[i-1]; m+=d[i-1] }
+      m/=(n-1)
+      if (m<=0) { exit 1 }
+      s=0
+      for (i=0;i<n-1;i++) { s += (d[i]-m)*(d[i]-m) }
+      s = sqrt(s/(n-1))
+      printf "%.4f", s/m
+    }
+  ' || return 1
+}
+
+# Detects whether $src has genuinely constant (CFR) or variable (VFR)
+# frame timing, using packet-level DTS-delta variance rather than the
+# unreliable r_frame_rate==avg_frame_rate container-metadata heuristic --
+# Battlestar Galactica slipped through that check entirely (its
+# avg_frame_rate matches r_frame_rate despite real per-packet timing
+# irregularities, discovered 2026-08-11/12 while chasing the VMAF-VFR
+# false-positive bug). Caches into SOURCE_TRAITS_CACHE alongside
+# field_mode/is_bw/field_order. Safe to call repeatedly (cache hit after
+# the first call) and safe under --dry-run (read-only probing).
+detect_frame_rate_mode() {  # src -> prints cfr|vfr|unknown
+  local src="$1"
+  local cached
+  cached="$(source_traits_frame_rate_mode "$src")"
+  [ "$cached" = unknown ] || { printf '%s' "$cached"; return 0; }
+
+  local dur points
+  local -a starts=()
+  dur="$(video_duration "$src")"; dur="${dur%.*}"
+  if [ -n "${dur:-}" ] && [ "$dur" -gt 0 ] 2>/dev/null; then
+    points="$(find_complexity_sample_points "$src" "$dur")" || points=""
+  fi
+  if [ -n "$points" ]; then
+    read -r -a starts <<<"$points"
+  else
+    starts=("$(sample_start_middle "${dur:-0}")")
+  fi
+
+  local width="$SOURCE_TRAITS_PROBE_WIDTH_SECS"
+  local start cv n_windows=0 avg_cv="" mode="unknown"
+  local -a cvs=()
+  for start in "${starts[@]}"; do
+    [ -n "$start" ] || continue
+    cv="$(_dts_delta_cv "$src" "$start" "$width")" || continue
+    cvs+=("$cv")
+    n_windows=$((n_windows + 1))
+  done
+
+  if [ "$n_windows" -gt 0 ]; then
+    avg_cv="$(printf '%s\n' "${cvs[@]}" | awk '{s+=$1;n++} END{printf "%.4f", s/n}')"
+    if awk -v c="$avg_cv" -v t="$SOURCE_TRAITS_VFR_CV_MAX" 'BEGIN{exit !(c<=t)}'; then
+      mode="cfr"
+    else
+      mode="vfr"
+    fi
+  fi
+
+  _source_traits_cache_set "$src" "frame_rate_mode" "$mode"
+  log_err "Source frame-rate mode: $src -> $mode (avg_cv=${avg_cv:-n/a} windows=$n_windows)"
+  printf '%s' "$mode"
+}
+
+# Measures VMAF of $src against itself -- a pure measurement-methodology
+# sanity check, not a real quality assessment (identical content is being
+# compared, so a healthy source should score ~100). Its only purpose is
+# confirming the comparison technique this pipeline uses actually works for
+# THIS source's specific frame-timing characteristics, BEFORE any later
+# encode-vs-source comparison is trusted for it. Reuses measure_final_vmaf
+# unchanged (same measure-both-ways-take-max fps handling already hardened
+# for the VMAF-VFR bug, v5.1.0T) rather than duplicating VMAF-comparison
+# logic -- this function is a thin cached wrapper, not a new measurement
+# pipeline. A source that fails this baseline (e.g. Battlestar Galactica --
+# real per-frame irregularities beyond simple VFR, not just a measurement
+# artifact) gets flagged for human review immediately, instead of silently
+# producing a misleading low "quality" number after a real encode.
+measure_source_baseline_vmaf() {  # src -> prints VMAF or fails
+  local src="$1"
+  local cached
+  cached="$(source_traits_baseline_vmaf "$src")"
+  [ -z "$cached" ] || { printf '%s' "$cached"; return 0; }
+
+  [ -f "$src" ] || return 1
+  local vmaf
+  vmaf="$(measure_final_vmaf "$src" "$src" 0 2>/dev/null)" || return 1
+  [[ "$vmaf" =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 1
+
+  _source_traits_cache_set "$src" "baseline_vmaf" "$vmaf"
+  if awk -v v="$vmaf" -v t="$SOURCE_BASELINE_VMAF_MIN" 'BEGIN{exit !(v+0 < t+0)}'; then
+    log_err "Source baseline VMAF LOW: $src -> $vmaf (below ${SOURCE_BASELINE_VMAF_MIN} — measurement methodology unreliable for this source)"
+    flag_source_traits_ambiguous "$src" "baseline self-VMAF ${vmaf} below ${SOURCE_BASELINE_VMAF_MIN} — frame_rate_mode=$(source_traits_frame_rate_mode "$src")"
+  else
+    log_err "Source baseline VMAF: $src -> $vmaf"
+  fi
+  printf '%s' "$vmaf"
+}
+
 source_traits_field_mode() {  # src -> field_mode string ("unknown" if never detected)
   local v="${SOURCE_TRAITS_CACHE[$1]:-}"
   [[ "$v" =~ field_mode=([a-z]+) ]] && printf '%s' "${BASH_REMATCH[1]}" || printf 'unknown'

@@ -4,6 +4,112 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.0W — 2026-08-13
+
+**New: proactive per-source VFR/CFR detection + baseline self-VMAF**
+(`modules/ves-source-traits.sh`), added after finding the v5.1.0S/T
+VMAF-VFR false-positive bug had left ~130 files fleet-wide mistagged
+"NEEDS REVIEW" (root-caused and mostly auto-corrected this session, see
+below). That bug was only ever caught reactively, after the fact, by
+noticing a suspiciously low encode-vs-source score. These two checks run
+proactively, once per source (cached), before CRF search — unconditional,
+every profile, not just vintage (the bug hit modern-profile titles:
+Godfather of Harlem, Snowpiercer, Jessica Jones, Westworld).
+
+- `detect_frame_rate_mode(src)` — classifies `cfr`/`vfr`/`unknown` via
+  packet-level DTS-delta coefficient of variation, not the unreliable
+  `r_frame_rate==avg_frame_rate` container-metadata heuristic (Battlestar
+  Galactica slipped through that check entirely last session — its
+  `avg_frame_rate` matches `r_frame_rate` despite real per-packet timing
+  irregularities). Hit a real bug building this: ffprobe prints the
+  literal string `"N/A"` for a packet's `dts_time` near a `-ss` seek
+  boundary (before the B-frame reordering buffer fills), which silently
+  corrupted the numeric sort/delta math and made every probe window fail
+  — fixed by filtering non-numeric lines before the awk pass. Verified
+  live: Godfather of Harlem → `cfr` (avg_cv=low); Battlestar Galactica →
+  `cfr` too (avg_cv=0.0109) — confirming BSG's real quality problems are
+  genuine low-bitrate broadcast-master content, not a frame-timing
+  measurement artifact (consistent with the re-verification results
+  below, where most BSG episodes stayed correctly flagged after
+  re-measurement).
+- `measure_source_baseline_vmaf(src)` — measures VMAF of `$src` against
+  itself, reusing `measure_final_vmaf` unchanged (same measure-both-ways-
+  take-max fps handling already hardened in v5.1.0T) rather than
+  duplicating comparison logic. A pure measurement-methodology sanity
+  check, not a real quality assessment — identical content should score
+  ~100. A source that fails this baseline gets flagged for human review
+  immediately via the existing `flag_source_traits_ambiguous` path,
+  instead of silently producing a misleading low "quality" number after a
+  real encode.
+- New `_source_traits_cache_set(src, key, value)` helper merges a field
+  into `SOURCE_TRAITS_CACHE[$src]`'s existing string rather than
+  overwriting it, so the new universal checks and the existing
+  vintage-only telecine/B&W detection can populate the same cache entry
+  independently of call order.
+- New config constants (both explicitly untuned, same caveat as the
+  existing field-mode thresholds — calibrate against real confirmed-CFR
+  and confirmed-VFR sources before relying on them beyond logging):
+  `SOURCE_TRAITS_VFR_CV_MAX=0.05`, `SOURCE_BASELINE_VMAF_MIN=97.0`.
+- **Bash only this release** — Windows PowerShell port (`VesQtgmc.psm1`-
+  style module) is a follow-up, per plan (verify on the harder platform
+  against real known-tricky files first, then port).
+
+**Fleet-wide VMAF-VFR false-positive re-verification and auto-fix.**
+Grepping every fleet machine's logs for "BELOW FLOOR, NEEDS REVIEW" found
+~130 flagged files across 9 shows (Jessica Jones, Battlestar Galactica,
+Marvel's Runaways, Stargate Universe, Godfather of Harlem, Snowpiercer, V
+(1983), Penny Dreadful, Westworld), all tagged under versions predating
+the v5.1.0S/T VMAF-VFR fix. Built a re-verify+auto-retag tool
+(`write_ves_processed_tag` already does exactly the right thing — measure
+with the current fixed code, rewrite the tag — so this was a thin driver
+script, not new pipeline logic) and ran it fleet-wide. Confirmed
+overwhelmingly false-positive: e.g. Snowpiercer 53.0→92.2, Westworld
+61.2→91.3, Jessica Jones 52.3→98.9, Godfather of Harlem S03E08 66.9→99.4.
+Two real bugs found and fixed in the driver script itself along the way
+(neither is pipeline code, both self-caught before any real file was
+touched incorrectly): an unquoted `$MKVLIST` variable that word-split
+every filename containing spaces, silently no-op'ing the whole run; and a
+stripped `PATH` in non-interactive macOS SSH sessions that made
+`discover_tools` never find `mkvpropedit`, so `write_ves_processed_tag`
+silently failed every tag write on MARLONJ specifically. Battlestar
+Galactica was deliberately given extra scrutiny (real prior regression
+history) — confirmed the fix correctly leaves genuinely-low-quality
+episodes flagged rather than blindly clearing everything.
+
+**NAS root-squash + SMB ACL findings (TrueNAS API, `10.10.10.150`).**
+Root-caused the session's earlier "Permission denied" writing ffmpeg-log
+sidecars: TrueNAS's default root-squash mapped every fleet worker
+account's root/sudo writes to `nobody` on the three Media NFS shares
+(`BabyBear/Media`, `BigMomma/Media`, `BigPoppa/Media`) — fixed via
+`maproot_user=root`/`maproot_group=wheel` on all three shares. A first
+NFSv4 ACL fix (`WRITE_OWNER` grant to `group@`/`everyone@`) looked
+plausible but was a red herring for the actual chown failures (POSIX
+blocks unprivileged/non-root-mapped chown regardless of ACL grants) —
+kept anyway for consistency, then discovered it also needed to be
+**recursive**, not just at the dataset root: the original non-recursive
+apply only benefits brand-new folders created after the change, since
+already-existing subdirectories (every real show/movie folder) never
+inherited it. Reapplied recursively across all three datasets.
+
+Separately investigated the Windows-side `icacls`/"Could not widen ACL"
+failures (SMB, not NFS — a different share/protocol the NFS fix never
+touched). Traced through three layers: (1) the NFSv4 ACL was missing
+`WRITE_ACL` (Windows' "change permissions" right) on `group@`/`everyone@`
+— granted, recursively, same as the `WRITE_OWNER` fix above; (2) even
+with a correct ACL, `icacls` still failed — traced to the connecting
+Windows identity (`PRINCE\worker`, a purely local Windows account with no
+matching TrueNAS credential) silently falling through to Samba's guest
+account under `guestok: true`; created a real TrueNAS SMB user (`worker`,
+uid 3000, group `media`/gid 8080 — that gid existed on-disk with no actual
+TrueNAS group object until created here) with SMB auth enabled, verified
+via a real authenticated connection that the identity and file ownership
+are now correct (no longer guest); (3) **`icacls` still fails even with
+correct ACL and correct real authentication** — the remaining gap is in
+Samba's own NFSv4-ACL-to-Windows-security-descriptor translation for this
+share, not fixable via more ACL/user changes. Left open, documented
+precisely rather than guessed at further; needs a Samba `vfs_objects`/
+share-reconfiguration-level investigation.
+
 ## v5.1.0V — 2026-08-12
 
 **Generalized v5.1.0U's permission fix, per explicit direction: every file
