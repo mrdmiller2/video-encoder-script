@@ -36,8 +36,62 @@
 ensure_shared_sidecar_dir() {
   local dir="$1"
   mkdir -p -- "$dir" 2>/dev/null
-  chmod 0777 -- "$dir" 2>/dev/null && return 0
-  sudo -n chmod 0777 -- "$dir" 2>/dev/null || true
+  match_source_permissions "$dir" "$(dirname -- "$dir")"
+}
+
+# Reads $reference's mode/owner/group and applies them to $target --
+# "newly-written files/dirs should match the source path's own permissions
+# and ownership" (explicit user direction, 2026-08-12), rather than a
+# fixed 0777 guess: this library's own convention (777, a specific numeric
+# owner:group -- confirmed live as e.g. 950:8080) is whatever the SOURCE
+# path already has, and that can differ by library/NAS/export, so deriving
+# it from a real neighboring file/dir is more correct than hard-coding one
+# value everywhere. Found needed for more than just the sidecar-directory
+# case this was built for (see ensure_shared_sidecar_dir): a real finished
+# OUTPUT file was found owned by `worker:8080` at mode 666 sitting right
+# next to its own source at `950:8080` mode 777 -- same group (so it never
+# actually broke access, purely by luck of "other" already being rw on a
+# 666 file), but not actually matching, which is the real ask here. Same
+# escalation reasoning as ensure_shared_sidecar_dir: a plain chmod/chown
+# from a non-owner account is rejected outright by POSIX regardless of the
+# existing mode, so this falls back to non-interactive `sudo -n` (this
+# fleet's worker accounts have passwordless sudo by convention). That
+# recovers chmod reliably -- confirmed live, mode 666->777 on a real file.
+# chown does NOT recover the same way: confirmed live that `sudo chown`
+# fails ("Operation not permitted") against this NAS export for ANY
+# target UID, including one that's already valid locally -- but the exact
+# same `sudo chown` on a local (non-NAS) file succeeds instantly. That
+# rules out a client-side privilege problem entirely; this NAS export
+# hard-blocks ownership changes server-side, for every client, root
+# included -- no client-side script change can work around it (would
+# need the NAS's own export/dataset config changed, if the platform even
+# allows that). The chown attempt below is kept anyway as pure
+# best-effort/never-fatal, in case a future/different export does permit
+# it -- but on this NAS, matching MODE (which chmod does reliably) is the
+# whole practical win: a 777-mode file already grants full read/write to
+# every account regardless of who nominally owns it, so the leftover
+# owner-UID mismatch is cosmetic, not a functional access problem.
+match_source_permissions() {
+  local target="$1" reference="$2" mode owner group
+  [ -e "$target" ] && [ -e "$reference" ] || return 0
+  case "$PLATFORM" in
+    macos)
+      mode="$(stat -f '%Lp' -- "$reference" 2>/dev/null)" || return 0
+      owner="$(stat -f '%u' -- "$reference" 2>/dev/null)"
+      group="$(stat -f '%g' -- "$reference" 2>/dev/null)"
+      ;;
+    *)
+      mode="$(stat -c '%a' -- "$reference" 2>/dev/null)" || return 0
+      owner="$(stat -c '%u' -- "$reference" 2>/dev/null)"
+      group="$(stat -c '%g' -- "$reference" 2>/dev/null)"
+      ;;
+  esac
+  [ -n "$mode" ] || return 0
+  chmod "$mode" -- "$target" 2>/dev/null || sudo -n chmod "$mode" -- "$target" 2>/dev/null || true
+  if [ -n "$owner" ] && [ -n "$group" ]; then
+    chown "${owner}:${group}" -- "$target" 2>/dev/null \
+      || sudo -n chown "${owner}:${group}" -- "$target" 2>/dev/null || true
+  fi
 }
 # Cheap, tag-only check for the current major version's processed marker --
 # survives renames/moves since it's embedded in the container, not derived from
@@ -507,6 +561,7 @@ finalize_mkv_output() {
   label_mkv_tracks "$mkv" "$src" "$title"
   write_ves_processed_tag "$mkv" "$src"
   maybe_chown_for_media_user "$mkv"
+  match_source_permissions "$mkv" "$src"
   # $mkv is now the real, durable, final output -- clear the in-progress
   # flag here rather than waiting for end_convert_job, closing the window
   # where an interrupt right after this point would otherwise make

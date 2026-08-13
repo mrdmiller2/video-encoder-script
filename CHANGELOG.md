@@ -4,6 +4,41 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.0V — 2026-08-12
+
+**Generalized v5.1.0U's permission fix, per explicit direction: every file
+this pipeline writes should match its source path's own permissions and
+ownership, not a hard-coded guess.** New `match_source_permissions(target,
+reference)` reads `$reference`'s mode/owner/group and applies them to
+`$target`, replacing the hard-coded `chmod 0777` in `ensure_shared_sidecar_dir`
+(now derives from the target's own parent directory) and newly wired into
+`finalize_mkv_output` (every finished output file goes through this one
+function fleet-wide, confirmed by grep — one call site covers all of them)
+using the file's own `$src` as the reference.
+
+Found needed for more than the sidecar-directory case v5.1.0U fixed: a
+real finished output was sitting at mode 666 owned by `worker:8080` right
+next to its own source at mode 777 owned by `950:8080` — same group, so it
+never actually broke access (pure luck: 666's "other" bits are already
+rw), but not actually matching, which is the real ask.
+
+**Important limitation, confirmed live and worth understanding**: the
+`chmod` half of this reliably works (including the same passwordless-sudo
+escalation v5.1.0U introduced) — verified 666→777 on a real file. The
+`chown` half does not: `sudo chown` fails ("Operation not permitted")
+against this NAS export for *any* target UID, including ones already
+valid locally, while the identical `sudo chown` against a local
+(non-NAS) file succeeds instantly. That rules out a client-side privilege
+problem entirely — this NAS export hard-blocks ownership changes
+server-side, for every client, root included. No client-side script
+change can work around it; it would need the NAS's own export/dataset
+configuration changed, if the platform even supports that. The chown
+attempt is kept as pure best-effort (never fatal) in case a different
+export does allow it, but on this NAS, matching MODE is the whole
+practical win — a 777-mode file already grants full read/write to every
+account regardless of nominal ownership, so the leftover owner-UID
+mismatch is cosmetic, not a functional access problem.
+
 ## v5.1.0U — 2026-08-12
 
 **Fixed real "Permission denied" failures writing shared NAS sidecar
