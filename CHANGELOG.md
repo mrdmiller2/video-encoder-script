@@ -9,7 +9,7 @@ has the full story — what was wrong, why it mattered, and how it was fixed.
 **Fleet-wide validation test triage.** After the SMB `icacls` fix
 (v5.1.0W's follow-up, above), ran a real one-movie-per-machine test
 across all 10 fleet machines to confirm no regressions. Found and fixed
-three more real bugs, none of them regressions from the ACL work itself
+four more real bugs, none of them regressions from the ACL work itself
 but all either newly exposed or newly discovered by it.
 
 **(1) Windows orphan reaper hang, both PRINCE/ELVIS/RANDYJ.** After the
@@ -77,6 +77,25 @@ correctly via ffmpeg's own `-color_primaries`/`-color_trc`/`-colorspace`
 args, entirely independent of this dead parameter; `mastering-display=`/
 `content-light=` (the real, valid HDR10 static-metadata svtav1-params)
 are untouched.
+
+**(4) Windows local-disk staging leak, all 3 Windows machines** (found
+while investigating (1) above: ELVIS alone had 55 orphaned
+`convert-stage-*` directories, some over a week old). `New-VesLocalStageDir`
+(the local-disk fallback used whenever RAM-disk staging is unavailable or
+too small) had no cleanup path at all for a crashed job's stage dir --
+unlike the RAM-disk staging path, it never wrote an ownership marker, so
+nothing could ever safely determine whether a leftover directory's owning
+process was dead and reclaim it. Fixed by giving it the same
+`.ves-owner.json` marker convention `VesRamDisk.psm1` already uses (PID,
+host, start time), a new `Get-VesLocalStageLeftovers` enumerator
+mirroring `Get-VesRamDiskLeftovers`, and a sweep in `convert.ps1`'s
+orphan-reap phase that purges any leftover whose recorded owner PID is
+confirmed dead on this host -- these are in-flight scratch files, not
+completed candidates, so they're purged wholesale rather than routed
+through the salvage-or-delete gates used for RAM-disk leftovers. Verified
+live: marker written on creation, correctly detected as a live-owner
+leftover while its process is still running. Bash was never affected --
+its own staging convention differs and already gets swept.
 
 ## v5.1.0W — 2026-08-13
 

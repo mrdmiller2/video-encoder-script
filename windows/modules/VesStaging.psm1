@@ -112,10 +112,60 @@ function New-VesLocalStageDir {
     $stageDir = Join-Path $parentDir "convert-stage-$token"
     try {
         New-Item -ItemType Directory -Path $stageDir -ErrorAction Stop | Out-Null
+        # Ownership marker, matching VesRamDisk.psm1's .ves-owner.json
+        # convention -- without this, a crashed job's stage dir has no
+        # recorded owner and nothing can ever safely reclaim it (found
+        # 2026-08-13: dozens of these accumulated per machine, some over a
+        # week old, with zero automatic cleanup path -- Get-VesRamDiskLeftovers
+        # only knows about mounted ImDisk RAM disks, not this local-disk
+        # fallback). Best-effort; a marker write failure just means this
+        # particular leftover won't be auto-reclaimed later, not a job
+        # failure now.
+        try {
+            [PSCustomObject]@{
+                JobPid     = $PID
+                Host       = $env:COMPUTERNAME
+                StartedUtc = [DateTimeOffset]::UtcNow.ToString('o')
+            } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stageDir '.ves-owner.json') -ErrorAction Stop
+        } catch { }
         return $stageDir
     } catch {
         return $null
     }
+}
+
+function Get-VesLocalStageLeftovers {
+    <#
+    .SYNOPSIS
+    Crash-recovery counterpart to VesRamDisk.psm1's Get-VesRamDiskLeftovers,
+    for the local-disk staging fallback (New-VesLocalStageDir). Enumerates
+    convert-stage-* directories directly under $Root carrying this
+    project's owner-marker convention, for the orphan reaper to evaluate
+    -- never disposed of directly by this function, matching the RAM-disk
+    leftover pattern's separation of enumeration from disposal.
+    #>
+    param([Parameter(Mandatory)][string]$Root)
+    $leftovers = @()
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) { return $leftovers }
+    Get-ChildItem -LiteralPath $Root -Directory -Force -Filter 'convert-stage-*' -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            $markerPath = Join-Path $_.FullName '.ves-owner.json'
+            if (Test-Path -LiteralPath $markerPath -ErrorAction SilentlyContinue) {
+                try {
+                    $owner = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
+                    $leftovers += [PSCustomObject]@{
+                        StageDir   = $_.FullName
+                        JobPid     = $owner.JobPid
+                        Host       = $owner.Host
+                        StartedUtc = $owner.StartedUtc
+                    }
+                } catch { }
+            }
+        }
+    # Plain return -- see Get-VesOrphanFlagCandidates's comment for why a
+    # comma-wrap is deliberately not used; wrap with @(...) at the call
+    # site when capturing into a variable for indexing/Count.
+    return $leftovers
 }
 
 function Resolve-VesEncodeStagePath {
@@ -251,4 +301,4 @@ function Complete-VesStagedEncodeOutput {
 }
 
 Export-ModuleMember -Function New-VesLocalStageDir, Resolve-VesEncodeStagePath, Remove-VesStagedFileDir, `
-    Complete-VesStagedEncodeOutput, Remove-VesFileRobust, Remove-VesDirectoryRobust
+    Complete-VesStagedEncodeOutput, Remove-VesFileRobust, Remove-VesDirectoryRobust, Get-VesLocalStageLeftovers

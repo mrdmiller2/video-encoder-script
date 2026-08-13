@@ -206,6 +206,29 @@ if (-not $NoAutoReap) {
             # this project's ambiguous-is-not-actionable invariant.
         } | Out-Null
     }
+
+    # Local-disk staging fallback leftover sweep (2026-08-13): mirrors the
+    # RAM-disk leftover recovery just above, but for New-VesLocalStageDir's
+    # convert-stage-* directories, which had no cleanup path at all before
+    # this -- a crashed job's local stage dir was simply abandoned forever
+    # (found via a real fleet audit: 55 leaked directories on one machine
+    # alone, some over a week old). A leftover's content is unattributable
+    # to a real source the same way a RAM-disk leftover file is (no
+    # resume-state mapping survives a crash before the file was even
+    # finished), so a confirmed-dead owner's directory is simply purged
+    # wholesale rather than routed through the salvage-or-delete candidate
+    # gates -- it is scratch space for in-flight work, not a completed
+    # candidate output.
+    $localStageLeftovers = @(Get-VesLocalStageLeftovers -Root $LocalStagingDir)
+    if ($localStageLeftovers.Count -gt 0) {
+        Write-VesLog "Orphan reaper: found $($localStageLeftovers.Count) local staging leftover(s) from a prior crash, evaluating"
+        foreach ($leftover in $localStageLeftovers) {
+            if ($leftover.Host -ne $env:COMPUTERNAME) { continue }
+            if (Test-VesProcessIsAlive -Pid_ $leftover.JobPid) { continue }
+            Write-VesLog "Orphan reaper: removing stale local staging dir $($leftover.StageDir) (owner pid $($leftover.JobPid) confirmed dead)"
+            Remove-VesDirectoryRobust -Path $leftover.StageDir -Recurse
+        }
+    }
 } else {
     Write-VesLog 'Orphan reaper: skipped (-NoAutoReap)'
 }
