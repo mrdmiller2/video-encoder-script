@@ -4,6 +4,44 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.0U — 2026-08-12
+
+**Fixed real "Permission denied" failures writing shared NAS sidecar
+directories (bash only)**, found while running small verification batches
+across the fleet: AI-PROCESSOR and LAYTOYAJ both hit genuine
+`Permission denied` errors writing their own `ffmpeg-logs/*.stderr.log`
+files (jobs still completed -- these writes are non-fatal diagnostics --
+but the logs themselves were silently lost).
+
+Root cause, confirmed live: every media path in this library is
+maintained at `777`/`admin:8080`, but that convention only covers
+directories that already exist -- a *freshly created* directory doesn't
+automatically inherit it. Whichever machine's `mkdir` first creates a
+shared sidecar directory (`ffmpeg-logs/`, `.convert-v5-validation-failures/`,
+`Deferred/`) gets whatever this NFS export's own default new-directory ACL
+happens to be, which resolves to mode `0775` owned by an unmapped
+`nobody:8080` rather than `0777`. The `worker` account on every fleet
+machine is a member of its own `worker` group only (gid 1000) -- neither
+`nobody` nor group `8080` -- so `0775`'s "other" bits (`r-x`, no write)
+locked out every subsequent writer, including the very machine that
+created the directory on its next run.
+
+This is the exact same bug class already fixed on the Windows port via
+`Set-VesEveryoneReadWrite` (see `VesTwoStageEncode.psm1`) -- bash never
+had the equivalent self-heal. Fixed via a new `ensure_shared_sidecar_dir()`
+helper (`modules/ves-validation.sh`), used at all three shared-directory
+creation sites (`ffmpeg-logs/`, the validation-failure evidence dir,
+`Deferred/`). A plain `chmod` from a non-owner account fails outright
+(confirmed: `Operation not permitted` -- world-writable mode alone doesn't
+grant permission to re-`chmod` a directory you don't own), so it falls
+back to a non-interactive `sudo -n chmod` -- this fleet's worker accounts
+have passwordless sudo by established convention, confirmed live this
+actually fixes the real directory (root is not squashed on this NAS
+export). Every step is best-effort and silently falls through if
+unavailable, never treated as fatal. Verified end-to-end against the real
+broken directory on AI-PROCESSOR: mode corrected to `0777`, a real file
+write that previously failed now succeeds.
+
 ## v5.1.0T — 2026-08-12
 
 Two fixes found while re-verifying v5.1.0S's own fix against the real

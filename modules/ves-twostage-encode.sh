@@ -479,7 +479,7 @@ ffmpeg_encode() {
   local errbase encode_errfile remux_errfile retry_errfile stage1
   local -a remux_args remux_color_args
   errbase="${JOB_SIDECAR_DIR:-/tmp}/ffmpeg-logs"
-  mkdir -p "$errbase" 2>/dev/null || true
+  ensure_shared_sidecar_dir "$errbase"
   errbase="${errbase}/$(canonical_title_from_source "$src").$$"
   encode_errfile="${errbase}.stderr.log"
   remux_errfile="${errbase}.remux.stderr.log"

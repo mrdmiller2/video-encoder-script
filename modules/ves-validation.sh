@@ -4,6 +4,41 @@
 # capture + flagging paths. Pure move from the former monolithic script --
 # no logic changes.
 
+# mkdir -p + unconditional best-effort 0777 widen for a shared, NAS-visible
+# sidecar directory (ffmpeg-logs/, .convert-v5-validation-failures/,
+# Deferred/ -- anything multiple fleet machines' worker accounts write
+# into). Every media path in this library is maintained at 777/admin:8080,
+# but a *freshly created* directory doesn't automatically inherit that --
+# whichever machine's mkdir wins the race gets whatever this NFS export's
+# own default new-directory ACL happens to be, which on this NAS resolves
+# to mode 0775 owned by an unmapped "nobody:8080" rather than the intended
+# 0777 (found 2026-08-12: AI-PROCESSOR and LAYTOYAJ both hit real
+# "Permission denied" writing their own stderr sidecar logs into an
+# ffmpeg-logs/ dir that a THIRD machine's run had created earlier the same
+# day -- `worker` on any machine is neither "nobody" nor in an 8080 group,
+# so mode 0775's "other" bits (r-x, no write) locked every later writer
+# out). This is the exact same bug class the Windows port already
+# self-heals via Set-VesEveryoneReadWrite (see VesTwoStageEncode.psm1's
+# comment on that call) -- bash never had the equivalent. Unconditional
+# (not just on first creation) so it self-heals a directory a PAST run
+# already created with the broken ACL, not only ones this run happens to
+# create fresh. A plain chmod from a non-owner account fails outright
+# (confirmed live against the actual broken directory: "Operation not
+# permitted") since POSIX chmod requires being the owner or root --
+# world-writable mode alone doesn't grant permission to RE-chmod it. Falls
+# back to a non-interactive `sudo -n chmod` (this fleet's worker accounts
+# have passwordless sudo by established convention -- confirmed this
+# actually fixes the real directory, root is not squashed on this NAS
+# export) before giving up. Every step is best-effort: a machine without
+# passwordless sudo, or a genuinely permission-locked NAS, just falls
+# through silently rather than treated as fatal -- the caller's own
+# mkdir/write already has its own failure handling for that case.
+ensure_shared_sidecar_dir() {
+  local dir="$1"
+  mkdir -p -- "$dir" 2>/dev/null
+  chmod 0777 -- "$dir" 2>/dev/null && return 0
+  sudo -n chmod 0777 -- "$dir" 2>/dev/null || true
+}
 # Cheap, tag-only check for the current major version's processed marker --
 # survives renames/moves since it's embedded in the container, not derived from
 # the path or filename. Used as a second, defense-in-depth skip signal alongside
@@ -595,16 +630,19 @@ capture_validation_failure_evidence() {
   esac
 
   root="$(dirname -- "$out")/.convert-v5-validation-failures"
-  mkdir -p -- "$root" 2>/dev/null || {
+  ensure_shared_sidecar_dir "$root"
+  [ -d "$root" ] || {
     root="${JOB_SIDECAR_DIR:-/tmp}/validation-failures"
-    mkdir -p -- "$root" 2>/dev/null || return 0
+    ensure_shared_sidecar_dir "$root"
+    [ -d "$root" ] || return 0
   }
   stamp="$(date -u '+%Y%m%dT%H%M%SZ')"
   raw_title="$(canonical_title_from_source "$src")"
   title="$(printf '%s' "$raw_title" | tr -cd '[:alnum:]_. -' | sed 's/[[:space:]]\+/_/g')"
   [ -n "$title" ] || title="media"
   dir="$root/${stamp}.$$.$title.$reason"
-  mkdir -p -- "$dir" 2>/dev/null || return 0
+  ensure_shared_sidecar_dir "$dir"
+  [ -d "$dir" ] || return 0
 
   {
     printf 'captured_utc=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -737,7 +775,8 @@ flag_bad_source_for_human() {
     dir="$(dirname -- "$src")"
     base="$(basename -- "$src")"
     deferred_dir="$dir/Deferred"
-    if mkdir -p -- "$deferred_dir" 2>/dev/null; then
+    ensure_shared_sidecar_dir "$deferred_dir"
+    if [ -d "$deferred_dir" ]; then
       dest="$deferred_dir/$base"
       # Don't clobber an earlier deferred file of the same name.
       [ -e "$dest" ] && dest="$deferred_dir/$(date -u '+%Y%m%dT%H%M%SZ')-$base"
