@@ -110,6 +110,62 @@ share, not fixable via more ACL/user changes. Left open, documented
 precisely rather than guessed at further; needs a Samba `vfs_objects`/
 share-reconfiguration-level investigation.
 
+**Follow-up, same day: SMB `icacls` root cause found and fixed.** Direct
+NAS console access (previously unavailable) made the real evidence
+visible: `/var/log/samba4/log.smbd` showed `ixnas_process_smbacl: ...
+failed to set acl: Operation not permitted` for every single `icacls`
+attempt this whole investigation ran — a raw kernel/ZFS-level `EPERM`
+inside TrueNAS's own custom `ixnas` Samba VFS module, unrelated to
+Windows-side authentication or session type (which explains why every
+credential-persistence theory chased above turned out to be a dead end).
+Fix: switched the affected datasets' `acltype` from `nfsv4` to `posix`
+(`aclmode=DISCARD`, API-enforced pairing) via `pool.dataset.update` —
+this removes `ixnas` from the share's auto-generated `vfs objects`
+entirely and is a first-class, GUI-exposed, native TrueNAS/ZFS property
+that survives updates/reboots (explicit user requirement — no smb.conf
+hand-editing). Applied and verified via real authenticated `icacls`
+exit-code-0 tests on all three Media datasets: `BigMomma/Media` (clean
+first try), `BigPoppa/Media` (first attempt broke the share outright —
+`SMB_VFS_CONNECT ... failed: No data available` — reverted, retried with
+pauses between disable/switch/enable steps, succeeded cleanly the second
+time; root cause of the first failure not conclusively pinned down, filed
+as a transient/race risk to watch for on any future acltype switch on a
+live share), and `BabyBear/Media` (blocked on the production share
+because it's rooted at the *parent* `/mnt/BabyBear`, shared with the
+unrelated Nextcloud dataset, and TrueNAS refuses an acltype switch when
+it would create an ACL-type mismatch under a currently-*enabled* share's
+root — resolved by creating a new dataset-scoped share, `BabyBearMedia`,
+disabled first so the mismatch check doesn't fire, switching underneath
+it, then enabling; the original `BabyBear` share and Nextcloud were
+never touched). Also fixed the POSIX-mode group-inheritance gap this
+introduces (new files get the creating process's primary group instead
+of the parent directory's, since POSIX ACLs don't have NFSv4's automatic
+inheritance) via the standard SGID bit, applied recursively on all three
+datasets. Windows fleet paths updated to the new share names
+(`\\<nas>\BigMommaMedia\`, `\\<nas>\BigPoppaMedia\`,
+`\\<nas>\BabyBearMedia\`) on PRINCE/ELVIS/RANDYJ. Verified clean under
+real production traffic: a fleet-wide one-file-per-machine validation
+test produced zero `icacls` failures on all three Windows machines.
+
+**Fleet-wide validation test findings (2026-08-13), unrelated to the ACL
+fix itself.** Running one real movie/concert-length job per machine
+surfaced two more real bugs, both self-contained to the Windows test
+harness rather than the shipped pipeline code: (1) a stale/zombie
+`convert.ps1` process on one Windows machine that Task Scheduler kept
+reporting as `Running` for 80+ minutes past the point it had actually gone
+idle — `Get-ScheduledTask` state cannot be trusted alone to mean "still
+doing work" on this platform, matching the already-known unreliable-
+`ExitCode` gotcha; (2) confirmed the already-documented library-path
+auto-detection limitation (non-standard paths like `Concerts/` or
+`Stand-Up Comedy/` need an explicit profile override) applies identically
+on the Windows port's `-ForceProfile` parameter, not just bash's
+`--profile`. Also found and cleared real staging-directory leak debris
+unrelated to this session's work: dozens of orphaned `.convert-stage-*`
+RAM-disk staging folders (one Windows machine had 55, dating back over a
+week) that normal job completion never cleans up after a crash — worth a
+proper fix (a startup-time sweep, not just the existing orphan-reaper's
+narrower leftover-flag logic) in a future session.
+
 ## v5.1.0V — 2026-08-12
 
 **Generalized v5.1.0U's permission fix, per explicit direction: every file
