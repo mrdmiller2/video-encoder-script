@@ -207,7 +207,17 @@ build_ffmpeg_video_args() {
     av1)
       svtp="$(profile_svt_params "$profile")"
       if [ "$hdr" = true ]; then
-        svtp="$svtp:enable-hdr=1"
+        # No "enable-hdr" here: real color signaling (bt2020/PQ or HLG) is
+        # set explicitly via ffmpeg's own -color_primaries/-color_trc/
+        # -colorspace args below, not via svtav1-params. Found 2026-08-13:
+        # "enable-hdr" was never a real SVT-AV1 option on any version
+        # checked (absent from --help and from the compiled library's own
+        # string table) -- SVT-AV1 logged "Error parsing option enable-hdr:
+        # 1" and silently ignored it every single HDR encode this whole
+        # project has ever run; harmless (the real color metadata below
+        # was never affected), but dead weight that only surfaced once a
+        # machine happened to process real HDR content with a version
+        # verbose enough to log the parse failure.
         # Static mastering-display/CLL metadata is a PQ/HDR10-specific
         # concept -- HLG doesn't carry it, and a genuine HLG source's own
         # frames naturally won't have this SEI anyway, but be explicit

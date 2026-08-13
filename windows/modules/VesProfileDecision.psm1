@@ -503,7 +503,11 @@ function Build-VesFfmpegVideoArgs {
         $svtp = Get-VesProfileSvtParams -Profile $Profile -FfmpegPath $FfmpegPath
         if ($null -eq $svtp) { return $null }
         if ($IsHdr) {
-            $svtp = "${svtp}:enable-hdr=1"
+            # No "enable-hdr" here -- see ves-twostage-encode.sh's matching
+            # comment (2026-08-13): it was never a real SVT-AV1 option on
+            # any version checked, silently logged-and-ignored on every HDR
+            # encode this project has run. Real color signaling is set via
+            # ffmpeg's own -color_primaries/-color_trc/-colorspace args.
             if ($HdrMode -ne 'hlg') {
                 if ($hdrMeta.MasterDisplay) { $svtp = "${svtp}:mastering-display=$($hdrMeta.MasterDisplay)" }
                 if ($hdrMeta.Cll) { $svtp = "${svtp}:content-light=$($hdrMeta.Cll)" }

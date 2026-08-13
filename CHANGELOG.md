@@ -4,6 +4,80 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.0X — 2026-08-13
+
+**Fleet-wide validation test triage.** After the SMB `icacls` fix
+(v5.1.0W's follow-up, above), ran a real one-movie-per-machine test
+across all 10 fleet machines to confirm no regressions. Found and fixed
+three more real bugs, none of them regressions from the ACL work itself
+but all either newly exposed or newly discovered by it.
+
+**(1) Windows orphan reaper hang, both PRINCE/ELVIS/RANDYJ.** After the
+ACL fix, all three single-file test jobs hung indefinitely at "Orphan
+reaper: scanning for crashed-job leftovers" (RANDYJ: 20+ min before this
+was traced; confirmed not deadlocked, just slow). Root cause:
+`Get-VesOrphanFlagCandidates` calls `Get-ChildItem -LiteralPath $Root
+-Recurse -Force -File -Filter "*.$FlagSuffix"`, and PowerShell silently
+**ignores `-Filter`/`-Recurse` entirely** when `-LiteralPath` points at a
+single file (the single-file `-SearchPath` invocation mode) rather than a
+directory — it just returns that one file as-is, filter unapplied. The
+function then fed the multi-GB source video itself to `Get-Content`,
+which tried to read it as newline-delimited text over SMB. This bug has
+presumably existed since the single-file mode shipped, but was invisible
+until today: the pre-fix broken ACLs made that `Get-Content` call fail
+instantly with Access Denied, so it never got far enough to actually
+attempt the read. Fixed by special-casing the non-container case: a
+single-file `$Root` can only ever have one possible sibling flag
+(`"$Root.$FlagSuffix"`, exactly what `New-VesInProgressFlag` writes), so
+check that directly via `Get-Item` instead of recursing at all — verified
+live, 20+ minutes → 0.2 seconds. Bash was never affected (its own
+`find`-based equivalent doesn't have this quirk).
+
+**(2) Root-caused the fleet's shared "Permission denied"/`icacls`
+ACL-widen failures on `ffmpeg-logs/` sidecar directories** (previously
+seen on JJACKSON/Plex/LAYTOYAJ/AI-PROCESSOR via bash's `tee`, and just
+reproduced live on PRINCE via `icacls exit code 5`). Direct inspection on
+the NAS console: a freshly Samba-created `ffmpeg-logs/` directory came
+out `drwxrwsr-x` (0775) — SGID correctly inherited the parent's `media`
+group, but "other" was only `r-x`, not the library's full `rwx`
+convention. Both platforms' existing after-the-fact self-heal
+(`ensure_shared_sidecar_dir`'s `chmod`+`sudo` escalation on bash,
+`Set-VesEveryoneReadWrite`'s `icacls /grant` on Windows) require owning
+the object or explicit rights to re-grant it, which a guest/different-
+identity writer doesn't have — same fundamental limitation as the
+session's earlier `icacls` investigation, just for a different operation.
+Fixed at the true root instead: none of the 3 Media shares had a Samba
+`create mask`/`directory mask` set, so Samba fell back to its own default
+(0775-ish) rather than the library's 0777 convention. Added
+`create mask = 0777`, `force create mode = 0777`, `directory mask = 0777`,
+`force directory mode = 0777` to all three shares' `auxsmbconf` (TrueNAS
+API, same "always send the full `options` object" convention as the
+earlier ACL work) — a single, stock, GUI-exposed, update-surviving
+server-side change that makes every SMB-created file/dir correctly
+world-writable at creation time, closing the gap for every current and
+future writer regardless of identity. Verified live: a fresh directory +
+file created via SMB now come out `drwxrwsrwx`/`-rwxrwxrwx` automatically,
+no self-heal needed. Both platforms' existing self-heal code is left in
+place as defense-in-depth (harmless, now redundant for SMB-side writes).
+
+**(3) `enable-hdr=1` removed from both platforms' `svtav1-params`.**
+MARLONJ hit `Error parsing option enable-hdr: 1` from libsvtav1 on every
+sample point and the real encode of an HDR concert file (non-fatal —
+SVT-AV1 logs and ignores it, encode continues) — first noticed loudly
+because MARLONJ runs SVT-AV1 **4.2.0**, drifted from the fleet-pinned
+v4.1.0 standard. Investigation found `enable-hdr` is not a real SVT-AV1
+option on any version checked: absent from `SvtAv1EncApp --help`
+(including its dedicated Color Description Options section) and absent
+from the compiled library's own string table. It was silently
+logged-and-ignored on **every HDR encode this project has ever run**,
+just quietly enough that nobody noticed until a newer SVT-AV1 build
+happened to process real HDR content. No functional loss from removing
+it — real HDR color signaling (`bt2020`/PQ or HLG) was always set
+correctly via ffmpeg's own `-color_primaries`/`-color_trc`/`-colorspace`
+args, entirely independent of this dead parameter; `mastering-display=`/
+`content-light=` (the real, valid HDR10 static-metadata svtav1-params)
+are untouched.
+
 ## v5.1.0W — 2026-08-13
 
 **New: proactive per-source VFR/CFR detection + baseline self-VMAF**

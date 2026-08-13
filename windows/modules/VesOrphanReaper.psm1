@@ -173,13 +173,33 @@ function Get-VesOrphanFlagCandidates {
     format: pid=/host=/encoder_pid=/encoder_started_utc=/
     encoder_fingerprint=/source=). Uses -Force since dot-prefixed names
     are hidden over this fleet's SMB share by default.
+
+    Real bug found+fixed 2026-08-13: when $Root is a single FILE (the
+    -SearchPath single-file invocation mode), `Get-ChildItem -Recurse
+    -Filter` silently ignores -Filter for a non-container -LiteralPath and
+    just returns that one item -- so the multi-GB video file itself was
+    getting treated as a "flag candidate" and fed to `Get-Content`, which
+    then tried to read the whole binary file as newline-delimited text
+    (minutes-to-hours over SMB depending on file size). This went
+    unnoticed until now because the pre-fix broken NAS ACLs made that
+    Get-Content call fail fast with Access Denied; once real read access
+    started working, it actually attempted the full read and hung. Fixed
+    by special-casing the non-container case: a single-file $Root can
+    only ever have its own sibling flag ("$Root.$FlagSuffix", exactly what
+    New-VesInProgressFlag writes), so check that directly instead of
+    recursing at all.
     #>
     param(
         [Parameter(Mandatory)][string]$Root,
         [string]$FlagSuffix = 'convert.IN_PROGRESS'
     )
     $candidates = @()
-    Get-ChildItem -LiteralPath $Root -Recurse -Force -File -Filter "*.$FlagSuffix" -ErrorAction SilentlyContinue |
+    $rootItems = if (Test-Path -LiteralPath $Root -PathType Container) {
+        Get-ChildItem -LiteralPath $Root -Recurse -Force -File -Filter "*.$FlagSuffix" -ErrorAction SilentlyContinue
+    } else {
+        Get-Item -LiteralPath "$Root.$FlagSuffix" -Force -ErrorAction SilentlyContinue
+    }
+    $rootItems |
         ForEach-Object {
             $fields = @{}
             try {
