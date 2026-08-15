@@ -1470,7 +1470,7 @@ process_existing_av1() {
       remove_output_only "$out"
       return 1
     fi
-    finalize_mkv_output "$out" "$src" "$title"
+    finalize_mkv_output "$out" "$src" "$title" true
     record_conversion_result "$src" "$out"
     return 0
   fi
@@ -1821,7 +1821,7 @@ try_x265_convert() {
       remove_output_only "$out"
       return 1
     }
-    finalize_mkv_output "$out" "$src" "$title"
+    finalize_mkv_output "$out" "$src" "$title" true
     log "Kept x265 remux ($(awk -v o="$(file_size_bytes "$src")" -v n="$(file_size_bytes "$out")" 'BEGIN { printf "%.1f%% of original", (n/o)*100 }')): $out"
     record_conversion_result "$src" "$out"
     return 0
@@ -2245,7 +2245,7 @@ process_existing_x265() {
       remove_output_only "$out"
       return 1
     fi
-    finalize_mkv_output "$out" "$src" "$title"
+    finalize_mkv_output "$out" "$src" "$title" true
     record_conversion_result "$src" "$out"
     return 0
   fi

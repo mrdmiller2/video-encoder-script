@@ -4,6 +4,73 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.0Y — 2026-08-14/15
+
+**Root-caused and fixed a real VMAF false-positive bug** found while
+running a larger fleet-wide validation batch (2-3 real movies per
+machine) to confirm v5.1.0X's fixes held up under sustained load. Three
+files across two machines got flagged "BELOW FLOOR, NEEDS REVIEW" with
+catastrophically low scores (44.3, 66.2, 75.8) despite being genuinely
+fine — visually confirmed via extracted same-timestamp frame comparison
+(near-identical to the eye), objective SSIM (~0.96, not catastrophic),
+and matching duration/codec/color metadata between source and output.
+
+**Root cause found via direct packet-timestamp inspection** (`ffprobe
+-show_entries packet=pts_time`): ffmpeg's MKV muxer relabels frame PTS
+values with a small, constant, non-frame-boundary-aligned offset
+relative to the source's own timestamps (~43ms on a 23.976fps file,
+confirmed identical near both the start and 40+ minutes into the same
+file — ruling out an earlier "cumulative drift" theory suggested by the
+uneven VMAF-vs-position pattern, which actually just reflects motion-
+sensitivity: the same small misalignment barely dents a low-motion scene
+but tanks the score on a high-motion one). `_vmaf_compare_window`'s
+independent `-ss` seek on each input lands on the SAME nominal timestamp
+but a DIFFERENT actual frame in src vs. a freshly-muxed MKV output,
+comparing near-adjacent-but-different frames and scoring them near-
+randomly. Confirmed and ruled out two other hypotheses first: seek-
+precision (a true frame-accurate decode-from-start comparison gave the
+identical bad score) and color/pixel-format mismatch (all metadata
+matches exactly). A manually-compensated seek offset recovered most of
+the lost score (52.3 -> 82.6 on the same window), confirming the
+diagnosis, though the exact sub-frame alignment needed for a fully
+precise general-purpose fix isn't nailed down yet (see below).
+
+**Fixed for the provably-safe case (2 of 3 real occurrences): skip VMAF
+measurement entirely for lossless stream-copy remuxes.** New `$lossless`
+parameter threaded through `finalize_mkv_output()` ->
+`write_ves_processed_tag()`, set `true` at all three
+`remux_copy_to_mkv()` call sites (AV1-source remux-to-MKV, HEVC-in-MKV
+stream-copy shortcut, x265-source non-MKV-container remux) -- `-c:v copy
+-c:a copy` cannot possibly change quality by construction, so there was
+never anything meaningful to measure at these call sites regardless of
+what the underlying muxer-timestamp bug turns out to be. This is
+strictly more correct than reporting a number already proven wrong in
+two independent real-world reproductions (MARLONJ: "A Midsummer Night's
+Dream" VMAF 66.2, "Time Loop" VMAF 44.3, both pure remuxes) and
+completely sidesteps the bug without touching the shared VMAF comparator
+that every real (non-lossless) encode fleet-wide still depends on.
+
+**Left open (1 of 3 real occurrences, genuinely harder): a real AV1
+transcode's final-quality measurement** (ELVIS: "I Put a Hit On You",
+CRF search predicted ~90, final measured 75.8) hit the same underlying
+muxer-timestamp-offset bug, but this call site can't just skip
+measurement -- a real re-encode's quality genuinely needs checking. A
+manually-tuned compensating seek offset improved but didn't fully
+resolve the score (79-82 vs. an expected ~100 for a byte-identical
+comparison scenario), and patching the shared `_vmaf_compare_window`
+comparator used by every real encode fleet-wide on an unproven precise
+offset carries real regression risk (could newly UNDER-flag a genuinely
+bad encode) that isn't worth taking without more validation time.
+Cleared the specific false-positive flag by hand this session (both the
+bash per-title `low_quality_review.txt` entries on MARLONJ and the
+Windows one-file-per-entry `.quality-flag` on ELVIS); the general fix
+for real-encode final-VMAF timestamp alignment remains a documented,
+scoped follow-up. Bash only this release -- the Windows port has no
+lossless-remux-with-VMAF-tagging code path yet (the AV1/x265 bake-off
+those call sites live in isn't ported), so there was nothing to change
+there for the safe fix; the harder real-encode case affects both
+platforms equally and is unresolved on both.
+
 ## v5.1.0X — 2026-08-13
 
 **Fleet-wide validation test triage.** After the SMB `icacls` fix

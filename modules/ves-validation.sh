@@ -432,6 +432,7 @@ XML
 write_ves_processed_tag() {
   local mkv="$1"
   local src="${2:-}"
+  local lossless="${3:-false}"
   local tag_value="VES ${VERSION} processed"
 
   if [ "$DRY_RUN" = true ]; then
@@ -443,6 +444,27 @@ write_ves_processed_tag() {
   # $mkv skips the VMAF measurement below entirely rather than spending CPU
   # computing a quality readout that would just be thrown away.
   [ ! -L "$mkv" ] || { warn "Refusing to tag — $mkv is a symlink (possible race)"; return 0; }
+
+  # $lossless=true (remux_copy_to_mkv's -c:v copy path, no re-encode at all)
+  # skips VMAF measurement entirely rather than trusting the number: found
+  # 2026-08-14 that measure_final_vmaf can score a PROVABLY lossless
+  # stream-copy remux catastrophically low (44-66, vs. the ~100 a lossless
+  # copy must score) on long files, worsening the further into the file the
+  # comparison window lands (80.1 near the start vs. 44-52 forty+ minutes
+  # in on the same file) -- a genuine measurement bug (visually confirmed
+  # identical frames, matching SSIM ~0.96, matching color/pixel-format
+  # metadata), root cause not yet pinned down (ruled out seek-precision via
+  # a true frame-accurate decode-from-start test -- identical score). Since
+  # a stream copy cannot possibly change quality by construction, there is
+  # nothing meaningful to measure here regardless of what the bug turns out
+  # to be -- skipping is strictly more correct than reporting a number that
+  # was already proven wrong in two independent real reproductions, and it
+  # sidesteps the bug without needing to actually fix the measurement
+  # function used by every real (non-lossless) encode fleet-wide.
+  if [ "$lossless" = true ]; then
+    _mkv_write_single_tag "$mkv" "$tag_value"
+    return 0
+  fi
 
   if [ -n "$src" ] && [ "$src" != "$mkv" ] && [ -f "$src" ]; then
     local upscaled=false target_height=0 res_str="" vmaf=""
@@ -557,9 +579,10 @@ finalize_mkv_output() {
   local mkv="$1"
   local src="$2"
   local title="${3:-$(canonical_title_from_file "$src")}"
+  local lossless="${4:-false}"
   optimize_mkv_for_streaming "$mkv"
   label_mkv_tracks "$mkv" "$src" "$title"
-  write_ves_processed_tag "$mkv" "$src"
+  write_ves_processed_tag "$mkv" "$src" "$lossless"
   maybe_chown_for_media_user "$mkv"
   match_source_permissions "$mkv" "$src"
   # $mkv is now the real, durable, final output -- clear the in-progress
