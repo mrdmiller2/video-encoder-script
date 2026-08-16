@@ -4,6 +4,31 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.0Z — 2026-08-15
+
+**Raised default RAM-disk sizing (`CONVERT_RAMDISK_PCT`/`PercentOfAvailable`)
+from 50% to 60% of available memory** after a real `ENOSPC` failure on
+PRINCE: a 4K movie (Congo, 1995) ran its full AV1 encode successfully
+(~4h20m) but died at the final remux stage with "No space left on
+device" — confirmed via the ffmpeg stderr log, on both the
+subtitles-included and subtitles-stripped retry. Root cause: the
+two-stage pipeline's stage-1 intermediate (video+audio only) and
+stage-2 final remux output briefly coexist on the same RAM disk, so
+peak usage approaches ~2x the final file size — for a large 4K title
+that easily exceeded the ~9.5GB a 50%-of-available RAM disk provided on
+a 31.7GB-RAM machine. All 4+ hours of AV1 compute were lost; the job
+fell back to x265 and re-ran the entire encode from scratch under the
+same constraint. Fixed by widening the default headroom on both
+platforms (`modules/ves-config.sh`'s `CONVERT_RAMDISK_PCT`,
+`windows/modules/VesRamDisk.psm1`'s `PercentOfAvailable` param default)
+— still leaves 40% of available memory for the encoder's own working
+set, per the sizing comment's original intent. No caller on either
+platform overrides the default, so this single-line change applies
+fleet-wide. The currently-running job on PRINCE was not interrupted
+(its RAM disk was already created under the old 50% for its lifetime,
+and killing it would have lost real progress) — the fix applies to the
+next job launched on any machine.
+
 ## v5.1.0Y — 2026-08-14/15
 
 **Root-caused and fixed a real VMAF false-positive bug** found while

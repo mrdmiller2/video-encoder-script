@@ -85,7 +85,7 @@ function New-VesRamDiskJob {
     graceful-degradation intent in bash).
     #>
     param(
-        [int]$PercentOfAvailable = 50,
+        [int]$PercentOfAvailable = 60,
         [long]$MinSizeBytes = 256MB,
         # No longer WSL2-constrained (bash's own ramdisk_create has no
         # equivalent absolute cap, only the percentage) -- raised well
