@@ -484,11 +484,26 @@ ffmpeg_encode() {
   # pipeline pressure on long/complex files (team review didn't confirm
   # this was the actual trigger, but there's no downside to more headroom);
   # thread_queue_size added on the input side for the same reason.
-  # -fps_mode passthrough (2026-07-31, team review): low-risk
-  # belt-and-suspenders addition after "KanColle The Movie (2016)" produced
-  # a video stream that stalled well before real EOF on a long (93min)
-  # subtitle+font-attachment-heavy source, on both AV1 and x265 attempts
-  # independently.
+  # -fps_mode cfr (changed from passthrough 2026-08-16): passthrough was
+  # added 2026-07-31 as an unconfirmed, "no downside" mitigation for the
+  # KanColle stall (that bug's real, confirmed fix was the two-stage
+  # restructure below, which keeps subtitles/attachments out of this stage
+  # entirely -- passthrough was never proven necessary for it). It turned
+  # out to have a real downside: root-caused a systemic frame-duplication
+  # defect (Stargate Universe S01, Marvel's Runaways S02, Battlestar
+  # Galactica, Godfather of Harlem -- 100% reproduction across 6 fleet
+  # machines, both bash/ffmpeg and PowerShell) to passthrough blindly
+  # propagating a subtle decoded-PTS irregularity in these sources' opening
+  # ~30s (invisible at the container/packet level, only visible post-decode)
+  # into a persistent ~1-in-3-frame duplicate+compensating-gap pattern for
+  # the rest of the encode. Isolated via direct stage-1-only repro testing:
+  # identical clip/settings, only the start offset changed (t=0 broken,
+  # t=30s clean); ruled out scd, preset, and job duration as factors before
+  # finding fps_mode was the actual variable. cfr forces ffmpeg to properly
+  # retime to the nominal frame rate instead of passing the decoder's raw
+  # PTS through unmodified -- verified clean (matches the known-good
+  # baseline CV exactly) on both a 5-minute reproduction clip and the full
+  # source file.
   #
   # Two-stage muxing (2026-08-02): the empirical KanColle re-run proved
   # the minimal -max_interleave_delta/-flush_packets mitigation does not
@@ -535,7 +550,7 @@ ffmpeg_encode() {
   args+=(-c:a "$acodec" -b:a "$abr" -af "$(ffmpeg_audio_filter_chain "$acodec")")
   if [ "$acodec" = libopus ]; then args+=(-mapping_family 1); fi
   args+=(-max_muxing_queue_size 8192
-         -fps_mode passthrough
+         -fps_mode cfr
          -f matroska "$stage1")
 
   if [ "$hdr" = true ]; then

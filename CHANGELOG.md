@@ -4,6 +4,70 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.1B — 2026-08-16
+
+**Root cause found and fixed for the v5.1.1A frame-duplication defect** —
+reopens and supersedes that entry's "not conclusively pinned down"
+conclusion. While triaging what looked like isolated ELVIS job failures
+during the 38-file requeue, the new v5.1.1A diagnostic tag surfaced that
+the defect reproduces **100% deterministically** on a fresh re-encode:
+checked across 6 fleet machines (bash/Linux and PowerShell/Windows, 3
+different ffmpeg builds), every single Stargate Universe S01 and Marvel's
+Runaways S02 episode re-encoded during the requeue came back tagged
+"LIKELY FRAME DUPLICATION" — not the isolated, unproven, NAS-contention-
+window theory the original entry described.
+
+Isolated via direct reproduction testing against a real source file
+(Stargate Universe S01E17 - Pain), bypassing the full pipeline to run the
+exact stage-1 ffmpeg command by hand against short extracted clips:
+- The full-length encode reproduces (`cv=0.77` uniformly from frame 1 to
+  the end of a 43-minute job); a 5-minute clip of the *same* content
+  starting 20 minutes in is completely clean.
+- Narrowed to *start position*, not duration: a 5-minute clip starting at
+  t=0 is broken; the identical 5-minute duration starting at t=30s is
+  clean. The trigger is specific content in the opening ~30 seconds
+  (recap/title-card/network-bumper, typical of broadcast TV cold-opens)
+  that corrupts frame pacing for the *entire remainder* of the job once
+  triggered.
+- Ruled out as factors: `scd=0` (scene-change detection off) — still
+  broken, identical duplicate count. `-preset 8` instead of `-preset 5` —
+  still broken, identical duplicate count. This ruled out SVT-AV1-internal
+  rate-control/lookahead state as the mechanism (a real encoder bug would
+  be expected to vary by preset).
+- The exact, reproducible fix: `-fps_mode cfr` instead of `-fps_mode
+  passthrough` on the stage-1 encode. Verified clean (matches the known-
+  good baseline CV of ~0.01 exactly, both on the 5-minute reproduction
+  clip and the full 43-minute source) with every other variable held
+  constant. `passthrough` blindly propagates whatever PTS sequence the
+  HEVC decoder emits for a given input; for this specific content the
+  decoder's PTS output has a subtle irregularity in the opening segment
+  that is **invisible at the container/packet level** (a from-scratch,
+  whole-file ffprobe packet-DTS scan of the source measured perfectly
+  regular timing throughout, zero anomalies) but present after decode —
+  `cfr` properly retimes to the nominal frame rate instead of passing that
+  through unmodified.
+
+`-fps_mode passthrough` was originally added 2026-07-31 (v5.0.33J) as an
+explicitly *unconfirmed* "low-risk, no downside" mitigation for a
+different bug (KanColle Movie stalling before EOF on subtitle-heavy
+content) — that entry's own text says the mechanism was "not fully
+proven." The KanColle bug's real, confirmed fix was the two-stage
+encode/remux restructure shipped shortly after (2026-08-02), which
+already keeps subtitles/attachments out of the stage-1 encode entirely —
+`passthrough` was never actually load-bearing for that fix. It turned out
+to have a real, serious downside instead. Changed on stage 1 only (both
+`modules/ves-twostage-encode.sh` and `windows/modules/VesTwoStageEncode.psm1`)
+— the stage-2 remux stays on `passthrough`, since it's a `-c:v copy`
+stream copy where `-fps_mode` is a no-op either way; left unchanged to
+minimize the diff.
+
+**Not yet done, follow-up needed**: re-encode the full backlog (all 38
+original files plus everything reprocessed during the requeue that came
+back tagged) with the fix; audit whether any other, non-flagged content in
+the library shares this trigger (opening-segment content type, not codec
+or show) and could be silently affected without ever crossing the VMAF
+floor to get flagged.
+
 ## v5.1.1A — 2026-08-16
 
 **Diagnostic-only safeguard: `detect_output_frame_duplication()` / `Get-VesOutputFrameDuplication`**,

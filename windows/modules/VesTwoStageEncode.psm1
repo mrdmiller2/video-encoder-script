@@ -157,7 +157,19 @@ function Invoke-VesTwoStageEncode {
         $audioFilterChain = Get-VesAudioFilterChain -AudioCodec $AudioCodec -AudioDrc $AudioDrc -AudioGainDb $AudioGainDb
         $stage1Args += @('-c:a', $AudioCodec, '-b:a', $AudioBitrate, '-af', $audioFilterChain)
         if ($AudioCodec -eq 'libopus') { $stage1Args += @('-mapping_family', '1') }
-        $stage1Args += @('-max_muxing_queue_size', '8192', '-fps_mode', 'passthrough', '-f', 'matroska', $stage1)
+        # -fps_mode cfr (changed from passthrough 2026-08-16): passthrough
+        # blindly propagates the decoder's raw PTS sequence, which for a
+        # confirmed set of sources (Stargate Universe S01, Marvel's
+        # Runaways S02, Battlestar Galactica, Godfather of Harlem) has a
+        # subtle irregularity in the opening ~30s invisible at the
+        # container/packet level but present post-decode -- passthrough
+        # propagated that into a persistent ~1-in-3-frame duplicate defect
+        # for the rest of the encode, 100% reproducible across the fleet
+        # (both this port and bash). cfr properly retimes to the nominal
+        # frame rate instead. See ves-twostage-encode.sh's matching comment
+        # for the full isolation writeup (bash and this port share the
+        # same defect since both use ffmpeg/libsvtav1 the same way here).
+        $stage1Args += @('-max_muxing_queue_size', '8192', '-fps_mode', 'cfr', '-f', 'matroska', $stage1)
 
         Write-Host "ffmpeg encode stage 1/2 (video+audio only): $([System.IO.Path]::GetFileName($Source))"
         $encodeResult = Invoke-VesTrackedProcess -FilePath $FfmpegPath -ArgumentList $stage1Args -ErrorLogPath $encodeErrFile
