@@ -183,6 +183,70 @@ detect_frame_rate_mode() {  # src -> prints cfr|vfr|unknown
   printf '%s' "$mode"
 }
 
+# Diagnostic companion to detect_frame_rate_mode(), but checks the FINISHED
+# OUTPUT rather than the source, and only runs when a final VMAF measurement
+# has already come back below LOW_QUALITY_VMAF_THRESHOLD (write_ves_processed_tag
+# is the only caller). Found 2026-08-16 auditing a 38-file fleet-wide
+# below-floor backlog (all traced to a single 2026-08-13 batch run, root
+# cause not pinned down -- tool binaries and encode command both unchanged,
+# a clean isolated re-encode of the same content doesn't reproduce it,
+# pattern is consistent with fleet-wide concurrent-NAS-load frame stalls
+# during that specific run rather than a persistent defect): real, literal
+# duplicate packets in the AV1 output's own timestamps (identical PTS twice
+# in a row, then a compensating double-length gap) -- invisible to a
+# still-frame comparison (individual frames decode fine) but catastrophic
+# to VMAF (measured 42-49 on files that SSIM'd at 0.96-0.997), because the
+# duplication/gap pattern is exactly the kind of judder VMAF's motion-aware
+# scoring is built to penalize. The existing VMAF floor already catches
+# these files (that's how the 38-file backlog was found at all) -- this
+# function's only job is turning "NEEDS REVIEW" into a self-diagnosing
+# "LIKELY FRAME DUPLICATION" tag so a human doesn't have to re-derive this
+# investigation from scratch every time it (or something with the same
+# below-floor symptom) recurs. Same CV-based technique as
+# detect_frame_rate_mode() -- reuses _dts_delta_cv() unchanged -- but on
+# $out instead of $src. A healthy encode's own PTS spacing is just as
+# regular as its source's (confirmed empirically: today's clean re-encodes
+# read avg_cv 0.01-0.05, same ballpark as clean sources); the 38 confirmed-
+# defective files all measured avg_cv 0.5-0.8+ on the SAME technique, so
+# OUTPUT_DUPLICATE_FRAME_CV_MAX is set with wide margin on both sides
+# rather than tuned to a boundary.
+detect_output_frame_duplication() {  # out -> prints ok|duplicated|unknown
+  local out="$1"
+  local dur points
+  local -a starts=()
+  dur="$(video_duration "$out")"; dur="${dur%.*}"
+  if [ -n "${dur:-}" ] && [ "$dur" -gt 0 ] 2>/dev/null; then
+    points="$(find_complexity_sample_points "$out" "$dur")" || points=""
+  fi
+  if [ -n "$points" ]; then
+    read -r -a starts <<<"$points"
+  else
+    starts=("$(sample_start_middle "${dur:-0}")")
+  fi
+
+  local width="$SOURCE_TRAITS_PROBE_WIDTH_SECS"
+  local start cv n_windows=0 avg_cv="" mode="unknown"
+  local -a cvs=()
+  for start in "${starts[@]}"; do
+    [ -n "$start" ] || continue
+    cv="$(_dts_delta_cv "$out" "$start" "$width")" || continue
+    cvs+=("$cv")
+    n_windows=$((n_windows + 1))
+  done
+
+  if [ "$n_windows" -gt 0 ]; then
+    avg_cv="$(printf '%s\n' "${cvs[@]}" | awk '{s+=$1;n++} END{printf "%.4f", s/n}')"
+    if awk -v c="$avg_cv" -v t="$OUTPUT_DUPLICATE_FRAME_CV_MAX" 'BEGIN{exit !(c<=t)}'; then
+      mode="ok"
+    else
+      mode="duplicated"
+    fi
+  fi
+
+  log_err "Output frame-pacing check: $out -> $mode (avg_cv=${avg_cv:-n/a} windows=$n_windows)"
+  printf '%s' "$mode"
+}
+
 # Measures VMAF of $src against itself -- a pure measurement-methodology
 # sanity check, not a real quality assessment (identical content is being
 # compared, so a healthy source should score ~100). Its only purpose is

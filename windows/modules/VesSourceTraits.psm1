@@ -32,6 +32,100 @@ $script:SourceTraitsBwSatavgMax = 4.0
 # $Source -> cached [PSCustomObject]@{ FieldMode; IsBw; FieldOrder }
 $script:SourceTraitsCache = @{}
 
+function Get-VesDtsDeltaCv {
+    <#
+    .SYNOPSIS
+    Port of _dts_delta_cv() (ves-source-traits.sh). Coefficient of
+    variation of packet dts_time deltas in one probe window -- low for
+    genuinely regular frame pacing, high when frames are irregularly
+    spaced or duplicated. Filters ffprobe's literal "N/A" dts_time near
+    a seek boundary (same B-frame-reorder-buffer gotcha the bash version
+    hit against a real Battlestar Galactica sample, 2026-08-13).
+
+    .OUTPUTS
+    [double] or $null on failure / fewer than 4 usable packets.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][double]$Start,
+        [Parameter(Mandatory)][int]$Width,
+        [Parameter(Mandatory)][string]$FfprobePath,
+        [int]$TimeoutSeconds = 60
+    )
+    $startStr = $Start.ToString('F3', [System.Globalization.CultureInfo]::InvariantCulture)
+    $result = Invoke-VesWithTimeoutRetry -FilePath $FfprobePath -ArgumentList @(
+        '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'packet=dts_time',
+        '-of', 'csv=p=0', '-read_intervals', "${startStr}%+${Width}", $Source
+    ) -TimeoutSeconds $TimeoutSeconds -MaxRetries 1
+    if ($result.TimedOut -or $result.ExitCode -ne 0 -or -not $result.StdOut) { return $null }
+
+    $times = [System.Collections.Generic.List[double]]::new()
+    foreach ($line in ($result.StdOut -split "`n")) {
+        $line = $line.Trim()
+        if (-not $line) { continue }
+        $v = 0.0
+        if ([double]::TryParse($line, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$v)) {
+            $times.Add($v)
+        }
+    }
+    if ($times.Count -lt 4) { return $null }
+    $sorted = $times | Sort-Object
+    $deltas = [System.Collections.Generic.List[double]]::new()
+    for ($i = 1; $i -lt $sorted.Count; $i++) { $deltas.Add($sorted[$i] - $sorted[$i - 1]) }
+    $mean = ($deltas | Measure-Object -Average).Average
+    if ($mean -le 0) { return $null }
+    $sumSq = 0.0
+    foreach ($d in $deltas) { $sumSq += [math]::Pow($d - $mean, 2) }
+    $stdev = [math]::Sqrt($sumSq / $deltas.Count)
+    return ($stdev / $mean)
+}
+
+function Get-VesOutputFrameDuplication {
+    <#
+    .SYNOPSIS
+    Windows port of detect_output_frame_duplication() (ves-source-traits.sh,
+    2026-08-16). Diagnostic-only, called from the below-VMAF-floor tagging
+    path (same as bash) -- reuses Get-VesDtsDeltaCv on the FINISHED OUTPUT
+    (not the source) to distinguish "genuinely low quality" from "real
+    duplicate frames baked into the output," found auditing a 38-file
+    fleet-wide below-floor backlog all traced to one 2026-08-13 batch run
+    (root cause not pinned down -- see the bash function's own comment for
+    the full investigation). $CvMax mirrors bash's
+    OUTPUT_DUPLICATE_FRAME_CV_MAX (0.15), same wide-margin reasoning: clean
+    encodes measure ~0.01-0.05, the confirmed-defective files measured
+    0.5-0.8+.
+
+    .OUTPUTS
+    'ok' | 'duplicated' | 'unknown'
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Output,
+        [Parameter(Mandatory)][string]$FfprobePath,
+        [double]$CvMax = 0.15,
+        [int]$ProbeWidth = 10
+    )
+    $durArgs = @('-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', $Output)
+    $durResult = Invoke-VesWithTimeoutRetry -FilePath $FfprobePath -ArgumentList $durArgs -TimeoutSeconds 30 -MaxRetries 1
+    $dur = 0.0
+    if ($durResult.TimedOut -or $durResult.ExitCode -ne 0 -or
+        -not [double]::TryParse(($durResult.StdOut).Trim(), [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$dur) -or $dur -le 0) {
+        return 'unknown'
+    }
+
+    $starts = Get-VesComplexitySamplePoints -Source $Output -Duration $dur -FfprobePath $FfprobePath -ProbeWidth $ProbeWidth
+    if (-not $starts -or $starts.Count -eq 0) { $starts = @([math]::Max(0, $dur / 2)) }
+
+    $cvs = [System.Collections.Generic.List[double]]::new()
+    foreach ($start in $starts) {
+        $cv = Get-VesDtsDeltaCv -Source $Output -Start $start -Width $ProbeWidth -FfprobePath $FfprobePath
+        if ($null -ne $cv) { $cvs.Add($cv) }
+    }
+    if ($cvs.Count -eq 0) { return 'unknown' }
+    $avgCv = ($cvs | Measure-Object -Average).Average
+    Write-Verbose "Output frame-pacing check: $Output -> avg_cv=$avgCv windows=$($cvs.Count)"
+    if ($avgCv -le $CvMax) { return 'ok' } else { return 'duplicated' }
+}
+
 function Get-VesComplexitySamplePoints {
     <#
     .SYNOPSIS
@@ -311,4 +405,4 @@ function Get-VesSourceTraits {
     return $result
 }
 
-Export-ModuleMember -Function Get-VesComplexitySamplePoints, Invoke-VesIdetProbeWindow, Invoke-VesSignalstatsProbeWindow, Get-VesSourceTraits
+Export-ModuleMember -Function Get-VesComplexitySamplePoints, Invoke-VesIdetProbeWindow, Invoke-VesSignalstatsProbeWindow, Get-VesSourceTraits, Get-VesDtsDeltaCv, Get-VesOutputFrameDuplication

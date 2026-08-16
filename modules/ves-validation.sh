@@ -519,7 +519,18 @@ write_ves_processed_tag() {
     # which would wrongly read as "far below floor" instead of "unavailable".
     if [[ "$vmaf" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v v="$vmaf" -v t="$LOW_QUALITY_VMAF_THRESHOLD" \
          'BEGIN { exit !(v + 0 < t + 0) }' 2>/dev/null; then
-      tag_value="${tag_value} — BELOW ${LOW_QUALITY_VMAF_THRESHOLD} FLOOR, NEEDS REVIEW"
+      # Diagnostic-only, run here rather than as an independent gate: a
+      # below-floor VMAF has already triggered review regardless of cause,
+      # so this just tells the reviewer WHICH kind of below-floor it is
+      # (see detect_output_frame_duplication()'s own comment for the
+      # 2026-08-16 investigation that motivated this).
+      local dup_mode
+      dup_mode="$(detect_output_frame_duplication "$mkv" 2>/dev/null)" || dup_mode="unknown"
+      if [ "$dup_mode" = "duplicated" ]; then
+        tag_value="${tag_value} — BELOW ${LOW_QUALITY_VMAF_THRESHOLD} FLOOR, LIKELY FRAME DUPLICATION, RE-ENCODE RECOMMENDED"
+      else
+        tag_value="${tag_value} — BELOW ${LOW_QUALITY_VMAF_THRESHOLD} FLOOR, NEEDS REVIEW"
+      fi
       flag_low_quality_output_for_human "$mkv" "$src" "$vmaf"
     fi
   fi

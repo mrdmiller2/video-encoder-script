@@ -699,7 +699,12 @@ function Invoke-VesEncodeAndValidate {
                 # container check fails) and, worse, pointed at an
                 # already-deleted scratch path even if it had written.
                 $flagDir = if ($IsDiscSource) { Get-VesDiscMediaContentDir -Source $ProfileSource } else { Split-Path -Parent $ProfileSource }
-                Write-VesLowQualityFlag -JobSidecarDir $flagDir -OutputPath $finalDst -SourcePath $ProfileSource -Vmaf $finalVmaf -Threshold $LowQualityVmafThreshold
+                # Diagnostic-only (2026-08-16): the VMAF floor already
+                # triggered review regardless of cause -- this just tells
+                # the reviewer WHICH kind of below-floor it is. See
+                # Get-VesOutputFrameDuplication's own docs.
+                $dupCheck = try { Get-VesOutputFrameDuplication -Output $finalDst -FfprobePath $FfprobePath } catch { 'unknown' }
+                Write-VesLowQualityFlag -JobSidecarDir $flagDir -OutputPath $finalDst -SourcePath $ProfileSource -Vmaf $finalVmaf -Threshold $LowQualityVmafThreshold -DuplicationCheck $dupCheck
             }
         }
     }

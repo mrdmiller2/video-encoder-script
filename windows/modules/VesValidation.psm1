@@ -159,7 +159,16 @@ function Write-VesLowQualityFlag {
         [Parameter(Mandatory)][string]$OutputPath,
         [Parameter(Mandatory)][string]$SourcePath,
         [Parameter(Mandatory)][double]$Vmaf,
-        [Parameter(Mandatory)][double]$Threshold
+        [Parameter(Mandatory)][double]$Threshold,
+        # 2026-08-16: diagnostic-only 5th field, populated by the caller via
+        # Get-VesOutputFrameDuplication ('ok'|'duplicated'|'unknown'/unset)
+        # -- see that function's docs for the investigation that motivated
+        # it. Turns "NEEDS REVIEW" into a self-diagnosing flag so a human
+        # doesn't have to re-derive the same root-cause investigation every
+        # time this (or something with the same below-floor symptom)
+        # recurs. Appended past the original 4 fields, so any existing
+        # reader that only consumes 4 stays correct.
+        [string]$DuplicationCheck = ''
     )
     Write-Warning "Kept output below VMAF $Threshold floor ($Vmaf) -- flagged for human review: $OutputPath"
     if (-not (Test-Path -LiteralPath $JobSidecarDir -PathType Container)) {
@@ -168,7 +177,7 @@ function Write-VesLowQualityFlag {
     }
     $token = [System.IO.Path]::GetRandomFileName() -replace '[.]', ''
     $entryPath = Join-Path $JobSidecarDir "low_quality_review-$env:COMPUTERNAME-$PID-$token.quality-flag"
-    $line = "{0}`t{1}`t{2}`t{3}`n" -f (Get-Date -AsUTC -Format 'yyyy-MM-ddTHH:mm:ssZ'), $Vmaf, $OutputPath, $SourcePath
+    $line = "{0}`t{1}`t{2}`t{3}`t{4}`n" -f (Get-Date -AsUTC -Format 'yyyy-MM-ddTHH:mm:ssZ'), $Vmaf, $OutputPath, $SourcePath, $DuplicationCheck
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($line)
     try {
         $fs = $null

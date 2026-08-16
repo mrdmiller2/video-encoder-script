@@ -4,6 +4,87 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.1A — 2026-08-16
+
+**Diagnostic-only safeguard: `detect_output_frame_duplication()` / `Get-VesOutputFrameDuplication`**,
+added while root-causing a 38-file fleet-wide below-VMAF-floor backlog
+found auditing `low_quality_review.txt`. All 38 files (6 Battlestar
+Galactica, 12 Marvel's Runaways, 19 Stargate Universe, 1 Godfather of
+Harlem) re-measured to the *exact same* VMAF score against current code
+— zero false positives, all genuine defects. Deep investigation of one
+file (Marvel's Runaways S02E08) found a real, literal duplicate-packet
+defect baked into the AV1 output itself: identical PTS twice in a row,
+then a compensating double-length gap, at a regular ~1-in-3-packet
+cadence — invisible to a still-frame/SSIM comparison (individual frames
+decode fine) but catastrophic to VMAF (42-49 measured on files that
+SSIM'd at 0.96-0.997), because the duplication/gap judder is exactly
+what VMAF's motion-aware scoring is built to penalize.
+
+Root cause not conclusively pinned down: ffmpeg (dated 2026-07-20) and
+the SVT-AV1 library (dated 2026-01-29) are both unchanged since before
+the defective batch, and the two-stage encode command in
+`ves-twostage-encode.sh` is essentially identical to what ran the bad
+batch (only an unrelated dead `enable-hdr` flag differs). A fresh,
+isolated re-encode of the same content with identical current tooling
+does not reproduce the defect. All 38 files trace to one narrow
+2026-08-13 06:57-07:19 UTC window, across 4 machines spanning 2 OSes and
+both physical and virtual hardware (LAYTOYAJ/AI-PROCESSOR VMs,
+TITOJ/MARLONJ physical) — that cross-platform consistency in one narrow
+window, documented (CHANGELOG v5.1.0W) as part of a coordinated
+fleet-wide batch run, points to a shared external factor (working
+theory: multiple machines reading the same NAS simultaneously caused
+transient stalls ffmpeg's demuxer bridged by duplicating a frame) rather
+than a persistent per-machine defect — but this can't be fully proven
+since the original run's logs were already overwritten by the time this
+was investigated.
+
+Since the exact trigger can't be confirmed fixed, this ships a
+detection safeguard instead of relying on that theory: reuses the
+existing `_dts_delta_cv()`/`Get-VesDtsDeltaCv` packet-timing-variance
+primitive (already used by `detect_frame_rate_mode()` for VFR detection
+on the *source*) against the finished *output*, called only when a
+final VMAF measurement has already come back below
+`LOW_QUALITY_VMAF_THRESHOLD` — diagnostic, not an independent gate,
+since the VMAF floor already catches these files regardless of cause.
+Turns a generic "NEEDS REVIEW" tag into "LIKELY FRAME DUPLICATION,
+RE-ENCODE RECOMMENDED" (bash: embedded MKV tag; Windows: new 5th field
+on the existing `.quality-flag` sidecar file) so a human doesn't have to
+re-derive this investigation from scratch if it recurs. New config
+constant `OUTPUT_DUPLICATE_FRAME_CV_MAX=0.15`, set with wide margin
+rather than a tuned boundary — clean encodes measured avg_cv 0.01-0.05
+(same ballpark as a clean source), the confirmed-defective files all
+measured 0.5-0.8+ on the identical technique. Verified against one real
+confirmed-defective file (correctly flagged "duplicated") and one real
+clean file (correctly flagged "ok").
+
+Ported to Windows in full this release — `detect_frame_rate_mode()` and
+`_dts_delta_cv()` themselves were never ported (a gap the original
+v5.1.0W CHANGELOG entry flagged as bash-only with Windows as a
+follow-up that never happened); this release adds `Get-VesDtsDeltaCv`
+and `Get-VesOutputFrameDuplication` to `VesSourceTraits.psm1` from
+scratch, following the same `Invoke-VesWithTimeoutRetry` pattern used
+throughout the port. Code-complete and syntax-validated
+(`[System.Management.Automation.Language.Parser]::ParseFile`), but live
+functional verification on a real Windows machine is still pending — all
+3 Windows machines were mid-job when this shipped, and PowerShell holds
+an open handle on an imported `.psm1` file for the life of the process,
+which silently blocked an `scp` overwrite attempt against ELVIS's
+running job (a real, previously-undocumented deployment gotcha:
+`convert.ps1` itself updated fine since it's just read once at
+invocation, but the two loaded modules didn't — unlike bash, where
+overwriting a script/sourced-module file mid-run is safe).
+
+Also requeued all 38 confirmed-defective files for re-encoding across
+the 8 then-idle fleet machines (PRINCE and RANDYJ excluded, both mid-job),
+ordered heaviest/vintage-first to fastest hardware. Found and fixed a
+real, unrelated deployment bug while doing this: the v5.1.0Z RAM-disk
+fix's `scp` had copied `ves-config.sh` to the script root instead of
+`modules/` on 5 of 6 Linux/macOS machines, so the real config file never
+actually updated there despite no error at the time (only the one
+machine deployed by hand, earlier in the same session, was correct) —
+fixed with exact-path verification this time, not just a filename-glob
+check.
+
 ## v5.1.0Z — 2026-08-15
 
 **Raised default RAM-disk sizing (`CONVERT_RAMDISK_PCT`/`PercentOfAvailable`)

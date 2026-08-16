@@ -6,7 +6,7 @@
 # MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
 # bug fix) -- see its own comment.
 
-VERSION="5.1.0Z"
+VERSION="5.1.1A"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
 # as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
@@ -464,6 +464,16 @@ SOURCE_TRAITS_BW_SATAVG_MAX=4.0        # avg signalstats SATAVG at/below this ->
 # confirmed-VFR sources before relying on it for anything beyond logging.
 SOURCE_TRAITS_VFR_CV_MAX=0.05          # packet dts-delta coefficient of variation at/below this -> CFR, above -> VFR
 SOURCE_BASELINE_VMAF_MIN=97.0          # self-vs-self VMAF below this -> measurement methodology unreliable for this source, flag for human review
+
+# OUTPUT_DUPLICATE_FRAME_CV_MAX (2026-08-16, detect_output_frame_duplication()):
+# same CV technique as SOURCE_TRAITS_VFR_CV_MAX above, but applied to a
+# FINISHED OUTPUT rather than a source, and only ever invoked once VMAF has
+# already come back below LOW_QUALITY_VMAF_THRESHOLD (a diagnostic, not an
+# independent gate). Set with wide margin, not a tuned boundary: clean
+# encodes measured avg_cv 0.01-0.05 (same ballpark as a clean source); the
+# confirmed-defective 38-file backlog that motivated this check all
+# measured avg_cv 0.5-0.8+ on the identical technique.
+OUTPUT_DUPLICATE_FRAME_CV_MAX=0.15
 
 # Phase F resolved constants. These complete strings are shared by sample
 # search and final encode so profile tuning cannot drift (the v5.0.29 lesson).
