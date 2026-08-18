@@ -48,17 +48,53 @@
 # artifacts from the filter) is masked by the other measurement not being
 # subject to that specific failure. Costs one extra ffmpeg pass per sample
 # window -- acceptable for this occasional tagging/diagnostic path.
-_vmaf_compare_window_once() {  # src out start secs model target_height fps_filter
-  local src="$1" out="$2" start="$3" secs="$4" model="$5" target_height="${6:-0}" fps_filter="${7:-}"
-  local scale_filter="" vlog v
+# Task #172: ffmpeg's MKV muxer relabels output PTS with a small offset vs
+# the source (observed 20-40ms). Both inputs below are seeked independently
+# at the SAME nominal "$start" and then have their own PTS zeroed
+# (setpts=PTS-STARTPTS), so this offset can silently land the two -ss seeks
+# on different real-content frames -- invisible on static content, but on
+# fast motion a 1-frame misalignment can swing the score by tens of points.
+#
+# First attempt (2026-08-17) measured the src/out first-frame PTS delta once
+# per file and unconditionally compensated the OUT-side seek by it, trusting
+# it as a fixed correction. Real-world test on PRINCE disproved that:
+# compensating by the measured offset (-ss 413.979 vs uncompensated 414, a
+# 21ms difference) scored 26.9, while the SAME window uncompensated scored
+# 72.6 -- worse, not better. A follow-up controlled sweep (13-point, one
+# frame-duration step each, same file/window) showed WHY: the true best
+# alignment is a sharp single peak sitting at offset=0 for that window, with
+# score collapsing by ~50 points within a single frame either side -- not a
+# smooth function a single measured delta can reliably predict, because the
+# real misalignment isn't a fixed property of the FILE, it can vary window
+# to window (frame jitter, B-frame reordering, landing near a scene cut).
+#
+# Correct fix: don't guess the offset from metadata at all -- SEARCH for it.
+# For each sample window, try every whole-frame offset from
+# -VMAF_ALIGN_SEARCH_FRAMES to +VMAF_ALIGN_SEARCH_FRAMES (crossed with the
+# existing plain/fps-filter axis below, which guards a different, still-real
+# VFR-drift failure mode) and keep whichever scores highest. Misalignment
+# can only ever drag a score spuriously LOW, never inflate it, so taking the
+# max across every candidate is safe in every direction -- same reasoning as
+# the fps_filter dual-measurement this extends. Costs
+# (2*VMAF_ALIGN_SEARCH_FRAMES+1) x up-to-2 ffmpeg passes per sample window;
+# acceptable for this once-per-file tagging/diagnostic path given the
+# alternative is a measurement that can't be trusted.
+_vmaf_compare_window_once() {  # src out start secs model target_height fps_filter offset
+  local src="$1" out="$2" start="$3" secs="$4" model="$5" target_height="${6:-0}" fps_filter="${7:-}" offset="${8:-0}"
+  local scale_filter="" vlog v out_start
   case "$target_height" in
     720) scale_filter='scale=1280:720:flags=lanczos:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,' ;;
     1080) scale_filter='scale=1920:1080:flags=lanczos:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,' ;;
   esac
+  # Compensate the OUT-side seek by the measured src/out PTS offset so both
+  # seeks land on the same real content frame -- clamped to 0 (never seek
+  # negative) since a large negative offset near the start of a file would
+  # otherwise produce an invalid -ss.
+  out_start="$(awk -v s="$start" -v d="$offset" 'BEGIN{v=s+d; printf "%.6f", (v<0?0:v)}')"
   vlog="$(mktemp "${TMPDIR:-/tmp}/ves-vmaf-XXXXXX.json")" || return 1
   # run_ffmpeg_validation (timeout-wrapped) -- same short-bounded-window
   # hang risk as the CRF-search VMAF scorer (fixed 2026-07-29).
-  run_ffmpeg_validation -y -v error -ss "$start" -t "$secs" -i "$out" -ss "$start" -t "$secs" -i "$src" -lavfi \
+  run_ffmpeg_validation -y -v error -ss "$out_start" -t "$secs" -i "$out" -ss "$start" -t "$secs" -i "$src" -lavfi \
     "[0:v]${fps_filter}setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]${fps_filter}${scale_filter}setpts=PTS-STARTPTS,format=yuv420p10le[r];[d][r]libvmaf=model=$model:n_threads=$(nproc 2>/dev/null || sysctl -n hw.ncpu):log_fmt=json:log_path=$vlog" \
     -f null - 2>/dev/null || { rm -f "$vlog"; return 1; }
   v="$(python3 -c "import json;print(round(json.load(open('$vlog'))['pooled_metrics']['vmaf']['mean'],2))" 2>/dev/null)" || { rm -f "$vlog"; return 1; }
@@ -68,22 +104,37 @@ _vmaf_compare_window_once() {  # src out start secs model target_height fps_filt
 
 _vmaf_compare_window() {  # src out start secs model target_height
   local src="$1" out="$2" start="$3" secs="$4" model="$5" target_height="${6:-0}"
-  local fps_rate fps_filter="" v_plain v_fps
+  local fps_rate fps_filter="" best="" v frame_dur=""
   fps_rate="$(run_ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate \
     -of default=nw=1:nk=1 "$src" 2>/dev/null)" || fps_rate=""
   if [[ "$fps_rate" =~ ^[0-9]+/[0-9]+$ ]] && [ "${fps_rate#*/}" -gt 0 ] && [ "${fps_rate%/*}" -gt 0 ]; then
     fps_filter="fps=${fps_rate},"
+    frame_dur="$(awk -v n="${fps_rate%/*}" -v d="${fps_rate#*/}" 'BEGIN{printf "%.6f", d/n}')"
   fi
-  v_plain="$(_vmaf_compare_window_once "$src" "$out" "$start" "$secs" "$model" "$target_height" "")" || v_plain=""
-  if [ -z "$fps_filter" ]; then
-    [ -n "$v_plain" ] && printf '%s' "$v_plain"
-    return $([ -n "$v_plain" ] && echo 0 || echo 1)
+  # Search -N..+N frame-durations around the nominal seek, crossed with
+  # {no fps filter, fps filter}, and keep the max -- see the comment above
+  # this function for why a single guessed offset isn't safe to trust.
+  local -a offsets=("0")
+  if [ -n "$frame_dur" ]; then
+    local k
+    for ((k = -VMAF_ALIGN_SEARCH_FRAMES; k <= VMAF_ALIGN_SEARCH_FRAMES; k++)); do
+      [ "$k" -eq 0 ] && continue
+      offsets+=("$(awk -v k="$k" -v d="$frame_dur" 'BEGIN{printf "%.6f", k*d}')")
+    done
   fi
-  v_fps="$(_vmaf_compare_window_once "$src" "$out" "$start" "$secs" "$model" "$target_height" "$fps_filter")" || v_fps=""
-  if [ -z "$v_plain" ] && [ -z "$v_fps" ]; then
-    return 1
-  fi
-  awk -v a="${v_plain:--1}" -v b="${v_fps:--1}" 'BEGIN{print (a>b)?a:b}'
+  local -a ff_variants=("")
+  [ -n "$fps_filter" ] && ff_variants+=("$fps_filter")
+  local o ff
+  for o in "${offsets[@]}"; do
+    for ff in "${ff_variants[@]}"; do
+      v="$(_vmaf_compare_window_once "$src" "$out" "$start" "$secs" "$model" "$target_height" "$ff" "$o")" || continue
+      if [ -z "$best" ] || awk -v a="$v" -v b="$best" 'BEGIN{exit !(a>b)}'; then
+        best="$v"
+      fi
+    done
+  done
+  [ -n "$best" ] && printf '%s' "$best"
+  [ -n "$best" ]
 }
 
 # Sampled full-output VMAF for the VES tag -- distinct from vmaf_crf_search's
@@ -1181,12 +1232,36 @@ vmaf_crf_search_internal() {  # src codec target model profile target_height
   done
 
   local best="" bv="" bb=""
+  local closest="" cv="" cb=""
   for crf in $(printf '%s\n' "${!score[@]}" | sort -n); do
     if awk -v s="${score[$crf]}" -v t="$target" 'BEGIN{exit !(s>=t)}'; then
       best="$crf"; bv="${score[$crf]}"; bb="${bytes[$crf]}"
     fi
+    # Track the highest-VMAF sample seen regardless of target, so a
+    # search that never reaches target still has a real fallback to
+    # offer below (2026-08-16 fix — see comment below).
+    if [ -z "$cv" ] || awk -v s="${score[$crf]}" -v c="$cv" 'BEGIN{exit !(s>c)}'; then
+      closest="$crf"; cv="${score[$crf]}"; cb="${bytes[$crf]}"
+    fi
   done
   rm -rf "$work"
+  if [ -z "$best" ]; then
+    # No sampled CRF reached target -- use the best (highest-VMAF)
+    # sample actually measured instead of discarding it: the caller's
+    # own fallback (fixed_crf_for, a static per-profile constant
+    # disconnected from this content) can be, and in practice was,
+    # WORSE than a CRF this search already tested and scored. Found
+    # 2026-08-16 auditing a real production failure: Stargate Universe
+    # S01E18 sampled crf=16->vmaf=87.23 (above the 85 below-floor
+    # threshold, close to the 90 target) but this function returned 1
+    # anyway, so the caller fell back to profile_fixed_crf's static
+    # crf=26 for the real encode -- producing a final measured VMAF of
+    # 33.7, far worse than what crf=16 had already demonstrated. Still
+    # returns 1 (triggering the static fallback) only when literally no
+    # sample ever succeeded, since there is nothing measured to fall
+    # back to in that case.
+    best="$closest"; bv="$cv"; bb="$cb"
+  fi
   [ -n "$best" ] || return 1
   local orig pred
   orig="$(file_size_bytes "$src")"
@@ -1304,9 +1379,15 @@ resolve_crf_for_encode() {  # src codec profile hdr [output-variable]
     warn "VMAF search failed or no CRF met target — fixed CRF $crf"
   else
     read -r crf pred vmaf <<<"$res"
+    # >= target is the common case; the internal search's below-target
+    # fallback (2026-08-16, see its own comment) can hand back a sample
+    # that never reached target — log that distinctly rather than
+    # falsely claiming it met target.
+    local _met_target="< $target (search never converged — best sample used)"
+    awk -v s="$vmaf" -v t="$target" 'BEGIN{exit !(s>=t)}' && _met_target=">= $target"
     case "$pred" in
-      *iB) log_err "VMAF search chose CRF $crf (sample VMAF $vmaf >= $target; predicted video ~$pred)" ;;
-      *)   log_err "VMAF search chose CRF $crf (sample VMAF $vmaf >= $target; predicted $(human_size_bytes "${pred:-0}"))" ;;
+      *iB) log_err "VMAF search chose CRF $crf (sample VMAF $vmaf $_met_target; predicted video ~$pred)" ;;
+      *)   log_err "VMAF search chose CRF $crf (sample VMAF $vmaf $_met_target; predicted $(human_size_bytes "${pred:-0}"))" ;;
     esac
   fi
   VMAF_CRF_CACHE[$key]="$crf"

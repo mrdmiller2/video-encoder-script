@@ -416,7 +416,8 @@ function Get-VesFinalVmaf {
         [int]$TargetHeight = 0,
         [int]$Samples = 3,
         [int]$SampleSeconds = 20,
-        [int]$TimeoutSeconds = 180
+        [int]$TimeoutSeconds = 180,
+        [int]$AlignSearchFrames = 3
     )
     if (-not (Test-Path -LiteralPath $Source) -or -not (Test-Path -LiteralPath $Output)) { return $null }
 
@@ -504,8 +505,43 @@ function Get-VesFinalVmaf {
         $rfrProc.Dispose()
     }
 
+    # Task #172: ffmpeg's MKV muxer relabels Output's PTS with an offset vs
+    # Source (observed 20-40ms) -- both streams below are seeked
+    # independently at the SAME nominal $Start and then have their own PTS
+    # zeroed (setpts=PTS-STARTPTS), so this offset can silently land the two
+    # -ss seeks on different real-content frames.
+    #
+    # First attempt (2026-08-17) measured the Source/Output first-frame PTS
+    # delta once per file and unconditionally compensated the Output-side
+    # seek by it, trusting it as a fixed correction. Real-world test on
+    # PRINCE disproved that: compensating by the measured offset (-ss
+    # 413.979 vs uncompensated 414, a 21ms difference) scored 26.9, while
+    # the SAME window uncompensated scored 72.6 -- worse, not better. A
+    # follow-up controlled sweep (13-point, one frame-duration step each,
+    # same file/window) showed why: the true best alignment is a sharp
+    # single peak sitting at offset=0 for that window, with the score
+    # collapsing by ~50 points within a single frame either side -- not
+    # something a single measured delta can reliably predict, because the
+    # real misalignment isn't a fixed property of the FILE, it can vary
+    # window to window (frame jitter, B-frame reordering, landing near a
+    # scene cut).
+    #
+    # Correct fix: don't guess the offset from metadata at all -- SEARCH for
+    # it. For each sample window, try every whole-frame offset from
+    # -AlignSearchFrames to +AlignSearchFrames (crossed with the existing
+    # fpsFilter axis below, which guards a different, still-real VFR-drift
+    # failure mode) and keep whichever scores highest. Misalignment can only
+    # ever drag a score spuriously low, never inflate it, so taking the max
+    # across every candidate is safe in every direction.
+    $frameDur = 0.0
+    if ($fpsFilter -match '^fps=(\d+)/(\d+),$') {
+        $frameDur = [double]$Matches[2] / [double]$Matches[1]
+    }
+
     $measureOnce = {
-        param($Start, $FilterPrefix)
+        param($Start, $FilterPrefix, $Offset)
+        $outStart = $Start + $Offset
+        if ($outStart -lt 0) { $outStart = 0 }
         $vlogDir = [System.IO.Path]::GetTempPath()
         $vlogName = "ves-vmaf-$([guid]::NewGuid().ToString('N')).json"
         $vlog = Join-Path $vlogDir $vlogName
@@ -520,7 +556,7 @@ function Get-VesFinalVmaf {
         # to the temp folder sidesteps the escaping question entirely --
         # also verified working end-to-end on PRINCE.
         $lavfi = "[0:v]${FilterPrefix}setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]${FilterPrefix}${scaleFilter}setpts=PTS-STARTPTS,format=yuv420p10le[r];[d][r]libvmaf=model=$model`:n_threads=$nThreads`:log_fmt=json:log_path=$vlogName"
-        $ffArgs = @('-y', '-v', 'error', '-ss', "$Start", '-t', "$SampleSeconds", '-i', $Output,
+        $ffArgs = @('-y', '-v', 'error', '-ss', "$outStart", '-t', "$SampleSeconds", '-i', $Output,
             '-ss', "$Start", '-t', "$SampleSeconds", '-i', $Source, '-lavfi', $lavfi, '-f', 'null', '-')
         $run = Invoke-VesProbeFfmpegRun -FfmpegPath $FfmpegPath -Args $ffArgs -TimeoutSeconds $TimeoutSeconds -WorkingDirectory $vlogDir
         if (-not $run.Ok -or -not (Test-Path -LiteralPath $vlog)) {
@@ -538,19 +574,28 @@ function Get-VesFinalVmaf {
         }
     }
 
+    $offsetVariants = @(0.0)
+    if ($frameDur -gt 0.0) {
+        for ($k = -$AlignSearchFrames; $k -le $AlignSearchFrames; $k++) {
+            if ($k -ne 0) { $offsetVariants += ($k * $frameDur) }
+        }
+    }
+    $filterVariants = @('')
+    if ($fpsFilter) { $filterVariants += $fpsFilter }
+
     $vsum = 0.0
     $n = 0
     for ($i = 1; $i -le $nsamples; $i++) {
         $start = [int]([math]::Floor($durInt * (2 * $i - 1) / ($nsamples * 2)))
-        $vPlain = & $measureOnce $start ''
-        $vFps = $null
-        if ($fpsFilter) { $vFps = & $measureOnce $start $fpsFilter }
-        $v = $null
-        if ($null -ne $vPlain -and $null -ne $vFps) { $v = [math]::Max($vPlain, $vFps) }
-        elseif ($null -ne $vPlain) { $v = $vPlain }
-        elseif ($null -ne $vFps) { $v = $vFps }
-        if ($null -eq $v) { continue }
-        $vsum += $v
+        $best = $null
+        foreach ($off in $offsetVariants) {
+            foreach ($ff in $filterVariants) {
+                $vTry = & $measureOnce $start $ff $off
+                if ($null -ne $vTry -and ($null -eq $best -or $vTry -gt $best)) { $best = $vTry }
+            }
+        }
+        if ($null -eq $best) { continue }
+        $vsum += $best
         $n++
     }
     if ($n -eq 0) { return $null }

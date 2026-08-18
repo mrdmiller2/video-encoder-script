@@ -6,7 +6,7 @@
 # MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
 # bug fix) -- see its own comment.
 
-VERSION="5.1.1B"
+VERSION="5.1.1C"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
 # as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
@@ -394,6 +394,15 @@ VMAF_TARGET_VTV="${CONVERT_VMAF_TARGET_VTV:-94.0}"
 VMAF_TARGET_4K="${CONVERT_VMAF_TARGET_4K:-95.0}"  # scored with the 4K model
 VMAF_SAMPLES="${CONVERT_VMAF_SAMPLES:-3}"
 VMAF_SAMPLE_SECS="${CONVERT_VMAF_SAMPLE_SECS:-20}"
+# Task #172: per-sample-window local search radius (in whole frames) for the
+# src/out seek-alignment fix in ves-vmaf-crf-search.sh's _vmaf_compare_window.
+# A real sweep test (2026-08-17, PRINCE, Falling Skies) showed the true best
+# alignment is a sharp single peak that can sit anywhere within a few frames
+# of the nominal timestamp -- not a fixed measured offset -- so the fix
+# searches -N..+N frame-durations and keeps whichever scores highest. 3 was
+# chosen as a safety margin around the widest real misalignment observed (~1
+# frame); raise if a future case needs more.
+VMAF_ALIGN_SEARCH_FRAMES="${CONVERT_VMAF_ALIGN_SEARCH_FRAMES:-3}"
 VMAF_SEARCH_MIN_CRF=16
 VMAF_SEARCH_MAX_CRF=46
 VMAF_DISABLED=false                               # --no-vmaf

@@ -4,6 +4,71 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.1C — 2026-08-17
+
+**Fixed the real-encode VMAF muxer-timestamp measurement bug (task #172)**,
+found at scale while investigating why nearly every episode of Falling
+Skies (2011) — an entire 52-episode series turned up by a fleet-wide
+library re-scan, unrelated to the original 38-file backlog — was landing
+well below the VMAF 85 floor despite CRF-search predicting healthy
+quality.
+
+**Root cause**: `measure_final_vmaf()`/`_vmaf_compare_window_once()`
+(`modules/ves-vmaf-crf-search.sh`, and the PowerShell port `Get-VesFinalVmaf`
+in `windows/modules/VesVmafCrfSearch.psm1`) seek into source and output
+independently at the same nominal `-ss` timestamp, then zero each stream's
+own PTS (`setpts=PTS-STARTPTS`). ffmpeg's MKV muxer relabels the output's
+PTS with an offset vs the source (observed 20-43ms), so "the same nominal
+timestamp" can land on genuinely different real-content frames between the
+two files — invisible on static content, severe on fast motion.
+
+**Two design iterations were tried and disproven by real tests before
+landing on the fix that shipped**:
+1. Measuring the src/out first-frame PTS delta once per file and
+   compensating the output-side seek by it unconditionally. A real test on
+   PRINCE showed this made one file's measurement dramatically *worse*
+   (72.6 → 26.9 for the same sample window).
+2. `max(uncompensated, measured-offset)` — extending the existing
+   VFR/fps_filter "take the higher of two measurements" safety pattern to
+   the offset axis. This fixed the one case tested, but a follow-up
+   13-point offset sweep on the same window revealed the true best
+   alignment is a sharp single peak (collapsing ~50 VMAF points within one
+   frame either side) that can sit anywhere nearby — not something a single
+   guessed offset can reliably predict, because the real misalignment isn't
+   a fixed property of the file, it varies window to window (frame jitter,
+   B-frame reordering, scene cuts).
+
+**The fix that shipped**: don't guess the offset at all — for each sample
+window, SEARCH every whole-frame offset from `-VMAF_ALIGN_SEARCH_FRAMES` to
+`+VMAF_ALIGN_SEARCH_FRAMES` (new config, default 3; `-AlignSearchFrames` on
+the Windows side) crossed with the existing plain/fps-filter axis, and keep
+whichever scores highest. Misalignment can only ever drag a score
+spuriously low, never inflate it, so taking the max across every candidate
+in the search is safe in every direction. Verified against 4 real cases:
+a genuinely-bad pre-v5.1.1B output correctly stayed low (73.9, still
+flagged for review), a genuinely-good fresh output scored 94.7, the PRINCE
+regression case recovered to 94.5, and an unrelated known-good file stayed
+a healthy, non-inflated 93.6 (regression check).
+
+A separate hypothesis — whether the existing `measure_source_baseline_vmaf()`
+self-vs-self sanity check could predict which files would hit this bug —
+was tested and disproven (Falling Skies and an unaffected control file
+scored nearly identically, ~99 and ~98.5): comparing a file against itself
+is trivially perfectly aligned by construction, so it structurally cannot
+surface a cross-file muxer offset. Kept for its own real purpose (single-file
+VFR/timing irregularity detection); not applicable to this bug.
+
+**Cost**: real and accepted deliberately — up to 7 offsets × 2 fps-filter
+variants × 3 sample windows = 42 ffmpeg passes, ~5-8 minutes per
+`measure_final_vmaf()` call on modest hardware. This runs once per
+completed file as a diagnostic tag, not on any hot path.
+
+**Not yet done**: files already flagged `NEEDS REVIEW`/low-quality before
+this fix landed were measured with the old broken comparator and were never
+automatically re-evaluated — re-running the fixed measurement against that
+backlog to clear likely-false-positive flags is an open decision, not yet
+actioned.
+
 ## v5.1.1B — 2026-08-16
 
 **Root cause found and fixed for the v5.1.1A frame-duplication defect** —
