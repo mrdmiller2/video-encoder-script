@@ -4,6 +4,64 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.1G — 2026-08-19
+
+**Closed a real Windows/bash feature-parity gap, user-flagged as high
+severity**: the proactive per-source VFR/CFR detection + baseline
+self-VMAF check (`detect_frame_rate_mode()` / `measure_source_baseline_vmaf()`,
+bash's `modules/ves-source-traits.sh`, shipped v5.1.0W) had **no Windows
+port at all** — confirmed via an exhaustive grep of every `.psm1` module
+on a live fleet machine, zero hits for `frame_rate_mode`/`avg_cv`/`VFR_CV`.
+Found while running a VFR-source hunt on Windows: every single one of 8
+real dry-run scans came back "no result" — not because those files were
+CFR/VFR either way, but because the check the scan was looking for simply
+didn't exist on that platform.
+
+**Not a quality-safety hole in the comparison math itself** — the
+VMAF-VFR false-positive fix (v5.1.0S/T's measure-both-ways-take-max
+frame-rate normalization) was already correctly ported and present in
+`Get-VesFinalVmaf` (`windows/modules/VesVmafCrfSearch.psm1`). What was
+missing was the *proactive detection/logging/ambiguous-flagging* layer
+that runs before CRF search, giving early visibility into a source's
+frame-timing characteristics rather than only reacting after a VMAF
+score comes back suspicious.
+
+**Fixed**, reusing already-ported helpers rather than duplicating logic:
+- `Get-VesSourceFrameRateMode` (port of `detect_frame_rate_mode()`) —
+  reuses the already-ported `Get-VesComplexitySamplePoints` (3-point
+  low/median/high sampling, same one used for the AV1-vs-x265 bake-off)
+  and `Get-VesDtsDeltaCv` (already existed, used for the separate
+  output-side duplicate-frame check). New code needed was genuinely
+  small: the CV-threshold classification and caching.
+- `Get-VesSourceBaselineVmaf` (port of `measure_source_baseline_vmaf()`)
+  — thin cached wrapper around the already-verified `Get-VesFinalVmaf`,
+  self-vs-self comparison.
+- `Write-VesSourceTraitsAmbiguousFlag` (port of
+  `flag_source_traits_ambiguous()`, `windows/modules/VesValidation.psm1`)
+  — same one-file-per-entry pattern as the existing
+  `Write-VesLowQualityFlag`/`Write-VesBadSourceFlag` (a shared-file
+  append is unreliable on this NAS from Windows clients, confirmed in
+  production 2026-08-06).
+- Wired into `convert.ps1` at the exact point bash's `ffmpeg_encode()`
+  calls the equivalent pair — after HDR-mode resolution, before CRF
+  search, on `$videoSrc` (the actual pixels the encode uses, not the
+  possibly-QTGMC-substituted `$EncodeSource`).
+
+**Verified live against real production data on RANDYJ**: `Get-VesSourceFrameRateMode`
+against Highwaymen (2004) returned `cfr (avg_cv=0.0109 windows=3)` —
+numerically identical to bash's result on the same file.
+
+**Related, smaller finding, not fixed this release**: Windows's `-DryRun`
+bails out at `Invoke-VesFileJob` (before any profile/HDR/CRF/traits work
+runs at all), while bash's `--dry-run` reaches much deeper into the
+per-file pipeline. This meant testing the new functions required a
+direct function call rather than `-DryRun` end-to-end — flagged as a
+separate, smaller parity item for a future pass, not addressed here.
+
+No bash changes this release (Windows-only fix) — version bumped anyway
+to keep bash/Windows on one shared version number, per standing
+convention.
+
 ## v5.1.1F — 2026-08-19
 
 **Second pass of the same NAS-load/RAM-disk audit** (a full sweep of every

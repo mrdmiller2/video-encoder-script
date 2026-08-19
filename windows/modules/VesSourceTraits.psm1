@@ -17,6 +17,9 @@ if (-not (Get-Module -Name VesTimeoutRetry)) {
 if (-not (Get-Module -Name VesValidation)) {
     Import-Module (Join-Path $PSScriptRoot 'VesValidation.psm1') -Force
 }
+if (-not (Get-Module -Name VesVmafCrfSearch)) {
+    Import-Module (Join-Path $PSScriptRoot 'VesVmafCrfSearch.psm1') -Force
+}
 
 # Source-traits classification thresholds -- same values as
 # modules/ves-config.sh's SOURCE_TRAITS_* constants, kept in lockstep by
@@ -28,9 +31,24 @@ $script:SourceTraitsTelecineRepeatMax = 0.30
 $script:SourceTraitsInterlaceMin = 0.10
 $script:SourceTraitsWindowSpreadMax = 0.25
 $script:SourceTraitsBwSatavgMax = 4.0
+# SOURCE_TRAITS_VFR_CV_MAX / SOURCE_BASELINE_VMAF_MIN in ves-config.sh --
+# added 2026-08-19 to close a real Windows/bash parity gap: this whole
+# proactive per-source VFR/CFR detection + baseline self-VMAF check
+# (bash's detect_frame_rate_mode()/measure_source_baseline_vmaf(),
+# ves-source-traits.sh, shipped v5.1.0W) had no Windows port at all until
+# now -- the VMAF-comparison frame-rate normalization itself was already
+# ported (Get-VesFinalVmaf's measure-both-ways-take-max fps handling), so
+# this closes the PROACTIVE detection/logging/ambiguous-flagging layer on
+# top of that, not a quality-safety hole in the comparison math itself.
+$script:SourceTraitsVfrCvMax = 0.05
+$script:SourceBaselineVmafMin = 97.0
 
 # $Source -> cached [PSCustomObject]@{ FieldMode; IsBw; FieldOrder }
 $script:SourceTraitsCache = @{}
+# $Source -> cached 'cfr'|'vfr'|'unknown'
+$script:FrameRateModeCache = @{}
+# $Source -> cached [double] baseline self-VMAF
+$script:BaselineVmafCache = @{}
 
 function Get-VesDtsDeltaCv {
     <#
@@ -78,6 +96,105 @@ function Get-VesDtsDeltaCv {
     foreach ($d in $deltas) { $sumSq += [math]::Pow($d - $mean, 2) }
     $stdev = [math]::Sqrt($sumSq / $deltas.Count)
     return ($stdev / $mean)
+}
+
+function Get-VesSourceFrameRateMode {
+    <#
+    .SYNOPSIS
+    Windows port of detect_frame_rate_mode() (ves-source-traits.sh) --
+    2026-08-19 parity fix, the proactive per-source CFR/VFR classification
+    had no Windows port at all before this. Reuses Get-VesComplexitySamplePoints
+    for sample windows (same 3-point low/median/high spread already used
+    for the CRF-search bake-off, not a second independent sampling pass)
+    and Get-VesDtsDeltaCv for the actual measurement. Cached -- safe to
+    call repeatedly.
+
+    .OUTPUTS
+    'cfr' | 'vfr' | 'unknown' (no usable probe windows)
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$FfprobePath
+    )
+    if ($script:FrameRateModeCache.ContainsKey($Source)) {
+        return $script:FrameRateModeCache[$Source]
+    }
+
+    $dur = Get-VesMediaDurationSeconds -Path $Source -FfprobePath $FfprobePath
+    $starts = $null
+    if ($dur -and $dur -gt 0) {
+        $starts = Get-VesComplexitySamplePoints -Source $Source -Duration $dur -FfprobePath $FfprobePath
+    }
+    if (-not $starts) {
+        $durOrZero = if ($dur) { $dur } else { 0 }
+        $starts = @([math]::Max(0, $durOrZero / 2))
+    }
+
+    $width = $script:SourceTraitsProbeWidthSecs
+    $cvs = [System.Collections.Generic.List[double]]::new()
+    foreach ($start in $starts) {
+        $cv = Get-VesDtsDeltaCv -Source $Source -Start $start -Width $width -FfprobePath $FfprobePath
+        if ($null -ne $cv) { $cvs.Add($cv) }
+    }
+
+    $mode = 'unknown'
+    if ($cvs.Count -gt 0) {
+        $avgCv = ($cvs | Measure-Object -Average).Average
+        $mode = if ($avgCv -le $script:SourceTraitsVfrCvMax) { 'cfr' } else { 'vfr' }
+        Write-Host "Source frame-rate mode: $Source -> $mode (avg_cv=$('{0:F4}' -f $avgCv) windows=$($cvs.Count))"
+    } else {
+        Write-Warning "Source frame-rate mode: no usable probe windows for $Source -- unknown"
+    }
+    $script:FrameRateModeCache[$Source] = $mode
+    return $mode
+}
+
+function Get-VesSourceBaselineVmaf {
+    <#
+    .SYNOPSIS
+    Windows port of measure_source_baseline_vmaf() (ves-source-traits.sh)
+    -- 2026-08-19 parity fix, no Windows port existed before this. Measures
+    $Source's VMAF against itself: a pure measurement-methodology sanity
+    check (identical content, a healthy source should score ~100), not a
+    real quality assessment. Confirms the comparison technique actually
+    works for THIS source's specific frame-timing characteristics before
+    any later encode-vs-source comparison is trusted for it. Reuses
+    Get-VesFinalVmaf unchanged (same measure-both-ways-take-max fps
+    handling already hardened for the VMAF-VFR bug) rather than
+    duplicating VMAF-comparison logic. Cached -- safe to call repeatedly.
+    A source that fails this baseline gets flagged for human review via
+    Write-VesSourceTraitsAmbiguousFlag immediately, instead of silently
+    producing a misleading low "quality" number after a real encode.
+
+    .OUTPUTS
+    [double] VMAF score, or $null if it couldn't be measured at all.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$FfmpegPath,
+        [Parameter(Mandatory)][string]$FfprobePath,
+        [string]$JobSidecarDir
+    )
+    if ($script:BaselineVmafCache.ContainsKey($Source)) {
+        return $script:BaselineVmafCache[$Source]
+    }
+    if (-not (Test-Path -LiteralPath $Source)) { return $null }
+
+    $vmaf = Get-VesFinalVmaf -Source $Source -Output $Source -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -TargetHeight 0
+    if ($null -eq $vmaf) { return $null }
+
+    $script:BaselineVmafCache[$Source] = $vmaf
+    if ($vmaf -lt $script:SourceBaselineVmafMin) {
+        $frMode = Get-VesSourceFrameRateMode -Source $Source -FfprobePath $FfprobePath
+        Write-Warning "Source baseline VMAF LOW: $Source -> $vmaf (below $($script:SourceBaselineVmafMin) -- measurement methodology unreliable for this source)"
+        if ($JobSidecarDir) {
+            Write-VesSourceTraitsAmbiguousFlag -JobSidecarDir $JobSidecarDir -SourcePath $Source `
+                -Detail "baseline self-VMAF $vmaf below $($script:SourceBaselineVmafMin) -- frame_rate_mode=$frMode"
+        }
+    } else {
+        Write-Host "Source baseline VMAF: $Source -> $vmaf"
+    }
+    return $vmaf
 }
 
 function Get-VesOutputFrameDuplication {
@@ -405,4 +522,4 @@ function Get-VesSourceTraits {
     return $result
 }
 
-Export-ModuleMember -Function Get-VesComplexitySamplePoints, Invoke-VesIdetProbeWindow, Invoke-VesSignalstatsProbeWindow, Get-VesSourceTraits, Get-VesDtsDeltaCv, Get-VesOutputFrameDuplication
+Export-ModuleMember -Function Get-VesComplexitySamplePoints, Invoke-VesIdetProbeWindow, Invoke-VesSignalstatsProbeWindow, Get-VesSourceTraits, Get-VesDtsDeltaCv, Get-VesOutputFrameDuplication, Get-VesSourceFrameRateMode, Get-VesSourceBaselineVmaf

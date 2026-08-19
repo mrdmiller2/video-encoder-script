@@ -194,6 +194,48 @@ function Write-VesLowQualityFlag {
     Set-VesEveryoneReadWrite -Path $entryPath
 }
 
+function Write-VesSourceTraitsAmbiguousFlag {
+    <#
+    .SYNOPSIS
+    Port of bash's flag_source_traits_ambiguous() (ves-source-traits.sh) --
+    NOT the same as Write-VesBadSourceFlag: an ambiguous source-traits read
+    means "don't auto-apply IVTC/deinterlace, and don't trust a VMAF
+    comparison against this source without a human look" -- it still
+    encodes normally, the source stays exactly where it is. Same
+    one-file-per-entry pattern as Write-VesLowQualityFlag, same NAS-append
+    unreliability this port is built around (see that function's docs) --
+    reused here rather than re-derived, 2026-08-19 Windows/bash parity
+    fix (this whole detection path had no Windows port at all until now).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$JobSidecarDir,
+        [Parameter(Mandatory)][string]$SourcePath,
+        [Parameter(Mandatory)][string]$Detail
+    )
+    Write-Warning "Source traits ambiguous -- auto-detelecine/deinterlace skipped, needs human review: $SourcePath ($Detail)"
+    if (-not (Test-Path -LiteralPath $JobSidecarDir -PathType Container)) {
+        Write-Warning "Source-traits-ambiguous flag: sidecar directory does not exist, cannot record -- $JobSidecarDir"
+        return
+    }
+    $token = [System.IO.Path]::GetRandomFileName() -replace '[.]', ''
+    $entryPath = Join-Path $JobSidecarDir "source_traits_ambiguous-$env:COMPUTERNAME-$PID-$token.traits-flag"
+    $line = "{0}`t{1}`t{2}`n" -f (Get-Date -AsUTC -Format 'yyyy-MM-ddTHH:mm:ssZ'), $SourcePath, $Detail
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($line)
+    try {
+        $fs = $null
+        try {
+            $fs = [System.IO.File]::Open($entryPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
+            $fs.Write($bytes, 0, $bytes.Length)
+        } finally {
+            if ($fs) { $fs.Close() }
+        }
+    } catch {
+        Write-Warning "Could not write source-traits-ambiguous flag to $entryPath -- $_"
+        return
+    }
+    Set-VesEveryoneReadWrite -Path $entryPath
+}
+
 function Write-VesBadSourceFlag {
     <#
     .SYNOPSIS
@@ -321,4 +363,4 @@ function Find-VesExistingValidOutput {
 
 Export-ModuleMember -Function Get-VesMediaDurationSeconds, Test-VesDurationsMatch, `
     Test-VesMkvStructureValid, Test-VesPathIsReparsePoint, Write-VesLowQualityFlag, Write-VesBadSourceFlag, `
-    Find-VesExistingValidOutput
+    Write-VesSourceTraitsAmbiguousFlag, Find-VesExistingValidOutput

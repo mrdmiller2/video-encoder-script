@@ -347,6 +347,20 @@ function Invoke-VesCodecEncodeAttempt {
     $fixedCrf = Get-VesProfileFixedCrf -Codec $Codec -Profile $profile -IsHdr $isHdr
     Write-VesLog "Profile: $profile  Codec: $Codec  HDR: $hdrMode  Upscale target: $upscaleTarget"
 
+    # Frame-rate mode + baseline self-VMAF (2026-08-19 Windows/bash parity
+    # fix -- mirrors modules/ves-twostage-encode.sh's ffmpeg_encode()
+    # exactly; this whole check had no Windows port at all before now).
+    # Unconditional across every profile, not just vintage -- the
+    # VMAF-VFR false-positive bug this guards against hit modern-profile
+    # titles too. Runs on $videoSrc (the actual pixels the CRF search and
+    # final encode use), same reasoning as the QTGMC substitution above,
+    # so a source that fails its own baseline gets flagged before
+    # Resolve-VesCrfForEncode ever trusts a comparison against it.
+    # Read-only probing, safe under -DryRun.
+    $sourceJobSidecarDir = Split-Path -Parent $EncodeSource
+    [void](Get-VesSourceFrameRateMode -Source $videoSrc -FfprobePath $FfprobePath)
+    [void](Get-VesSourceBaselineVmaf -Source $videoSrc -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -JobSidecarDir $sourceJobSidecarDir)
+
     if ($Codec -eq 'av1') {
         $svtParams = Get-VesProfileSvtParams -Profile $profile -FfmpegPath $FfmpegPath
         # $videoSrc (not $EncodeSource): the VMAF sample-encode this search
