@@ -27,7 +27,16 @@ function Invoke-VesWithTimeoutRetry {
     #      ReadToEndAsync() instead, which has no PowerShell-event-loop
     #      dependency, and racing it against WaitForExit via
     #      [Task]::WaitAll with the same timeout.
+    # Grows the timeout on each retry (doubling) instead of reusing the
+    # same budget every attempt (2026-08-18 fix, matching bash's
+    # _run_timeout_retry). Found via a real movie-length stress test: a
+    # large source's validation call hit its size-scaled timeout and
+    # still timed out after every retry, all at the identical budget --
+    # retrying can never help when the budget itself is the problem.
+    # Doubling self-corrects for per-file throughput variance beyond what
+    # any single size-based estimate can promise.
     $attempt = 0
+    $currentTimeout = $TimeoutSeconds
     while ($true) {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = $FilePath
@@ -45,7 +54,7 @@ function Invoke-VesWithTimeoutRetry {
             $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
             $stderrTask = $proc.StandardError.ReadToEndAsync()
 
-            $finished = $proc.WaitForExit($TimeoutSeconds * 1000)
+            $finished = $proc.WaitForExit($currentTimeout * 1000)
             if (-not $finished) {
                 try { $proc.Kill($true) } catch { }
                 $proc.WaitForExit()
@@ -61,6 +70,7 @@ function Invoke-VesWithTimeoutRetry {
                         TimedOut = $true
                     }
                 }
+                $currentTimeout = $currentTimeout * 2
                 continue
             }
 

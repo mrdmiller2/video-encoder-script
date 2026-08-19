@@ -244,6 +244,20 @@ run_ffmpeg_remux() { _run_timeout_retry "$(_remux_timeout_for_args "$@")" "${FFM
 # caller redirected to a file or captured via `$(...)`, without needing to
 # touch every call site individually.
 _run_timeout_retry() {
+  # Grows the timeout on each retry (doubling) instead of reusing the same
+  # budget every attempt (2026-08-18 fix). Found via a real movie-length
+  # stress test: a 7.76GB source's mkvalidator call hit the size-scaled
+  # timeout (~47min, per _validation_timeout_for_args) and STILL timed out
+  # after all VALIDATION_TIMEOUT_RETRIES=2 retries -- 3 total attempts, all
+  # at the identical timeout, so retrying provided zero additional headroom
+  # and the file was permanently skipped despite being a perfectly valid
+  # source. The per-GiB rate has already been tuned twice against real
+  # library-wide size data (2026-07-26/27) and stayed well-justified for
+  # the size distribution it targets, but per-file throughput genuinely
+  # varies beyond what any single size-based estimate can promise (content
+  # structure, transient NFS load, etc.) -- a retry that repeats an already-
+  # inadequate budget can never help. Doubling self-corrects for that
+  # variance without needing to keep re-guessing a static formula.
   local timeout_s="$1" attempt=0 rc out_tmp err_tmp
   shift
   out_tmp="$(mktemp)" || { run_with_timeout "$timeout_s" "$@"; return $?; }
@@ -271,6 +285,7 @@ _run_timeout_retry() {
       rm -f -- "$out_tmp" "$err_tmp"
       return "$rc"
     fi
+    timeout_s=$((timeout_s * 2))
     : >"$out_tmp"
     : >"$err_tmp"
   done

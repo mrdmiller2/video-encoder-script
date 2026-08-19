@@ -4,6 +4,41 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.1D — 2026-08-18
+
+**Fixed a real validation-retry bug found during a 20-file movie-length
+fleet stress test**: `_run_timeout_retry` (bash) / `Invoke-VesWithTimeoutRetry`
+(Windows) -- the shared timeout-wrapped-retry helper behind `mkvalidator`,
+`ffprobe`, `mkvmerge`, and bounded validation `ffmpeg` calls -- retried a
+timed-out call up to `VALIDATION_TIMEOUT_RETRIES` times using the exact
+same timeout budget on every attempt. Found live: a 7.76GB movie source's
+`mkvalidator` structural check hit its size-scaled timeout (~47 minutes,
+per `_validation_timeout_for_args`) and timed out identically on all 3
+attempts (1 initial + 2 retries), permanently skipping a perfectly valid
+source file with "possible stalled mount" -- even though the file was
+never actually stalled, it just needed more time than a single identical
+retry could ever provide. The per-GiB timeout formula has already been
+tuned twice against real library-wide size data (2026-07-26/27) and stays
+well-justified for the size distribution it targets; per-file throughput
+still varies beyond what any single size-based estimate can promise
+(content structure, transient NFS load), so retrying with an *identical*
+budget can structurally never help when the budget itself was the
+problem. **The fix**: each retry now doubles the timeout instead of
+reusing it, self-correcting for that variance without needing to keep
+re-guessing a static formula. Same fix applied on both platforms.
+
+Also investigated during the same stress test and found to be a
+pre-existing, separate gap (not caused by this fix, not fixed this
+release): Windows-side encodes never get an embedded `VES_PROCESSED`
+quality tag the way bash's `write_ves_processed_tag` always writes one --
+turns out no MKVToolNix (`mkvmerge.exe`/`mkvpropedit.exe`) is provisioned
+on any Windows fleet machine, so there's no tool available to perform the
+tag write with at all, not just missing code. The safety-critical behavior
+(flagging genuinely below-floor encodes for human review via
+`Write-VesLowQualityFlag`) is unaffected and confirmed still working
+correctly. Deploying MKVToolNix to the Windows fleet is a real scoped task
+of its own if full tag parity is wanted later.
+
 ## v5.1.1C — 2026-08-17
 
 **Fixed the real-encode VMAF muxer-timestamp measurement bug (task #172)**,
