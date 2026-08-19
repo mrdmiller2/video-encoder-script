@@ -513,11 +513,20 @@ ffmpeg_encode() {
   # The old "retry without subtitles" still makes sense, but only as a
   # stage-2 fallback: odd subtitle codecs can still make the remux header
   # fail, and rerunning the expensive encode would be wasteful.
-  local errbase encode_errfile remux_errfile retry_errfile stage1
+  # Live ffmpeg stderr (real, continuous writes every ~0.5s for the whole
+  # encode -- confirmed empirically 2026-08-19, not just a one-shot summary)
+  # goes to the SAME local/ramdisk directory $dst already stages to, not
+  # the NAS sidecar -- a multi-hour encode was otherwise generating steady
+  # NFS write traffic for a diagnostic stream nobody reads while the job is
+  # healthy. Only copied back to the real NAS sidecar (nas_errbase below)
+  # if it turns out to hold something worth a human reading: non-empty (a
+  # real warning) or the job failed. User direction 2026-08-19: only
+  # lock/progress/human-inspection files (this NAS copy, when made) belong
+  # on the NAS; everything else "live" during the encode stays local.
+  local errbase nas_errbase encode_errfile remux_errfile retry_errfile stage1
   local -a remux_args remux_color_args
-  errbase="${JOB_SIDECAR_DIR:-/tmp}/ffmpeg-logs"
-  ensure_shared_sidecar_dir "$errbase"
-  errbase="${errbase}/$(canonical_title_from_source "$src").$$"
+  errbase="$(dirname -- "$dst")/$(canonical_title_from_source "$src").$$"
+  nas_errbase="${JOB_SIDECAR_DIR:-/tmp}/ffmpeg-logs/$(canonical_title_from_source "$src").$$"
   encode_errfile="${errbase}.stderr.log"
   remux_errfile="${errbase}.remux.stderr.log"
   retry_errfile="${errbase}.remux-nosubs.stderr.log"
@@ -663,16 +672,22 @@ ffmpeg_encode() {
       QTGMC_FINAL_VMAF_VALUE="$_qtgmc_final_vmaf"
     fi
   fi
-  # Script cleans up after itself: a clean encode with nothing logged at
-  # -v warning gets its (empty) stderr file removed rather than left as
-  # permanent per-title clutter. Anything actually written to it survives
-  # -- that's a real warning trail worth keeping regardless of whether the
+  # A clean encode with nothing logged at -v warning gets its (empty)
+  # stderr file discarded rather than left as permanent per-title clutter.
+  # Anything actually written to it, or any file from a FAILED attempt
+  # (rc!=0), is copied to the real NAS sidecar for human review -- that's
+  # a real warning/failure trail worth keeping regardless of whether the
   # audio-truncation validation gate below happens to catch this instance.
-  if [ "$rc" -eq 0 ]; then
-    [ ! -s "$encode_errfile" ] && rm -f -- "$encode_errfile" 2>/dev/null
-    [ ! -s "$remux_errfile" ] && rm -f -- "$remux_errfile" 2>/dev/null
-    [ ! -s "$retry_errfile" ] && rm -f -- "$retry_errfile" 2>/dev/null
-  fi
+  # Must run here, before the ramdisk-staging-dir cleanup below, since
+  # these local log files live in the same directory being torn down.
+  local _errf
+  for _errf in "$encode_errfile" "$remux_errfile" "$retry_errfile"; do
+    if [ -s "$_errf" ]; then
+      ensure_shared_sidecar_dir "$(dirname -- "$nas_errbase")"
+      cp -f -- "$_errf" "$(dirname -- "$nas_errbase")/$(basename -- "$_errf")" 2>/dev/null
+    fi
+    rm -f -- "$_errf" 2>/dev/null
+  done
   rm -f -- "$stage1" 2>/dev/null
   ACTIVE_FFMPEG_STAGE1_FILE=""
   if [ "$rc" -eq 0 ] && [ "$dst" != "$real_dst" ]; then

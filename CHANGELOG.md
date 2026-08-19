@@ -4,6 +4,48 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.1E — 2026-08-19
+
+**Routed live ffmpeg diagnostic stderr off the NAS onto local/RAM-disk
+staging (both platforms)**, found while investigating a user report that
+RAM-disk utilization looked low during a 9-machine weighted stress test
+even though it's meant to be the primary "write path" of encoding.
+
+Direct empirical test (`-v warning -stats` piped through the same
+`tee`/process-substitution pattern the pipeline uses) confirmed
+`_run_capturing_stderr`'s per-title stderr log grows continuously
+throughout an encode — roughly one write every ~0.5s, for however long the
+real encode runs (hours, on this fleet's slower machines). `errbase`
+resolved through `${JOB_SIDECAR_DIR:-/tmp}/ffmpeg-logs`, which for a plain
+NFS-mounted source defaults to `JOB_ROOT` — the NAS folder next to the
+source — so every one of those periodic writes was a real, avoidable NFS
+write for a diagnostic stream nobody reads while the job is healthy. Same
+gap existed on Windows: `VesTwoStageEncode.psm1`'s stderr log shared
+`$ErrorLogDir` (also NAS) with the `-progress` file.
+
+Fixed by routing the live stderr tee to the same local/ramdisk directory
+the encode's own binary output already stages to (`dirname "$dst"` in
+bash, `Split-Path -Parent $writeDst` in PowerShell) — no new staging
+machinery needed, it's the exact directory `resolve_encode_stage_path`/
+`Resolve-VesEncodeStagePath` already resolved for this job. The finished
+log is copied back to the real NAS sidecar only if it's non-empty (a real
+warning, worth a human look) — matching the pre-existing "empty logs get
+discarded" policy on both platforms, just now decided locally instead of
+on every live append.
+
+**Explicit scope, per user direction (2026-08-19)**: only files that
+block multi-connections (title-lock directories), track progress
+(resume-state/done-log, the Windows `-progress` file), or exist for human
+inspection (`bad_sources.txt`, `corrupt_files.txt`, etc.) belong on the
+NAS. Everything else "live" during the encode — this diagnostic stderr
+stream — now stays local. The `-progress` file and all resume-state/
+lock/audit-trail files are unchanged by this fix; only the stderr log
+moved. Verified via `bash -n` / the PowerShell language parser on both
+modified files; not yet exercised by a real fleet encode (the concurrent
+9-machine weighted stress test was already running v5.1.1D when this
+landed and was left alone — this fix ships in v5.1.1E for the next round
+of jobs).
+
 ## v5.1.1D — 2026-08-18
 
 **Fixed a real validation-retry bug found during a 20-file movie-length

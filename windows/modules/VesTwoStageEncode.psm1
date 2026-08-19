@@ -116,9 +116,18 @@ function Invoke-VesTwoStageEncode {
     New-Item -ItemType Directory -Path $ErrorLogDir -Force -ErrorAction SilentlyContinue | Out-Null
     Set-VesEveryoneReadWrite -Path $ErrorLogDir
     $errBase = Join-Path $ErrorLogDir "$titleTag.$pidTag"
-    $encodeErrFile = "$errBase.stderr.log"
-    $remuxErrFile = "$errBase.remux.stderr.log"
-    $retryErrFile = "$errBase.remux-nosubs.stderr.log"
+    # ffmpeg's own -progress <file> (2026-08-19): writes machine-readable
+    # frame=/out_time_ms=/speed=/progress= key-value blocks to this path
+    # directly via ffmpeg's own file I/O, completely independent of
+    # Invoke-VesTrackedProcess's stdout/stderr capture (which uses
+    # ReadToEndAsync -- only returns data when the process exits, so
+    # -stats alone never gave live progress on this platform despite
+    # already being passed). Lets Get-VesFfmpegProgress (VesTrackedProcess.psm1)
+    # report real mid-encode metrics and detect a genuinely stuck process
+    # (file stops updating) as distinct from "just slow" (file keeps
+    # updating, CPU usage alone can't tell the two apart).
+    $encodeProgressFile = "$errBase.progress.log"
+    $remuxProgressFile = "$errBase.remux.progress.log"
 
     # Stage to a private, unpredictable path (ramdisk if available and it
     # fits, else local disk) rather than writing straight to the final,
@@ -131,6 +140,20 @@ function Invoke-VesTwoStageEncode {
     if (-not $writeDst) {
         return [PSCustomObject]@{ Success = $false; ExitCode = 1; Stage = 'stage-path' }
     }
+    # Live ffmpeg stderr goes to the same local/ramdisk directory $writeDst
+    # already stages the encode output to, not the NAS $ErrorLogDir -- a
+    # multi-hour encode was otherwise generating steady NFS/SMB write
+    # traffic for a diagnostic stream nobody reads while the job is
+    # healthy (bash-side fix, same finding, 2026-08-19). Only copied back
+    # to the real NAS sidecar ($errBase) at the end if non-empty (a real
+    # warning) or the job failed -- see the copy-back block below. The
+    # -progress files above stay on $ErrorLogDir unchanged: per explicit
+    # user direction, progress/lock/human-inspection files belong on the
+    # NAS, only the "live" diagnostic stream moves local.
+    $localErrBase = Join-Path (Split-Path -Parent $writeDst) "$titleTag.$pidTag"
+    $encodeErrFile = "$localErrBase.stderr.log"
+    $remuxErrFile = "$localErrBase.remux.stderr.log"
+    $retryErrFile = "$localErrBase.remux-nosubs.stderr.log"
 
     $stage1 = "$writeDst.video-audio-only.$pidTag"
 
@@ -169,7 +192,7 @@ function Invoke-VesTwoStageEncode {
         # frame rate instead. See ves-twostage-encode.sh's matching comment
         # for the full isolation writeup (bash and this port share the
         # same defect since both use ffmpeg/libsvtav1 the same way here).
-        $stage1Args += @('-max_muxing_queue_size', '8192', '-fps_mode', 'cfr', '-f', 'matroska', $stage1)
+        $stage1Args += @('-max_muxing_queue_size', '8192', '-fps_mode', 'cfr', '-progress', $encodeProgressFile, '-f', 'matroska', $stage1)
 
         Write-Host "ffmpeg encode stage 1/2 (video+audio only): $([System.IO.Path]::GetFileName($Source))"
         $encodeResult = Invoke-VesTrackedProcess -FilePath $FfmpegPath -ArgumentList $stage1Args -ErrorLogPath $encodeErrFile
@@ -202,7 +225,7 @@ function Invoke-VesTwoStageEncode {
         $remuxArgs += @('-c:a', 'copy')
         $remuxArgs += $subArgs
         $remuxArgs += @('-max_muxing_queue_size', '8192', '-fps_mode', 'passthrough',
-            '-max_interleave_delta', '1000000', '-flush_packets', '1', '-f', 'matroska', $writeDst)
+            '-max_interleave_delta', '1000000', '-flush_packets', '1', '-progress', $remuxProgressFile, '-f', 'matroska', $writeDst)
 
         Write-Host "ffmpeg remux stage 2/2 (copying encoded video/audio plus source subtitles/attachments): $([System.IO.Path]::GetFileName($Source))"
         $remuxResult = Invoke-VesTrackedProcess -FilePath $FfmpegPath -ArgumentList $remuxArgs -ErrorLogPath $remuxErrFile
@@ -235,14 +258,6 @@ function Invoke-VesTwoStageEncode {
             return [PSCustomObject]@{ Success = $false; ExitCode = 1; Stage = 'remux' }
         }
 
-        # Clean up empty error logs -- a real warning trail survives, empty
-        # per-title clutter doesn't (same policy as the bash version).
-        foreach ($f in @($encodeErrFile, $remuxErrFile, $retryErrFile)) {
-            if ((Test-Path $f) -and (Get-Item $f).Length -eq 0) {
-                Remove-VesFileRobust -Path $f
-            }
-        }
-
         if ($writeDst -ne $realDst) {
             if (Complete-VesStagedEncodeOutput -StagedPath $writeDst -FinalDestination $realDst) {
                 Write-Host "Staging: moved finished output to $realDst"
@@ -260,6 +275,20 @@ function Invoke-VesTwoStageEncode {
         # version (see ROADMAP.md item 4 -- PowerShell's try/finally is
         # the direct equivalent here, not a raw trap).
         Remove-VesFileRobust -Path $stage1
+        # Copy the local (ramdisk/staging-dir) stderr logs back to the real
+        # NAS sidecar ($ErrorLogDir/$errBase) only if non-empty -- a real
+        # warning trail survives (matching bash's identical policy,
+        # 2026-08-19), empty per-title clutter doesn't. Runs in `finally`
+        # so it fires on every exit path (success or any early return
+        # above), same as the bash version's placement before its own
+        # ramdisk-staging-dir teardown.
+        foreach ($f in @($encodeErrFile, $remuxErrFile, $retryErrFile)) {
+            if ((Test-Path $f) -and (Get-Item $f).Length -gt 0) {
+                New-Item -ItemType Directory -Path $ErrorLogDir -Force -ErrorAction SilentlyContinue | Out-Null
+                Copy-Item -Path $f -Destination (Join-Path $ErrorLogDir (Split-Path -Leaf $f)) -Force -ErrorAction SilentlyContinue
+            }
+            Remove-VesFileRobust -Path $f
+        }
     }
 }
 
