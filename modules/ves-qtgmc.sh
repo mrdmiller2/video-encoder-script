@@ -116,8 +116,16 @@ qtgmc_deinterlace_to_intermediate() {  # src -> prints intermediate path, or fai
   vspipe_bin="$(_qtgmc_vspipe_bin)"
   [ -n "$vspipe_bin" ] || { warn "vspipe not found — falling back to bwdif for: $src"; return 1; }
 
+  # RAMDISK_JOB_DIR (not CONVERT_RAMDISK_DIR, a rarely-set user override --
+  # see ves-ramdisk.sh) is the actual runtime-resolved/created per-job
+  # ramdisk from ramdisk_init. Using the override var here meant this
+  # multi-GB lossless intermediate fell through to plain ${TMPDIR:-/tmp}
+  # on every real run: harmless on Linux (tmpfs), but on macOS that's real
+  # local disk, not the /Volumes/ConvertRAMDisk this job already created,
+  # and it shared neither that ramdisk's disk-budget accounting nor its
+  # single-teardown lifecycle. Found during the 2026-08-19 NAS-load audit.
   local stage_dir
-  stage_dir="$(mktemp -d "${CONVERT_RAMDISK_DIR:-${TMPDIR:-/tmp}}/.convert-stage-qtgmc-XXXXXX" 2>/dev/null)" || {
+  stage_dir="$(mktemp -d "${RAMDISK_JOB_DIR:-${TMPDIR:-/tmp}}/.convert-stage-qtgmc-XXXXXX" 2>/dev/null)" || {
     warn "Could not create QTGMC staging dir — falling back to bwdif for: $src"
     return 1
   }

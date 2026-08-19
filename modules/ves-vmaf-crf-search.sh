@@ -91,7 +91,14 @@ _vmaf_compare_window_once() {  # src out start secs model target_height fps_filt
   # negative) since a large negative offset near the start of a file would
   # otherwise produce an invalid -ss.
   out_start="$(awk -v s="$start" -v d="$offset" 'BEGIN{v=s+d; printf "%.6f", (v<0?0:v)}')"
-  vlog="$(mktemp "${TMPDIR:-/tmp}/ves-vmaf-XXXXXX.json")" || return 1
+  # Every mktemp in this file now prefers RAMDISK_JOB_DIR (the actual
+  # runtime-resolved per-job ramdisk, empty if this run couldn't get one)
+  # over bare TMPDIR/tmp -- these CRF-search sample clips already land on
+  # RAM-backed storage via plain /tmp on Linux (tmpfs), but consolidating
+  # them onto the same ramdisk the main encode already staged closes the
+  # one platform (macOS, where /tmp is real disk) where they didn't. Part
+  # of the 2026-08-19 NAS-load/RAM-disk-utilization audit.
+  vlog="$(mktemp "${RAMDISK_JOB_DIR:-${TMPDIR:-/tmp}}/ves-vmaf-XXXXXX.json")" || return 1
   # run_ffmpeg_validation (timeout-wrapped) -- same short-bounded-window
   # hang risk as the CRF-search VMAF scorer (fixed 2026-07-29).
   run_ffmpeg_validation -y -v error -ss "$out_start" -t "$secs" -i "$out" -ss "$start" -t "$secs" -i "$src" -lavfi \
@@ -203,7 +210,7 @@ upscale_sample_decision() {  # src display_height -> 720|1080
   # point cleans up "$tmp" and returns 1 -- but a failing mktemp itself here
   # was bare, which would abort the whole script under `set -e` instead of
   # letting this function's own graceful-failure convention run.
-  tmp="$(mktemp -d)" || return 1
+  tmp="$(mktemp -d "${RAMDISK_JOB_DIR:-${TMPDIR:-/tmp}}/ves-crf-XXXXXX")" || return 1
   clip="$tmp/clip.mkv"; out720="$tmp/720.mkv"; out1080="$tmp/1080.mkv"
   log720="$tmp/720.json"; log1080="$tmp/1080.json"
   # run_ffmpeg_validation (timeout-wrapped), not bare run_ffmpeg -- same
@@ -573,7 +580,7 @@ pick_av1_encoder() {
   # || return 1 (E2E review, 2026-07-30): bare mktemp here would abort the
   # whole script under `set -e` instead of this function's own return-1
   # convention used by every failure path below.
-  tmp="$(mktemp -d)" || return 1
+  tmp="$(mktemp -d "${RAMDISK_JOB_DIR:-${TMPDIR:-/tmp}}/ves-crf-XXXXXX")" || return 1
   clip="$tmp/clip.mkv"
   nvenc_out="$tmp/nvenc.mkv"
   svt_out="$tmp/svt.mkv"
@@ -790,7 +797,7 @@ ffmpeg_sample_encode() {
     hevc) acodec=aac; abr="$AAC_BITRATE_V5" ;;
   esac
 
-  errfile="$(mktemp "${TMPDIR:-/tmp}/.sample-encode-stderr.XXXXXX" 2>/dev/null)" || errfile=/dev/null
+  errfile="$(mktemp "${RAMDISK_JOB_DIR:-${TMPDIR:-/tmp}}/.sample-encode-stderr.XXXXXX" 2>/dev/null)" || errfile=/dev/null
 
   # Map subtitles too (dropped attachments match the clip extraction, which
   # no longer pulls -map 0's global attachments either) so the sample's
@@ -974,7 +981,7 @@ av1_source_reencode_sample_decision() {
   # || return 1 (E2E review, 2026-07-30): same reasoning as elsewhere -- a
   # bare mktemp failure here would abort under `set -e` before this
   # function's own graceful cleanup/return-1 path ever runs.
-  tmp="$(mktemp -d)" || return 1
+  tmp="$(mktemp -d "${RAMDISK_JOB_DIR:-${TMPDIR:-/tmp}}/ves-crf-XXXXXX")" || return 1
   sample_profile="$(profile_for_source "$sample_src")" || { rm -rf "$tmp"; return 1; }
   saved_profile_context="$PROFILE_CONTEXT"
   PROFILE_CONTEXT="$sample_profile"
@@ -1174,7 +1181,7 @@ vmaf_crf_search_internal() {  # src codec target model profile target_height
   local -A score=() bytes=()
   # || return 1 (E2E review, 2026-07-30): same reasoning as elsewhere in
   # this function's sibling sample-encode helpers.
-  work="$(mktemp -d)" || return 1
+  work="$(mktemp -d "${RAMDISK_JOB_DIR:-${TMPDIR:-/tmp}}/ves-crf-XXXXXX")" || return 1
 
   dur="$(video_duration "$src")"
   dur="${dur%.*}"

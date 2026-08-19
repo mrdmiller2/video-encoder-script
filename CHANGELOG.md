@@ -4,6 +4,39 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.1F — 2026-08-19
+
+**Second pass of the same NAS-load/RAM-disk audit** (a full sweep of every
+live-encode write path, not just the one already fixed in v5.1.1E), per
+explicit user direction to triage "even small ones" before restarting the
+weighted stress test.
+
+1. **Real bug, multi-GB impact**: `qtgmc_deinterlace_to_intermediate()`
+   (`modules/ves-qtgmc.sh`) staged its lossless deinterlaced intermediate
+   via `${CONVERT_RAMDISK_DIR:-${TMPDIR:-/tmp}}` — `CONVERT_RAMDISK_DIR`
+   is a rarely-set *user override* (empty by default), not
+   `RAMDISK_JOB_DIR`, the actual runtime-resolved/created per-job ramdisk
+   from `ramdisk_init`. Every real run fell through to plain
+   `${TMPDIR:-/tmp}`: harmless on Linux (tmpfs), but on macOS that's real
+   local disk, not the `/Volumes/ConvertRAMDisk` the job already created —
+   and either way it shared neither that ramdisk's disk-budget accounting
+   nor its single-teardown lifecycle. Fixed to use `RAMDISK_JOB_DIR`
+   directly.
+2. **Minor, consistency-only**: every `mktemp`/`mktemp -d` in
+   `modules/ves-vmaf-crf-search.sh` (upscale-decision clips, CRF-search
+   sample encodes, encoder-bakeoff samples) now prefers `RAMDISK_JOB_DIR`
+   the same way — these were already RAM-backed via plain `/tmp` on Linux
+   (tmpfs), so this closes the same macOS gap rather than fixing a real
+   NAS-load problem; done anyway per explicit "even small ones" direction.
+
+Everything else checked in the audit (VMAF comparison's direct `-ss`
+seeks, the title-lock heartbeat's tiny 300s `touch`, HandBrake's temp
+clips, all Windows `.psm1` temp-file usage) was already correctly local
+or intentionally NAS-resident — no further changes. Windows QTGMC isn't
+wired into the encode path at all yet (matches the standing QTGMC
+fleet-deployment plan's Phase E, still future work, not a bug here).
+Verified via `bash -n` only; not yet exercised by a real fleet encode.
+
 ## v5.1.1E — 2026-08-19
 
 **Routed live ffmpeg diagnostic stderr off the NAS onto local/RAM-disk
