@@ -250,5 +250,49 @@ function Get-VesRamDiskLeftovers {
     return $leftovers
 }
 
+function Clear-VesRamDiskStaleAttemptFiles {
+    <#
+    .SYNOPSIS
+    Windows port of ramdisk_sweep_stale_attempt_files() (modules/ves-ramdisk.sh)
+    -- defensive guarantee for a codec-fallback transition (AV1 attempt
+    fails/discarded, caller is about to try x265 in the same job). The RAM
+    disk is reserved for the ACTIVE encoding attempt only, never a holding
+    area for a discarded/superseded one. $StagePath is a single directory
+    reused across the whole job's lifetime (both codec attempts stage into
+    it), so anything a prior attempt left behind -- most plausibly a
+    crashed encode's partial stage1 file its own cleanup path didn't reach
+    (an actual PRINCE production crash, 2026-08-20, root-caused a
+    RAM-disk-exhaustion failure this exact way) -- would otherwise still
+    be sitting there competing with the new attempt for the same limited
+    space. Moves anything found to a local (non-ramdisk) holding
+    directory rather than deleting it outright, in case it's ever worth a
+    human glance for debugging a repeat crash -- explicit user direction,
+    2026-08-20. Safe to call even when $StagePath doesn't exist or is
+    already empty (the common case, when the prior attempt's own cleanup
+    already worked correctly).
+    #>
+    param(
+        [string]$StagePath,
+        [Parameter(Mandatory)][string]$LocalHoldingDir
+    )
+    if (-not $StagePath -or -not (Test-Path -LiteralPath $StagePath -PathType Container)) { return }
+    $leftovers = Get-ChildItem -LiteralPath $StagePath -File -ErrorAction SilentlyContinue
+    if (-not $leftovers) { return }
+    New-Item -ItemType Directory -Path $LocalHoldingDir -Force -ErrorAction SilentlyContinue | Out-Null
+    $moved = 0
+    foreach ($f in $leftovers) {
+        try {
+            Move-Item -LiteralPath $f.FullName -Destination $LocalHoldingDir -Force -ErrorAction Stop
+            $moved++
+        } catch {
+            Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if ($moved -gt 0) {
+        Write-Warning "RAM disk: moved $moved leftover file(s) from a prior codec attempt to local disk ($LocalHoldingDir) before starting the next attempt -- see that file's own diagnostic logs if this recurs"
+    }
+}
+
 Export-ModuleMember -Function Get-VesAvailableMemoryBytes, Get-VesFreeRamDiskDriveLetter, `
-    New-VesRamDiskJob, Test-VesRamDiskOwnedByCurrentJob, Remove-VesRamDiskJob, Get-VesRamDiskLeftovers
+    New-VesRamDiskJob, Test-VesRamDiskOwnedByCurrentJob, Remove-VesRamDiskJob, Get-VesRamDiskLeftovers, `
+    Clear-VesRamDiskStaleAttemptFiles

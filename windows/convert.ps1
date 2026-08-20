@@ -277,6 +277,17 @@ function Invoke-VesCodecEncodeAttempt {
         [Parameter(Mandatory)][string]$Destination,
         [Parameter(Mandatory)][ValidateSet('av1', 'hevc')][string]$Codec
     )
+    # Defensive guarantee for an AV1-to-x265 fallback (this same $ramDiskJob
+    # staging directory is reused across both codec attempts within one
+    # job) -- see Clear-VesRamDiskStaleAttemptFiles's own docs for the full
+    # reasoning (2026-08-20, a real PRINCE production RAM-disk-exhaustion
+    # crash). Gated on 'hevc' specifically: mirrors bash's choice to sweep
+    # at try_x265_convert's single shared entry point rather than every AV1
+    # call site, and is a harmless no-op when nothing was left behind (the
+    # common case).
+    if ($Codec -eq 'hevc' -and $ramDiskJob) {
+        Clear-VesRamDiskStaleAttemptFiles -StagePath $ramDiskJob.StagePath -LocalHoldingDir (Join-Path $PSScriptRoot 'logs\ramdisk-holding')
+    }
     # Wrapped in try/finally (2026-08-08 fix): $qtgmcIntermediate is a
     # local of THIS function, and every attempt to clean it up or measure
     # a same-representation VMAF against it from the CALLER

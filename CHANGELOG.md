@@ -4,6 +4,58 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.1I — 2026-08-20
+
+**Explicit user hypothesis, confirmed and fixed**: when the pipeline falls
+back from a failed/discarded AV1 attempt to a real x265 encode, anything
+the AV1 attempt left behind in the RAM disk was competing with the x265
+attempt for the same limited space — directly contributing to (if not
+solely responsible for) the RAM-disk-exhaustion failure v5.1.1H already
+root-caused on PRINCE. `RAMDISK_JOB_STAGE_DIR` (bash) / `$ramDiskJob.StagePath`
+(Windows) is a single directory reused across a whole job's lifetime —
+both codec attempts stage into it, and it's only ever torn down at job
+end, not between attempts — so a crashed AV1 encode whose own cleanup
+path didn't run (a genuine access-violation crash can bypass normal
+control flow) would leave partial data sitting there indefinitely while
+x265 started fresh alongside it.
+
+**Fixed on both platforms**: before any x265 fallback attempt begins, the
+RAM disk staging area is now explicitly swept — anything found gets moved
+to a local-disk holding directory (not deleted outright, in case it's
+ever worth a look for debugging a repeat crash), guaranteeing the RAM
+disk is genuinely clear for the active attempt regardless of whether the
+prior attempt's own cleanup worked. `ramdisk_sweep_stale_attempt_files()`
+(bash, `modules/ves-ramdisk.sh`) is called once at `try_x265_convert()`'s
+single shared entry point — all three of `try_av1_convert()`'s fallback
+call sites (encode failure, validation failure, size-overshoot) funnel
+through it, so one call site covers all three triggers. `Clear-VesRamDiskStaleAttemptFiles`
+(Windows, `windows/modules/VesRamDisk.psm1`) is called from
+`Invoke-VesCodecEncodeAttempt` gated on `-Codec hevc`, mirroring the same
+"sweep at the x265 entry point" choice. Both are harmless no-ops when
+nothing was left behind — the common case, when the prior attempt's own
+cleanup already worked correctly.
+
+Also confirmed via this session's regression-test audit: **PRINCE's own
+"A Clockwork Orange" retry (under v5.1.1H, before this fix) has not yet
+reached this file in its queue** — the RAM-disk-exhaustion root cause
+itself hasn't been re-tested against the original failure case yet. Also
+found during the same audit: **ELVIS's "Mad Heidi" run, previously
+misreported as a clean success earlier this session, was actually a
+`last_status:"failed"`** — the misreport traced to a stale
+`convert-v4.log` entry from an unrelated 2026-08-14 run being read
+instead of the current session's real resume-state; the actual failure
+hit the identical RAM-disk `ENOSPC` signature as A Clockwork Orange. Needs
+a re-run under v5.1.1I. Not fixed this release (separate, already-flagged
+follow-up): a systemic Windows-only gap where the "only copy the
+diagnostic stderr log back to the NAS if non-empty" policy (v5.1.1E/H)
+doesn't actually filter anything on Windows, because
+`Invoke-VesTrackedProcess`'s `ReadToEndAsync`-based capture always
+returns a full blob at process exit, unlike bash where a clean run's
+piped `-stats` output was empirically found to produce nothing.
+
+Verified via `bash -n` and the PowerShell language parser only — not yet
+exercised by a real fleet encode.
+
 ## v5.1.1H — 2026-08-20
 
 **Two real bugs found root-causing a genuine PRINCE production failure**

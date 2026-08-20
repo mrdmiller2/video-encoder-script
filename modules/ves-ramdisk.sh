@@ -364,3 +364,36 @@ ramdisk_job_teardown() {
   esac
   return 0
 }
+
+# Defensive guarantee for a codec-fallback transition (AV1 attempt fails or
+# is discarded, caller is about to try x265 in the same job) -- the RAM
+# disk is reserved for the ACTIVE encoding attempt only, never a holding
+# area for a discarded/superseded one. $RAMDISK_JOB_STAGE_DIR is a single
+# directory shared across the whole job's lifetime (only torn down at job
+# end via ramdisk_job_teardown, see above), so anything a prior codec
+# attempt left behind there -- most plausibly a crashed encode's partial
+# stage1 file that its own cleanup path didn't reach (an actual PRINCE
+# production crash, 2026-08-20, root-caused a RAM-disk-exhaustion failure
+# this way) -- would otherwise still be sitting there competing with the
+# new attempt for the same limited space. Moves anything found to a local
+# (non-ramdisk) holding directory rather than deleting it outright, in
+# case it's ever worth a human glance for debugging a repeat crash --
+# explicit user direction, 2026-08-20. Safe to call even when nothing
+# needs moving (the common case, when the prior attempt's own cleanup
+# already worked correctly).
+ramdisk_sweep_stale_attempt_files() {
+  [ -n "$RAMDISK_JOB_STAGE_DIR" ] && [ -d "$RAMDISK_JOB_STAGE_DIR" ] || return 0
+  local f holding_dir moved=0
+  holding_dir="${_CONVERT_V4_SCRIPT_DIR:-/tmp}/logs/ramdisk-holding"
+  while IFS= read -r -d '' f; do
+    mkdir -p "$holding_dir" 2>/dev/null
+    if mv -f -- "$f" "$holding_dir/" 2>/dev/null; then
+      moved=$((moved + 1))
+    else
+      rm -f -- "$f" 2>/dev/null || true
+    fi
+  done < <(find "$RAMDISK_JOB_STAGE_DIR" -mindepth 1 -type f -print0 2>/dev/null)
+  if [ "$moved" -gt 0 ]; then
+    warn "RAM disk: moved $moved leftover file(s) from a prior codec attempt to local disk ($holding_dir) before starting the next attempt — see that file's own diagnostic logs if this recurs"
+  fi
+}
