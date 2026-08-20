@@ -428,7 +428,7 @@ function Invoke-VesCodecEncodeAttempt {
 
     $errLogDir = Join-Path $JobRoot 'ffmpeg-logs'
     $result = Invoke-VesTwoStageEncode -Source $EncodeSource -VideoSource $videoSrc -Destination $Destination -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath `
-        -VideoArgs $videoArgsResult.VideoArgs -VideoFilters $videoFilters -ColorArgs $videoArgsResult.ColorArgs `
+        -Codec $Codec -VideoArgs $videoArgsResult.VideoArgs -VideoFilters $videoFilters -ColorArgs $videoArgsResult.ColorArgs `
         -AudioCodec $AudioCodec -AudioBitrate $AudioBitrate -ErrorLogDir $errLogDir `
         -RamdiskDir $(if ($ramDiskJob) { $ramDiskJob.RootPath }) -LocalFallbackDir $stageDir
 

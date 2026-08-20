@@ -515,18 +515,30 @@ ffmpeg_encode() {
   # fail, and rerunning the expensive encode would be wasteful.
   # Live ffmpeg stderr (real, continuous writes every ~0.5s for the whole
   # encode -- confirmed empirically 2026-08-19, not just a one-shot summary)
-  # goes to the SAME local/ramdisk directory $dst already stages to, not
-  # the NAS sidecar -- a multi-hour encode was otherwise generating steady
-  # NFS write traffic for a diagnostic stream nobody reads while the job is
-  # healthy. Only copied back to the real NAS sidecar (nas_errbase below)
-  # if it turns out to hold something worth a human reading: non-empty (a
-  # real warning) or the job failed. User direction 2026-08-19: only
-  # lock/progress/human-inspection files (this NAS copy, when made) belong
-  # on the NAS; everything else "live" during the encode stays local.
+  # goes to genuine LOCAL DISK, not the RAM disk and not the NAS sidecar.
+  # v5.1.1E originally routed this to the same directory $dst stages to
+  # (correct call for getting it off the NAS, but that directory IS the
+  # RAM disk when one's active) -- explicit user direction 2026-08-19,
+  # after a real PRINCE production failure where RAM-disk space exhaustion
+  # from a large multi-track HDR title corrupted an in-progress encode:
+  # the RAM disk must be reserved for encode DATA only (the thing that
+  # actually benefits from RAM speed), never diagnostic text logs, to
+  # keep it from being a scarce resource two different concerns compete
+  # for. _CONVERT_V4_SCRIPT_DIR is the script's own deployment directory --
+  # guaranteed real local disk (not tmpfs, not NAS) on every fleet
+  # machine, unlike /tmp which is tmpfs on this fleet's Linux boxes.
+  # Codec is now part of the filename (not just PID) -- same production
+  # failure investigation found the AV1-attempt's crash log silently
+  # overwritten by the x265 fallback attempt's own log, since both used
+  # identical PID-only-based filenames and only ever one codec attempt
+  # runs per ffmpeg_encode() call, but the CALLER retries with a
+  # different codec reusing the same $$ across attempts.
   local errbase nas_errbase encode_errfile remux_errfile retry_errfile stage1
   local -a remux_args remux_color_args
-  errbase="$(dirname -- "$dst")/$(canonical_title_from_source "$src").$$"
-  nas_errbase="${JOB_SIDECAR_DIR:-/tmp}/ffmpeg-logs/$(canonical_title_from_source "$src").$$"
+  local _local_log_dir="${_CONVERT_V4_SCRIPT_DIR:-/tmp}/logs/ffmpeg-tmp"
+  mkdir -p "$_local_log_dir" 2>/dev/null
+  errbase="${_local_log_dir}/$(canonical_title_from_source "$src").${codec}.$$"
+  nas_errbase="${JOB_SIDECAR_DIR:-/tmp}/ffmpeg-logs/$(canonical_title_from_source "$src").${codec}.$$"
   encode_errfile="${errbase}.stderr.log"
   remux_errfile="${errbase}.remux.stderr.log"
   retry_errfile="${errbase}.remux-nosubs.stderr.log"
@@ -678,8 +690,10 @@ ffmpeg_encode() {
   # (rc!=0), is copied to the real NAS sidecar for human review -- that's
   # a real warning/failure trail worth keeping regardless of whether the
   # audio-truncation validation gate below happens to catch this instance.
-  # Must run here, before the ramdisk-staging-dir cleanup below, since
-  # these local log files live in the same directory being torn down.
+  # These local log files live under _CONVERT_V4_SCRIPT_DIR (real local
+  # disk, 2026-08-20), not the ramdisk staging dir -- unaffected by the
+  # ramdisk teardown below, but still explicitly cleaned up here rather
+  # than left to accumulate across every title this run processes.
   local _errf
   for _errf in "$encode_errfile" "$remux_errfile" "$retry_errfile"; do
     if [ -s "$_errf" ]; then

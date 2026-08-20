@@ -78,6 +78,13 @@ function Invoke-VesTwoStageEncode {
         [Parameter(Mandatory)][string]$Destination,
         [Parameter(Mandatory)][string]$FfmpegPath,
         [Parameter(Mandatory)][string]$FfprobePath,
+        # Included in the local log filename (not just PID) so a codec
+        # fallback retry (e.g. AV1 crashes, caller retries with x265) never
+        # silently overwrites the failed attempt's own diagnostic log --
+        # both attempts reuse the same PowerShell $PID, and PID-only
+        # filenames meant the AV1 crash evidence was gone by the time a
+        # real PRINCE production failure needed it. 2026-08-20.
+        [Parameter(Mandatory)][string]$Codec,
         [Parameter(Mandatory)][string[]]$VideoArgs,
         [string[]]$VideoFilters = @(),
         [string[]]$ColorArgs = @(),
@@ -140,17 +147,26 @@ function Invoke-VesTwoStageEncode {
     if (-not $writeDst) {
         return [PSCustomObject]@{ Success = $false; ExitCode = 1; Stage = 'stage-path' }
     }
-    # Live ffmpeg stderr goes to the same local/ramdisk directory $writeDst
-    # already stages the encode output to, not the NAS $ErrorLogDir -- a
-    # multi-hour encode was otherwise generating steady NFS/SMB write
-    # traffic for a diagnostic stream nobody reads while the job is
-    # healthy (bash-side fix, same finding, 2026-08-19). Only copied back
-    # to the real NAS sidecar ($errBase) at the end if non-empty (a real
-    # warning) or the job failed -- see the copy-back block below. The
-    # -progress files above stay on $ErrorLogDir unchanged: per explicit
-    # user direction, progress/lock/human-inspection files belong on the
-    # NAS, only the "live" diagnostic stream moves local.
-    $localErrBase = Join-Path (Split-Path -Parent $writeDst) "$titleTag.$pidTag"
+    # Live ffmpeg stderr goes to genuine LOCAL DISK ($LocalFallbackDir),
+    # not the RAM disk and not the NAS $ErrorLogDir. v5.1.1E originally
+    # routed this to $writeDst's own directory (correct call for getting
+    # it off the NAS, but that directory IS the RAM disk when one's
+    # active). Explicit user direction 2026-08-20, after a real PRINCE
+    # production failure: RAM-disk space exhaustion from a large
+    # multi-track HDR title corrupted an in-progress encode -- the RAM
+    # disk must be reserved for encode DATA only (the thing that actually
+    # benefits from RAM speed), never diagnostic text logs, so it isn't a
+    # scarce resource two different concerns compete for. Falls back to
+    # $writeDst's directory only if $LocalFallbackDir wasn't supplied
+    # (defensive -- every real caller passes it). Only copied back to the
+    # real NAS sidecar ($errBase) at the end if non-empty (a real warning)
+    # or the job failed -- see the copy-back block below. The -progress
+    # files above stay on $ErrorLogDir unchanged: per explicit user
+    # direction, progress/lock/human-inspection files belong on the NAS,
+    # only the "live" diagnostic stream moves local.
+    $localLogDir = if ($LocalFallbackDir) { $LocalFallbackDir } else { Split-Path -Parent $writeDst }
+    New-Item -ItemType Directory -Path $localLogDir -Force -ErrorAction SilentlyContinue | Out-Null
+    $localErrBase = Join-Path $localLogDir "$titleTag.$Codec.$pidTag"
     $encodeErrFile = "$localErrBase.stderr.log"
     $remuxErrFile = "$localErrBase.remux.stderr.log"
     $retryErrFile = "$localErrBase.remux-nosubs.stderr.log"
@@ -275,13 +291,13 @@ function Invoke-VesTwoStageEncode {
         # version (see ROADMAP.md item 4 -- PowerShell's try/finally is
         # the direct equivalent here, not a raw trap).
         Remove-VesFileRobust -Path $stage1
-        # Copy the local (ramdisk/staging-dir) stderr logs back to the real
-        # NAS sidecar ($ErrorLogDir/$errBase) only if non-empty -- a real
-        # warning trail survives (matching bash's identical policy,
-        # 2026-08-19), empty per-title clutter doesn't. Runs in `finally`
-        # so it fires on every exit path (success or any early return
-        # above), same as the bash version's placement before its own
-        # ramdisk-staging-dir teardown.
+        # Copy the local-disk ($LocalFallbackDir) stderr logs back to the
+        # real NAS sidecar ($ErrorLogDir/$errBase) only if non-empty -- a
+        # real warning trail survives (matching bash's identical policy),
+        # empty per-title clutter doesn't. Runs in `finally` so it fires
+        # on every exit path (success or any early return above), same as
+        # the bash version's placement before its own ramdisk-staging-dir
+        # teardown.
         foreach ($f in @($encodeErrFile, $remuxErrFile, $retryErrFile)) {
             if ((Test-Path $f) -and (Get-Item $f).Length -gt 0) {
                 New-Item -ItemType Directory -Path $ErrorLogDir -Force -ErrorAction SilentlyContinue | Out-Null

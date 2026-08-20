@@ -4,6 +4,56 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.1H — 2026-08-20
+
+**Two real bugs found root-causing a genuine PRINCE production failure**
+during the full-history regression test: "A Clockwork Orange (1971)" (a
+large HDR10 source with many PGS subtitle streams) failed after ~13 hours.
+Investigation traced it to RAM-disk space exhaustion on PRINCE corrupting
+an in-progress x265 stage-1 encode (it silently stopped at ~72 of 137
+minutes but still exited with a clean success marker — caught correctly
+by the existing post-encode duration-mismatch validation, so no bad
+output was kept, but real compute was wasted). While root-causing it, a
+second, independent bug surfaced: the AV1 attempt's own crash diagnostics
+(the access-violation crash that triggered the x265 fallback in the first
+place) were unrecoverable, because both the AV1 and x265 attempts reused
+the identical PID-only-based log filename — the x265 fallback's own log
+silently overwrote the AV1 crash's evidence before anyone could read it.
+
+**Fixed both, on both platforms, per explicit user direction**:
+
+1. **Diagnostic stderr logs now write to genuine local disk, never the
+   RAM disk.** The RAM disk is reserved exclusively for encode DATA (the
+   thing that actually benefits from RAM speed) — sharing it with
+   diagnostic text logs made it a scarce resource two unrelated concerns
+   competed for, and this session's real failure is a direct consequence.
+   Bash: routes to `$_CONVERT_V4_SCRIPT_DIR/logs/ffmpeg-tmp` (the script's
+   own deployment directory — guaranteed real disk, unlike `/tmp`, which
+   is tmpfs/RAM-backed on this fleet's Linux machines). Windows: routes to
+   `$LocalFallbackDir` (already threaded through as `-LocalStagingDir` at
+   every call site, previously only used for the encode-output fallback
+   path, now also used for logs unconditionally). Same NAS-sidecar
+   copy-back-if-non-empty policy from v5.1.1E/v5.1.1G is unchanged, only
+   the *live* local location moved.
+2. **Codec is now part of every diagnostic log filename**, not just PID —
+   `<title>.<codec>.<pid>.stderr.log` instead of `<title>.<pid>.stderr.log`.
+   A codec-fallback retry (AV1 fails, caller retries with x265) can no
+   longer silently clobber the failed attempt's own crash evidence, since
+   both attempts share the same PID within one job but now write to
+   distinct files. Windows required a new `-Codec` parameter on
+   `Invoke-VesTwoStageEncode`, threaded from the one real call site in
+   `convert.ps1`.
+
+Verified via `bash -n` and the PowerShell language parser only — **not
+yet exercised by a real fleet encode**, per explicit user direction to
+hold off on relaunching any jobs while investigating the PRINCE failure
+(a NAS-hosted VM is being set up separately). The RAM-disk-exhaustion
+root cause itself (why PRINCE's RAM disk ran out of space on this
+specific title) is not fixed by this release — this release only stops
+diagnostic logs from competing for that same scarce space; a genuine
+undersized-RAM-disk-for-large-multi-track-sources fix, if still needed
+once logs are out of the way, is separate future work.
+
 ## v5.1.1G — 2026-08-19
 
 **Closed a real Windows/bash feature-parity gap, user-flagged as high
