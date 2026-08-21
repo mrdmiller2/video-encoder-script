@@ -401,8 +401,21 @@ ramdisk_sweep_stale_attempt_files() {
     mkdir -p "$holding_dir" 2>/dev/null
     if mv -f -- "$f" "$holding_dir/" 2>/dev/null; then
       moved=$((moved + 1))
-    else
+    elif sleep 0.5 && mv -f -- "$f" "$holding_dir/" 2>/dev/null; then
+      # Retry once after a brief pause -- covers a transient lock right
+      # after a crash (the file a crashed process just wrote can still
+      # be briefly held by the OS/an AV scanner touching it).
+      moved=$((moved + 1))
+    elif cp -f -- "$f" "$holding_dir/" 2>/dev/null; then
+      # Never silently delete a file we couldn't preserve first (found
+      # 2026-08-20: this exact rm-on-mv-failure path was destroying
+      # crash stderr logs a live PRINCE root-cause investigation needed,
+      # with zero warning). A plain copy survives even when an atomic
+      # rename doesn't.
+      moved=$((moved + 1))
       rm -f -- "$f" 2>/dev/null || true
+    else
+      warn "RAM disk: could not preserve leftover file from a prior codec attempt (move and copy both failed) -- it will be lost when the RAM disk is torn down: $f"
     fi
   done < <(find "$RAMDISK_JOB_STAGE_DIR" -mindepth 1 -type f -print0 2>/dev/null)
   if [ "$moved" -gt 0 ]; then

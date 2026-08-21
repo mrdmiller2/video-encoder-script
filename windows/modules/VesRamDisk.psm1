@@ -305,11 +305,36 @@ function Clear-VesRamDiskStaleAttemptFiles {
     New-Item -ItemType Directory -Path $LocalHoldingDir -Force -ErrorAction SilentlyContinue | Out-Null
     $moved = 0
     foreach ($f in $leftovers) {
+        $ok = $false
         try {
             Move-Item -LiteralPath $f.FullName -Destination $LocalHoldingDir -Force -ErrorAction Stop
-            $moved++
+            $ok = $true
         } catch {
-            Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+            # Retry once after a brief pause -- covers a transient lock
+            # right after a crash (the file a crashed process just wrote
+            # can still be briefly held by the OS/an AV scanner touching
+            # it).
+            Start-Sleep -Milliseconds 500
+            try {
+                Move-Item -LiteralPath $f.FullName -Destination $LocalHoldingDir -Force -ErrorAction Stop
+                $ok = $true
+            } catch { }
+        }
+        if ($ok) {
+            $moved++
+            continue
+        }
+        # Never silently delete a file we couldn't preserve first (found
+        # 2026-08-20: an unconditional Remove-Item fallback here was
+        # destroying crash stderr logs a live PRINCE root-cause
+        # investigation needed, with zero warning). A plain copy survives
+        # even when an atomic rename doesn't.
+        try {
+            Copy-Item -LiteralPath $f.FullName -Destination $LocalHoldingDir -Force -ErrorAction Stop
+            $moved++
+            try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue } catch { }
+        } catch {
+            Write-Warning "RAM disk: could not preserve leftover file from a prior codec attempt (move and copy both failed) -- it will be lost when the RAM disk is torn down: $($f.FullName) -- $_"
         }
     }
     if ($moved -gt 0) {

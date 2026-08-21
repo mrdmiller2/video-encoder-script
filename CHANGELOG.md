@@ -4,6 +4,34 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.1L — 2026-08-20
+
+**Fixed a second, more severe logging bug found immediately while verifying
+the v5.1.1K fix live**: relaunching "Happiness for Beginners (2023)" on
+PRINCE a third time reproduced the identical `ffmpeg.exe` access violation
+(same fault offset again), but the new v5.1.1K live-capture stderr log was
+*still* missing entirely afterward — not a v5.1.1K regression, but a
+second, independent bug in the RAM-disk stale-attempt-file sweep added in
+v5.1.1I (`ramdisk_sweep_stale_attempt_files()` / bash,
+`Clear-VesRamDiskStaleAttemptFiles` / Windows), which runs automatically
+right before the x265 fallback starts. Its own doc comment says it "moves
+anything found to a local holding directory rather than deleting it
+outright, in case it's ever worth a human glance" — but the actual code
+did the opposite whenever the move failed: silently `rm -f`/`Remove-Item`
+the file with zero warning, on both platforms. A file a just-crashed
+process wrote is plausibly still transiently locked (OS/AV scanner) right
+when the sweep runs, which is exactly the scenario that kept destroying
+this investigation's evidence.
+
+**Fixed on both platforms**: the sweep now retries the move once after a
+brief pause (covers a transient post-crash lock), and if the move still
+fails, falls back to copy-then-delete instead of straight-to-delete — the
+content survives even when an atomic rename doesn't. Only if both a move
+and a copy fail does it now log an explicit warning naming the lost file,
+instead of staying silent. Syntax-verified on both platforms; a further
+PRINCE re-test is what will actually confirm the AV1 crash's stderr
+survives this time.
+
 ## v5.1.1K — 2026-08-20
 
 **Fixed a Windows-only diagnostic-logging gap discovered while retesting the
