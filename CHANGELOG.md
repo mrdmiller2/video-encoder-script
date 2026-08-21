@@ -4,6 +4,33 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.1N — 2026-08-21
+
+**Fixed a real remux-stage RAM-disk-exhaustion gap**, found by a fleet
+health-check audit independent of the PRINCE crash investigation:
+ELVIS's "Mad Heidi (2022)" AV1 attempt failed at the *remux* stage (not
+the encode stage) with `rc=-28`, `"There is not enough space on the
+disk"`, despite the v5.1.1J two-tier RAM-disk sizing fix already being
+deployed. Root cause: `resolve_encode_stage_path()`/
+`Resolve-VesEncodeStagePath` only ever sizes the RAM disk against the
+*source* file's size, once, before stage 1 even starts — it never
+accounted for stage 1's own output (the just-finished video+audio-only
+file) and the final remuxed output needing to coexist on the RAM disk
+*simultaneously* during the remux stage, roughly 2x a single file's
+worth of space. v5.1.1J's fix was for a different resource entirely (the
+encoder's own internal working memory), so it didn't cover this.
+
+**Fixed on both platforms**: right after stage 1 succeeds (so stage 1's
+real on-disk size is known exactly, not estimated), a new check compares
+it against actual current free space on the RAM disk. If there isn't
+room for a second same-size file, only the final remux *output*
+retargets to local disk — stage 1 itself stays put on the RAM disk
+untouched (ffmpeg reads it fine across filesystems), so nothing
+already-written needs to move, and the existing move-into-place logic
+(already agnostic to RAM-disk-vs-local-fallback paths) picks it up with
+no further changes needed. Syntax-verified on both platforms; not yet
+exercised against a real remux-stage-headroom-shortfall reproduction.
+
 ## v5.1.1M — 2026-08-20
 
 **Temporary diagnostic instrumentation**, added while root-causing the

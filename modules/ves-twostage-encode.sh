@@ -616,6 +616,47 @@ ffmpeg_encode() {
     warn "ffmpeg stage-1 encode reported success but output is missing/empty: $stage1"
     rc=1
   fi
+  # Real remux-stage headroom check (2026-08-21): resolve_encode_stage_path
+  # only ever sized the RAM disk against $src's size, once, before stage-1
+  # even started -- it never accounted for stage 1 (the just-finished
+  # video+audio-only file) and the final remuxed output needing to coexist
+  # on the RAM disk simultaneously during this stage, roughly 2x a single
+  # file's worth of space. Found via a real ELVIS production failure
+  # ("Mad Heidi") that hit "There is not enough space on the disk" at
+  # exactly this stage, despite the v5.1.1J two-tier sizing fix (which
+  # only ever addressed the ENCODER's own internal memory need, a
+  # different resource than RAM-disk file-space) already being deployed.
+  # Now uses stage1's real on-disk size (known exactly, not estimated)
+  # against actual current free space; if insufficient, only the final
+  # remux OUTPUT retargets to local disk -- stage1 stays put on the RAM
+  # disk untouched (ffmpeg reads it fine across filesystems), so nothing
+  # already-written needs to move.
+  if [ "$rc" -eq 0 ] && [ -n "$RAMDISK_JOB_STAGE_DIR" ] && [ "${dst#"$RAMDISK_JOB_STAGE_DIR"/}" != "$dst" ]; then
+    local _stage1_size _stage2_need_bytes _free_now _remux_local_dir
+    _stage1_size="$(file_size_bytes "$stage1")"
+    if [ "$_stage1_size" -gt 0 ]; then
+      _stage2_need_bytes=$(( _stage1_size + _stage1_size * RAMDISK_SIZE_ESTIMATE_MARGIN_PCT / 100 ))
+      _free_now="$(_dir_free_bytes "$RAMDISK_JOB_DIR")" || _free_now=""
+      if [ -n "$_free_now" ] && [ "$_free_now" -lt "$_stage2_need_bytes" ]; then
+        _remux_local_dir="$(_local_stage_dir_for "$real_dst")" && {
+          warn "Ramdisk staging: not enough free space in $RAMDISK_JOB_DIR for the remux output (stage-1 output + final file must coexist, need ~$(( _stage2_need_bytes / 1024 / 1024 ))MB free) — writing the remuxed output to local disk instead: $_remux_local_dir"
+          dst="${_remux_local_dir}/$$.$(basename "$real_dst")"
+        }
+      fi
+    fi
+  fi
+  remux_args=(-y -nostdin -v warning -stats
+              -thread_queue_size 4096 -i "$stage1"
+              -thread_queue_size 4096 -i "$src"
+              -map 0:v:0 -map "0:a?" "${REAL_SUBTITLE_MAP_ARGS[@]}" -map "1:t?"
+              -map_chapters 1
+              -c:v copy "${remux_color_args[@]}" -c:a copy
+              "${sub_args[@]}"
+              -max_muxing_queue_size 8192
+              -fps_mode passthrough
+              -max_interleave_delta 1000000
+              -flush_packets 1
+              -f matroska "$dst")
   if [ "$rc" -eq 0 ]; then
     log "ffmpeg remux stage 2/2 (copying encoded video/audio plus source subtitles/attachments): $(basename "$src")"
     run_tracked_encoder "ffmpeg remux subtitles" _run_capturing_stderr "$remux_errfile" "${FFMPEG_CMD[@]}" "${remux_args[@]}" || rc=$?

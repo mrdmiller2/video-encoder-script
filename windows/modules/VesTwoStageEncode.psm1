@@ -223,6 +223,38 @@ function Invoke-VesTwoStageEncode {
             return [PSCustomObject]@{ Success = $false; ExitCode = 1; Stage = 'encode' }
         }
 
+        # Real remux-stage headroom check (2026-08-21): Resolve-VesEncodeStagePath
+        # only ever sized the RAM disk against $Source's size, once, before
+        # stage 1 even started -- it never accounted for stage 1 (the
+        # just-finished video+audio-only file) and the final remuxed output
+        # needing to coexist on the RAM disk simultaneously during this
+        # stage, roughly 2x a single file's worth of space. Found via a
+        # real ELVIS production failure ("Mad Heidi") that hit "There is
+        # not enough space on the disk" at exactly this stage, despite the
+        # v5.1.1J two-tier sizing fix (which only ever addressed the
+        # ENCODER's own internal memory need, a different resource than
+        # RAM-disk file-space) already being deployed. Uses stage1's real
+        # on-disk size (known exactly now, not estimated) against actual
+        # current free space; if insufficient, only the final remux OUTPUT
+        # retargets to local disk -- stage1 stays put on the RAM disk
+        # untouched (ffmpeg reads it fine across filesystems), so nothing
+        # already-written needs to move.
+        if ($RamdiskDir -and $writeDst.StartsWith($RamdiskDir, [StringComparison]::OrdinalIgnoreCase)) {
+            $stage1Size = (Get-Item -LiteralPath $stage1 -Force).Length
+            if ($stage1Size -gt 0) {
+                $needBytes = $stage1Size + [long]($stage1Size * 0.20)
+                $freeBytes = (Get-Item $RamdiskDir -Force).PSDrive.Free
+                if ($freeBytes -lt $needBytes) {
+                    $needMb = [math]::Round($needBytes / 1MB)
+                    $localDir = New-VesLocalStageDir -Destination $realDst -PreferredParentDir $LocalFallbackDir
+                    if ($localDir) {
+                        Write-Warning "Ramdisk staging: not enough free space in $RamdiskDir for the remux output (stage-1 output + final file must coexist, need ~${needMb}MB free) -- writing the remuxed output to local disk instead: $localDir"
+                        $writeDst = Join-Path $localDir "$pidTag.$([System.IO.Path]::GetFileName($realDst))"
+                    }
+                }
+            }
+        }
+
         # --- Real-subtitle-map filter (only non-empty source subtitle tracks) ---
         $mapArgs = New-VesRealSubtitleMapArgs -InputIndex 1 -Source $Source -FfprobePath $FfprobePath -FfmpegPath $FfmpegPath -StrippedSubtitlesLogPath $StrippedSubtitlesLogPath
 
