@@ -6,7 +6,7 @@
 # MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
 # bug fix) -- see its own comment.
 
-VERSION="5.1.1Q"
+VERSION="5.1.1R"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
 # as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
@@ -536,6 +536,16 @@ SVT_PARAMS_CLASSIC='enable-qm=1:film-grain-denoise=1:film-grain=6:qm-min=0:scd=1
 SVT_PARAMS_VINTAGE='enable-qm=1:film-grain-denoise=1:film-grain=12:qm-min=0:scd=1:enable-tf=1:keyint=15s:aq-mode=2:enable-variance-boost=1:variance-boost-strength=2:variance-octile=4:sharpness=1'
 SVT_PARAMS_MTV="$SVT_PARAMS_MOVIES"
 SVT_PARAMS_VTV='enable-qm=1:film-grain-denoise=1:film-grain=5:qm-min=0:scd=1:enable-tf=1:keyint=15s:aq-mode=2:enable-variance-boost=1:variance-boost-strength=2:variance-octile=4:sharpness=1'
+# Per-machine SVT-AV1 parallelism override (2026-08-21) -- see
+# profile_svt_params()'s own comment in ves-vmaf-crf-search.sh for the
+# full reasoning. Unset by default everywhere (zero behavior change); set
+# per-machine only after a real benchmark on that specific machine, never
+# inferred from core count alone (a machine can have many logical
+# processors and still be a poor fit for more tiles if its per-core
+# throughput is weak).
+CONVERT_SVTAV1_TILE_COLUMNS="${CONVERT_SVTAV1_TILE_COLUMNS:-}"
+CONVERT_SVTAV1_TILE_ROWS="${CONVERT_SVTAV1_TILE_ROWS:-}"
+CONVERT_SVTAV1_LP="${CONVERT_SVTAV1_LP:-}"
 # NOTE: `tune=` is deliberately NOT embedded in these x265-params strings.
 # Found 2026-07-29: x265's own param parser (x265_param_parse(), what
 # ffmpeg's -x265-params/-enc x265-params= and HandBrake's --encopts all

@@ -468,6 +468,33 @@ profile_svt_params() {
   if ! svtav1_supports_sharpness; then
     params="$(printf '%s' "$params" | sed -E 's/:sharpness=[0-9]+//')"
   fi
+  # Per-machine parallelism override (2026-08-21, spec'd out following a
+  # real observation on PRINCE: a genuinely strong 24c/32t machine sitting
+  # at ~51-56% CPU utilization during encode, with no OS-level cap found
+  # -- PROCTHROTTLEMAX/MIN unrestricted, CPU affinity unrestricted, no
+  # thread-count override in our own code. Most likely explanation:
+  # SVT-AV1's tile-based parallelism model doesn't always scale to fully
+  # saturate very high core counts on its own, especially at a fast
+  # preset with less parallel work to distribute. Unset by default on
+  # every machine (zero behavior change) until calibrated per machine via
+  # real VMAF-at-matching-CRF comparisons (more tiles = real, if usually
+  # small, compression-efficiency cost from lost cross-tile prediction --
+  # never assume it's free). Deliberately a MACHINE characteristic, not a
+  # profile one -- applied here (shared by both the CRF search and the
+  # final encode) rather than per-profile, so CRF search always stays
+  # calibrated against the exact tile/thread config the final encode
+  # uses, matching this function's own existing sharpness-support
+  # handling above. High core count is not sufficient justification on
+  # its own -- per-core strength matters too (see the RANDYJ-vs-PRINCE
+  # framing this was scoped from: both have many logical processors, one
+  # has genuinely strong modern cores, the other has old/weak ones), so
+  # this is a real per-machine value set only after that machine's own
+  # benchmark, never inferred from core count alone.
+  local _extra=""
+  [ -n "$CONVERT_SVTAV1_TILE_COLUMNS" ] && _extra="${_extra}:tile-columns=${CONVERT_SVTAV1_TILE_COLUMNS}"
+  [ -n "$CONVERT_SVTAV1_TILE_ROWS" ] && _extra="${_extra}:tile-rows=${CONVERT_SVTAV1_TILE_ROWS}"
+  [ -n "$CONVERT_SVTAV1_LP" ] && _extra="${_extra}:lp=${CONVERT_SVTAV1_LP}"
+  [ -n "$_extra" ] && params="${params}${_extra}"
   printf '%s' "$params"
 }
 

@@ -4,6 +4,45 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.1R — 2026-08-21
+
+**New per-machine SVT-AV1 parallelism override plumbing** (spec'd out,
+not yet calibrated), explicit user direction: found while investigating
+PRINCE's post-update RAM-disk retest that a genuinely strong machine
+(13th Gen i9-13900HX, 24 cores/32 threads) was sitting at ~51-56% CPU
+utilization during encode, with no OS-level explanation found —
+`PROCTHROTTLEMAX`/`PROCTHROTTLEMIN` both unrestricted, CPU affinity
+unrestricted, no thread-count override anywhere in this pipeline's own
+code. Most likely explanation: SVT-AV1's tile-based parallelism model
+doesn't always scale to fully saturate very high core counts on its
+own, especially at a fast preset with less parallel work to distribute.
+
+User's framing, carried through into the design: core count alone isn't
+sufficient to decide this — a machine needs strong *per-core* throughput
+too, or added tiles just cost compression efficiency (real, if usually
+small, from lost cross-tile prediction) without a real speed payoff.
+RANDYJ (many logical processors via old-generation HT, weak per-thread
+IPC/clock) and PRINCE (many logical processors, genuinely strong modern
+cores) are the natural opposite-ends test pair.
+
+**Added on both platforms**: three new per-machine overrides —
+`CONVERT_SVTAV1_TILE_COLUMNS`/`CONVERT_SVTAV1_TILE_ROWS`/
+`CONVERT_SVTAV1_LP` (bash, env-var-driven) /
+`$env:CONVERT_SVTAV1_TILE_COLUMNS`/`TILE_ROWS`/`LP` (Windows, same
+names) — unset by default everywhere, zero behavior change until a
+machine is explicitly calibrated. Applied inside
+`profile_svt_params()`/`Get-VesProfileSvtParams`, shared by both the
+VMAF CRF search and the final encode, so CRF search always stays
+calibrated against the exact tile/thread config the final encode uses
+(matching this function's existing sharpness-support-detection pattern).
+Real per-machine values are meant to come from actual VMAF-at-matching-
+CRF benchmarks on that specific machine — see the planned rollout in
+this session's notes: benchmark PRINCE and RANDYJ first (opposite ends
+of the "many logical processors" spectrum), then decide real values,
+then multi-tool review before any machine actually gets a non-empty
+default. Syntax-verified only — no benchmarking done yet, no machine's
+behavior has actually changed.
+
 ## v5.1.1Q — 2026-08-21
 
 **Windows-only parity fix**: `convert.ps1`'s RAM-disk opt-out threshold

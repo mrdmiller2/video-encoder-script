@@ -163,6 +163,23 @@ function Get-VesProfileSvtParams {
     if (-not (Test-VesSvtAv1SupportsSharpness -FfmpegPath $FfmpegPath)) {
         $params = $params -replace ':sharpness=\d+', ''
     }
+    # Per-machine SVT-AV1 parallelism override (2026-08-21) -- see the
+    # matching bash comment in profile_svt_params() (ves-vmaf-crf-search.sh)
+    # for the full reasoning: a real observation on PRINCE (24c/32t, strong
+    # modern cores) sitting at ~51-56% CPU utilization with no OS-level cap
+    # found, most likely because SVT-AV1's tile-based parallelism doesn't
+    # always scale to fully saturate very high core counts on its own.
+    # Unset by default everywhere (zero behavior change); set per-machine
+    # only after a real VMAF-at-matching-CRF benchmark on that specific
+    # machine -- more tiles is a genuine, if usually small, compression
+    # cost, and high core count alone doesn't justify it (a machine can
+    # have many logical processors and weak per-core throughput, where
+    # this wouldn't help). Applied here, shared by both the CRF search and
+    # the final encode, so CRF search always stays calibrated against the
+    # exact config the final encode uses.
+    if ($env:CONVERT_SVTAV1_TILE_COLUMNS) { $params = "${params}:tile-columns=$($env:CONVERT_SVTAV1_TILE_COLUMNS)" }
+    if ($env:CONVERT_SVTAV1_TILE_ROWS) { $params = "${params}:tile-rows=$($env:CONVERT_SVTAV1_TILE_ROWS)" }
+    if ($env:CONVERT_SVTAV1_LP) { $params = "${params}:lp=$($env:CONVERT_SVTAV1_LP)" }
     return $params
 }
 
