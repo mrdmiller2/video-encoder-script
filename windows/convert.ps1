@@ -243,7 +243,22 @@ if (-not $NoAutoReap) {
 # hit on every single output file. -NoRamDisk is the new opt-out.
 $ramDiskJob = $null
 $stageDir = $LocalStagingDir
-if (-not $NoRamDisk -and -not $DryRun) {
+# Ramdisk staging is now opt-OUT by hardware class, not universal
+# (2026-08-21, explicit user direction): a real multi-hour investigation
+# this session found ramdisk staging to be the actual trigger of a
+# reproducible access-violation crash on one real fleet machine (PRINCE),
+# plus a separate ENOSPC failure on another (ELVIS) -- both root-caused,
+# both fixed, but the underlying tradeoff didn't hold up: video encoding
+# is CPU-bound, so a ramdisk's write-latency advantage over a real local
+# SSD is marginal for this workload, while the failure modes are real.
+# Machines with less than $RamDiskMinTotalBytes of TOTAL installed RAM
+# (not available -- see Get-VesTotalMemoryBytes' own comment) now skip
+# ramdisk staging entirely by default and fall straight through to local
+# disk staging (same write-back-to-NAS-on-completion, same local-only
+# logs). Sizing itself is unchanged for machines that still qualify.
+$RamDiskMinTotalBytes = 64GB
+$totalMem = Get-VesTotalMemoryBytes
+if (-not $NoRamDisk -and -not $DryRun -and $totalMem -ge $RamDiskMinTotalBytes) {
     $ramDiskJob = New-VesRamDiskJob
     if ($ramDiskJob) {
         Write-VesLog "RAM disk staging: $($ramDiskJob.RootPath) ($($ramDiskJob.StagePath))"
@@ -251,6 +266,9 @@ if (-not $NoRamDisk -and -not $DryRun) {
     } else {
         Write-VesLog 'RAM disk staging unavailable -- falling back to local disk staging'
     }
+} elseif (-not $NoRamDisk -and -not $DryRun) {
+    $totalGb = [math]::Round($totalMem / 1GB)
+    Write-VesLog "RAM disk staging: this machine has ${totalGb}GB total RAM, below the 64GB default threshold -- using local-disk staging by default"
 }
 
 $statePath = Get-VesResumeSidecarPath -JobRoot $JobRoot -Hostname $env:COMPUTERNAME -Kind 'state'

@@ -84,6 +84,25 @@ _mem_available_bytes() {
   esac
 }
 
+# TOTAL installed physical RAM, not available-right-now -- deliberately a
+# separate figure from _mem_available_bytes() above. Used only to decide
+# WHETHER to use a ramdisk at all for this machine (a fixed hardware
+# characteristic), never to size one (that stays keyed off available
+# memory at creation time, unchanged). Available memory fluctuates run to
+# run with whatever else is running on the machine; gating the on/off
+# decision on it would make the same machine unpredictably enable/disable
+# ramdisk staging between otherwise-identical runs.
+_mem_total_bytes() {
+  case "$PLATFORM" in
+    macos)
+      sysctl -n hw.memsize 2>/dev/null
+      ;;
+    *)
+      awk '/MemTotal/{print $2*1024}' /proc/meminfo 2>/dev/null
+      ;;
+  esac
+}
+
 # Finds an already-mounted, RAM-backed directory with at least $1 bytes free.
 # Returns its path on stdout, or nothing if none qualifies.
 ramdisk_discover() {
@@ -253,6 +272,33 @@ ramdisk_job_start() {
   trap ramdisk_job_teardown EXIT
   if [ "$CONVERT_NO_RAMDISK" = true ] || [ "$DRY_RUN" = true ]; then
     return 0
+  fi
+  # Ramdisk staging is now opt-OUT by hardware class, not universal
+  # (2026-08-21, explicit user direction): a real multi-hour investigation
+  # this session found ramdisk staging to be the actual trigger of a
+  # reproducible access-violation crash on one real fleet machine (PRINCE),
+  # plus a separate ENOSPC failure on another (ELVIS) -- both root-caused,
+  # both fixed, but the underlying tradeoff didn't hold up: video encoding
+  # is CPU-bound, so a ramdisk's write-latency advantage over a real local
+  # SSD is marginal for this workload, while the failure modes are real.
+  # Machines with less than CONVERT_RAMDISK_MIN_TOTAL_GB of TOTAL installed
+  # RAM (not available -- see _mem_total_bytes' own comment) now skip
+  # ramdisk staging entirely by default and fall straight through to the
+  # existing local-disk staging path (resolve_encode_stage_path's fallback
+  # branch, already used whenever ramdisk staging isn't available/doesn't
+  # fit) -- same write-back-to-NAS-on-completion behavior, same local-only
+  # logs, just without the ramdisk in the middle. Sizing itself (the
+  # two-tier CONVERT_RAMDISK_PCT_LARGE/CAP_SMALL_GB formula) is unchanged
+  # for machines that still qualify -- this only gates whether a ramdisk
+  # is used at all, not how it's sized when it is.
+  local total_mem
+  total_mem="$(_mem_total_bytes)" || total_mem=""
+  if [ -n "$total_mem" ] && [ "$total_mem" -gt 0 ]; then
+    local min_total_bytes=$(( CONVERT_RAMDISK_MIN_TOTAL_GB * 1024 * 1024 * 1024 ))
+    if [ "$total_mem" -lt "$min_total_bytes" ]; then
+      log "Ramdisk staging: this machine has less than ${CONVERT_RAMDISK_MIN_TOTAL_GB}GB total RAM -- using local-disk staging by default (set CONVERT_RAMDISK_MIN_TOTAL_GB=0 to override and allow ramdisk staging on this machine anyway)"
+      return 0
+    fi
   fi
 
   local owned_path probe_need

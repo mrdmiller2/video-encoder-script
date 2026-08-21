@@ -6,7 +6,7 @@
 # MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
 # bug fix) -- see its own comment.
 
-VERSION="5.1.1N"
+VERSION="5.1.1O"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
 # as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
@@ -194,6 +194,18 @@ PREEXISTING_X265_SMALL_SKIP_MAX_MB="${CONVERT_PREEXISTING_X265_SMALL_SKIP_MAX_MB
 CONVERT_RAMDISK_TIER_THRESHOLD_GB="${CONVERT_RAMDISK_TIER_THRESHOLD_GB:-64}"
 CONVERT_RAMDISK_PCT_LARGE="${CONVERT_RAMDISK_PCT_LARGE:-45}"
 CONVERT_RAMDISK_CAP_SMALL_GB="${CONVERT_RAMDISK_CAP_SMALL_GB:-12}"
+# Opt-out-by-hardware-class gate (2026-08-21, explicit user direction,
+# separate from the sizing tier above): whether a ramdisk is used AT ALL
+# for this machine, keyed off TOTAL installed RAM (a fixed hardware
+# characteristic), not available memory. Below this, every job on this
+# machine falls straight through to the existing local-disk staging
+# fallback (same write-back-to-NAS-on-completion, same local-only logs)
+# instead of ever attempting a ramdisk -- see ramdisk_job_start()'s own
+# comment in ves-ramdisk.sh for the full incident writeup (a real
+# access-violation crash on PRINCE, root-caused to ramdisk staging
+# itself, plus a separate ENOSPC failure on ELVIS) that motivated this.
+# Set to 0 to allow ramdisk staging on every machine regardless of RAM.
+CONVERT_RAMDISK_MIN_TOTAL_GB="${CONVERT_RAMDISK_MIN_TOTAL_GB:-64}"
 CONVERT_NO_RAMDISK="${CONVERT_NO_RAMDISK:-false}"
 CONVERT_RAMDISK_DIR="${CONVERT_RAMDISK_DIR:-}"
 RAMDISK_SIZE_ESTIMATE_MARGIN_PCT=10

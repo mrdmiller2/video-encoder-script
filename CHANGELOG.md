@@ -4,6 +4,39 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.1O — 2026-08-21
+
+**RAM-disk staging is now opt-out by hardware class, not universal**,
+explicit user direction following this session's multi-hour PRINCE crash
+investigation. That investigation conclusively isolated a reproducible
+`ffmpeg.exe` access-violation crash to RAM-disk staging itself on one
+real fleet machine (PRINCE, 31.7GB total RAM): the identical file, same
+machine, same encode settings, completed cleanly with zero issues when
+RAM-disk staging was disabled (`-NoRamDisk`), after crashing 5/5 times
+with it enabled. Combined with the separate real ENOSPC failure found on
+ELVIS this same session (v5.1.1N) and the fact that video encoding is
+CPU-bound (a RAM disk's write-latency advantage over a real local SSD is
+marginal for this workload's actual I/O pattern — mostly large,
+sequential writes well within any modern SSD's sustained throughput),
+the risk/benefit tradeoff no longer favors RAM disk as a blanket default.
+
+**Changed on both platforms**: machines with less than 64GB of *total
+installed* RAM (a fixed hardware characteristic, deliberately distinct
+from the *available*-memory figure the existing two-tier sizing formula
+uses) now skip RAM-disk staging entirely by default and fall straight
+through to the already-existing local-disk staging fallback — same
+write-back-to-NAS-on-completion behavior, same local-only logs, nothing
+new to build there. New config constant `CONVERT_RAMDISK_MIN_TOTAL_GB`
+(bash, default 64, set to 0 to override) / `$RamDiskMinTotalBytes`
+(Windows, in `convert.ps1`). The existing two-tier *sizing* formula
+(`CONVERT_RAMDISK_PCT_LARGE`/`CONVERT_RAMDISK_CAP_SMALL_GB`) is
+unchanged for machines that still qualify (64GB+ total RAM) — this only
+gates whether a RAM disk is used at all, not how it's sized when it is.
+New `_mem_total_bytes()`/`Get-VesTotalMemoryBytes` helpers added
+alongside the existing available-memory ones. On this fleet, this takes
+PRINCE (31.7GB total) off RAM-disk staging by default going forward —
+directly addressing the machine the crash was isolated to. Syntax-verified.
+
 ## v5.1.1N — 2026-08-21
 
 **Fixed a real remux-stage RAM-disk-exhaustion gap**, found by a fleet
