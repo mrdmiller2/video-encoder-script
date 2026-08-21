@@ -6,7 +6,7 @@
 # MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
 # bug fix) -- see its own comment.
 
-VERSION="5.1.1I"
+VERSION="5.1.1J"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
 # as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
@@ -172,10 +172,28 @@ PREEXISTING_X265_SMALL_SKIP_MAX_MB="${CONVERT_PREEXISTING_X265_SMALL_SKIP_MAX_MB
 # active encode ever touching the NFS write path -- reads tolerate network
 # blips fine via retry, but a stalled/interrupted write on a `hard` NFS mount
 # can block the whole encode), then the finished file is moved to the real
-# destination as one sequential transfer. Percentage is of *available* (free)
-# memory at the moment a ramdisk needs to be created, not total installed RAM,
-# and only applies when no suitable ramdisk/tmpfs is discovered already.
-CONVERT_RAMDISK_PCT="${CONVERT_RAMDISK_PCT:-60}"
+# destination as one sequential transfer. Only applies when no suitable
+# ramdisk/tmpfs is discovered already.
+#
+# Two-tier sizing (2026-08-20, replaces a flat 60%-of-available formula):
+# a real PRINCE production crash (SvtMalloc[fatal]: allocate memory failed,
+# 4K/10-bit "Happiness for Beginners") traced to the encoder's own internal
+# picture-buffer pool (~7.6GB just for SVT-AV1's picture buffers at that
+# resolution/GOP config, before any other internal structures) competing
+# with a ramdisk that had already claimed 60% of available memory before
+# the encoder even started. Below CONVERT_RAMDISK_TIER_THRESHOLD_GB
+# available memory, a flat CONVERT_RAMDISK_CAP_SMALL_GB cap leaves
+# generous, predictable headroom for the encoder regardless of ramdisk
+# math (explicit user direction: most fleet machines have 64GB+, a 12GB
+# cap on a ~32GB machine leaves ~20GB); at or above the threshold,
+# CONVERT_RAMDISK_PCT_LARGE% of available is used instead, since a
+# large-RAM machine has enough headroom either way and a flat cap there
+# would waste real staging capacity for no benefit. Percentage/cap are of
+# *available* (free) memory at the moment a ramdisk needs to be created,
+# never total installed RAM.
+CONVERT_RAMDISK_TIER_THRESHOLD_GB="${CONVERT_RAMDISK_TIER_THRESHOLD_GB:-64}"
+CONVERT_RAMDISK_PCT_LARGE="${CONVERT_RAMDISK_PCT_LARGE:-45}"
+CONVERT_RAMDISK_CAP_SMALL_GB="${CONVERT_RAMDISK_CAP_SMALL_GB:-12}"
 CONVERT_NO_RAMDISK="${CONVERT_NO_RAMDISK:-false}"
 CONVERT_RAMDISK_DIR="${CONVERT_RAMDISK_DIR:-}"
 RAMDISK_SIZE_ESTIMATE_MARGIN_PCT=10

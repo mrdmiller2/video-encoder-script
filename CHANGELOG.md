@@ -4,6 +4,49 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.1J — 2026-08-20
+
+**Root-caused why the RAM-disk-exhaustion failures kept happening**,
+investigating a real PRINCE crash mid-session: `SvtMalloc[fatal]: allocate
+memory failed` on "Happiness for Beginners (2023)" (true 4K, 3840x2160,
+10-bit) turned out to be a genuinely distinct issue from the earlier
+`ENOSPC` RAM-disk-full failures (v5.1.1H/I) — not the RAM disk running out
+of file-write space, but the *encoder process itself* failing to allocate
+its own working memory (SVT-AV1's internal picture-buffer pool: `Number of
+PPCS 305` at this resolution/GOP config is ~7.6GB just for picture buffers
+alone, before any other internal structures). Confirmed via direct
+investigation: PRINCE has 31.7GB total RAM: the RAM disk's flat
+60%-of-available formula was claiming the majority of free memory *before*
+the encoder even started, leaving a demanding 4K encode's own multi-GB
+memory need squeezed into whatever was left.
+
+**Fixed on both platforms, per explicit user direction**: RAM-disk sizing
+is now two-tier instead of a flat percentage. Below 64GB of available
+memory (most of the fleet's non-workstation machines), the RAM disk is
+capped at a flat 12GB regardless of how much more is technically free —
+leaving generous, predictable headroom for the encoder (a ~32GB machine
+now keeps ~20GB free instead of ~13GB under the old 60% formula). At or
+above 64GB available, 45% of available is used instead (down from 60%),
+since a large-RAM machine has enough headroom either way and a flat cap
+there would waste real staging capacity for no benefit. All three
+thresholds are named, overridable config constants on both platforms
+(`CONVERT_RAMDISK_TIER_THRESHOLD_GB`/`CONVERT_RAMDISK_PCT_LARGE`/`CONVERT_RAMDISK_CAP_SMALL_GB`
+in `ves-config.sh`; `-TierThresholdBytes`/`-PercentOfAvailable`/`-CapSmallBytes`
+on `New-VesRamDiskJob`), not hard-coded — verified against 5 realistic
+scenarios (28GB/60GB/64GB/90GB/8GB available) confirming correct behavior
+at both tiers and the boundary, including the safety clamp for a machine
+with less than the flat cap actually free.
+
+Does not eliminate the possibility of a genuinely oversized encode still
+exceeding available memory on a real machine (that's an inherent limit,
+not a bug) — but removes the RAM disk itself as a major, avoidable
+contributor to that pressure. This is a distinct fix from v5.1.1H/I's
+ENOSPC-focused work; both failure classes are now addressed.
+
+Verified via `bash -n` and the PowerShell language parser, plus a
+standalone arithmetic test of the sizing formula against 5 real-world
+scenarios — not yet exercised by a real fleet encode.
+
 ## v5.1.1I — 2026-08-20
 
 **Explicit user hypothesis, confirmed and fixed**: when the pipeline falls

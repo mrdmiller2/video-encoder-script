@@ -119,17 +119,29 @@ ramdisk_discover() {
   return 1
 }
 
-# Creates a new ramdisk sized at CONVERT_RAMDISK_PCT% of currently-available
-# memory (not total installed RAM -- leaves headroom for the encoder
-# process's own footprint, which runs several GB on its own). Only called
-# when discovery finds nothing suitable already mounted.
+# Creates a new ramdisk, two-tier sized off currently-available memory (not
+# total installed RAM -- leaves headroom for the encoder process's own
+# footprint, which a real production crash proved can be several GB on its
+# own for a demanding 4K/10-bit source -- see ves-config.sh's
+# CONVERT_RAMDISK_TIER_THRESHOLD_GB comment for the full incident writeup).
+# Only called when discovery finds nothing suitable already mounted.
 ramdisk_create() {
   local need_bytes="$1" avail size_bytes size_mb path
   avail="$(_mem_available_bytes)" || avail=""
   if [ -z "$avail" ] || [ "$avail" -le 0 ]; then
     return 1
   fi
-  size_bytes=$(( avail * CONVERT_RAMDISK_PCT / 100 ))
+  local threshold_bytes=$(( CONVERT_RAMDISK_TIER_THRESHOLD_GB * 1024 * 1024 * 1024 ))
+  local cap_small_bytes=$(( CONVERT_RAMDISK_CAP_SMALL_GB * 1024 * 1024 * 1024 ))
+  if [ "$avail" -ge "$threshold_bytes" ]; then
+    size_bytes=$(( avail * CONVERT_RAMDISK_PCT_LARGE / 100 ))
+  else
+    size_bytes="$cap_small_bytes"
+    # Never claim more than is actually free, even under the flat cap --
+    # a machine with less than CONVERT_RAMDISK_CAP_SMALL_GB free entirely
+    # would otherwise get a ramdisk request guaranteed to fail below.
+    [ "$size_bytes" -le "$avail" ] || size_bytes="$avail"
+  fi
   if [ "$size_bytes" -lt "$need_bytes" ]; then
     return 1
   fi

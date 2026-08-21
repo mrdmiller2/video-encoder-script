@@ -73,11 +73,26 @@ function New-VesRamDiskJob {
     <#
     .SYNOPSIS
     Port of ramdisk_job_start()/ramdisk_create(). Creates a job-scoped
-    RAM disk sized at $PercentOfAvailable% of currently-free memory (not
-    below $MinSizeBytes, not above $MaxSizeBytes), formats NTFS, and
-    writes an owner marker onto the new volume so the orphan reaper can
-    later attribute (and safely dispose of) a leftover disk from a
-    crashed run -- ImDisk volumes carry no ownership info of their own.
+    RAM disk, two-tier sized off currently-free memory (not below
+    $MinSizeBytes, not above $MaxSizeBytes), formats NTFS, and writes an
+    owner marker onto the new volume so the orphan reaper can later
+    attribute (and safely dispose of) a leftover disk from a crashed run
+    -- ImDisk volumes carry no ownership info of their own.
+
+    Two-tier sizing (2026-08-20, replaces a flat 60%-of-available
+    formula): a real PRINCE production crash (SvtMalloc[fatal]: allocate
+    memory failed, 4K/10-bit "Happiness for Beginners") traced to the
+    encoder's own internal picture-buffer pool (~7.6GB just for SVT-AV1's
+    picture buffers at that resolution/GOP config, before any other
+    internal structures) competing with a ramdisk that had already
+    claimed 60% of available memory before the encoder even started.
+    Below $TierThresholdBytes available, a flat $CapSmallBytes cap leaves
+    generous, predictable headroom for the encoder regardless of ramdisk
+    math (explicit user direction: most fleet machines have 64GB+, a
+    12GB cap on a ~32GB machine leaves ~20GB); at or above the
+    threshold, $PercentOfAvailable% of available is used instead, since
+    a large-RAM machine has enough headroom either way and a flat cap
+    there would waste real staging capacity for no benefit.
 
     Returns $null if creation failed for any reason (caller must fall
     back to VesStaging's local-disk staging, never fail closed on
@@ -85,7 +100,9 @@ function New-VesRamDiskJob {
     graceful-degradation intent in bash).
     #>
     param(
-        [int]$PercentOfAvailable = 60,
+        [int]$PercentOfAvailable = 45,
+        [long]$TierThresholdBytes = 64GB,
+        [long]$CapSmallBytes = 12GB,
         [long]$MinSizeBytes = 256MB,
         # No longer WSL2-constrained (bash's own ramdisk_create has no
         # equivalent absolute cap, only the percentage) -- raised well
@@ -98,7 +115,14 @@ function New-VesRamDiskJob {
     )
 
     $avail = Get-VesAvailableMemoryBytes
-    $sizeBytes = [long]($avail * $PercentOfAvailable / 100)
+    if ($avail -ge $TierThresholdBytes) {
+        $sizeBytes = [long]($avail * $PercentOfAvailable / 100)
+    } else {
+        # Never claim more than is actually free, even under the flat
+        # cap -- a machine with less than $CapSmallBytes free entirely
+        # would otherwise get a request guaranteed to fail below.
+        $sizeBytes = [math]::Min($CapSmallBytes, $avail)
+    }
     if ($sizeBytes -lt $MinSizeBytes) { $sizeBytes = $MinSizeBytes }
     if ($sizeBytes -gt $MaxSizeBytes) { $sizeBytes = $MaxSizeBytes }
     if ($sizeBytes -ge $avail) {
