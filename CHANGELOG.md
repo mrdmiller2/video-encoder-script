@@ -4,6 +4,46 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.1K — 2026-08-20
+
+**Fixed a Windows-only diagnostic-logging gap discovered while retesting the
+v5.1.1J fix**: relaunching "Happiness for Beginners (2023)" on PRINCE after
+the v5.1.1J two-tier RAM-disk sizing fix reproduced the exact same crash
+(`ffmpeg.exe` access violation, `0xc0000005`, identical fault offset both
+times), but with 16.6GB of 31.7GB RAM still free at the moment of the
+crash — ruling out RAM-disk/memory-pressure as this crash's cause and
+pointing at a genuine, deterministic native crash inside `ffmpeg.exe`
+itself (confirmed via Windows Event Log's Application Error record, not
+guessed). Investigating it further was blocked by a real gap:
+`Invoke-VesTrackedProcess` (`windows/modules/VesTrackedProcess.psm1`)
+captured stderr via `.NET`'s `ReadToEndAsync()`, buffered entirely in
+memory and only written to the sidecar log file after `WaitForExit()`
+returned — so a hard access-violation crash, which tears down the
+process's stdio pipes without a clean exit, left the sidecar log
+completely empty both times, with no way to tell whether the encoder ever
+printed anything before it died.
+
+**Fixed**: rewrote the capture as a synchronous polling read loop —
+`ReadLineAsync()` against the child's stdout/stderr, waited on with a
+bounded timeout so the loop can also poll `$proc.HasExited`, with every
+stderr line appended and flushed to the sidecar log file as it arrives.
+Whatever the crashed process managed to write before dying is now durably
+on disk immediately, not sitting in an in-memory buffer that only
+persists on a clean exit. This intentionally does *not* use
+`Register-ObjectEvent` (already proven to silently drop output in this
+runtime, see `VesTimeoutRetry.psm1`) — it's the dedicated polling loop
+that file's own comment called for if live capture ever became a real
+requirement. Bash's stderr capture already streamed live via `tee` on a
+process-substitution fd (see `ves-twostage-encode.sh`), so this is a
+Windows-only fix; the bash version bump is for fleet version-parity only,
+no bash code changed. Callers only consume `.ExitCode` from this
+function's return value, never the in-memory `.StdErr`/`.StdOut` strings
+programmatically, so this is a safe internal rework with no call-site
+changes needed. Syntax-verified (`pwsh -Command
+[System.Management.Automation.Language.Parser]::ParseFile`); a live
+crash-reproduction re-test on PRINCE is the real verification, in
+progress.
+
 ## v5.1.1J — 2026-08-20
 
 **Root-caused why the RAM-disk-exhaustion failures kept happening**,

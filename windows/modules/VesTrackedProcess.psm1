@@ -3,19 +3,20 @@
 # UNBOUND (no timeout) -- this is not Invoke-VesWithTimeoutRetry, which is
 # validation-probe-only.
 #
-# Deliberate deviation from the bash version, not an oversight: bash's
-# _run_capturing_stderr streams stderr to the log file live (via
-# `tee -a` on a process-substitution fd), so a crash mid-encode still
-# leaves a partial trail. This port captures stderr via .NET Task-based
-# ReadToEndAsync() and writes it out once the process exits, per the same
-# reasoning documented in VesTimeoutRetry.psm1: Register-ObjectEvent-based
-# "live" capture depends on PowerShell's event queue being pumped, which a
-# synchronous WaitForExit() doesn't do, and was already proven to silently
-# drop output in this exact runtime. A reliable end-of-run capture beats an
-# unreliable live one. If genuinely live capture becomes a real requirement
-# (e.g. a future heartbeat/kill-on-hang mechanism needs to inspect stderr
-# WHILE the process is still running), revisit with a dedicated polling
-# read loop instead of re-attempting the event-based approach.
+# Stderr capture is a synchronous polling read loop (2026-08-20), not
+# Register-ObjectEvent (proven unreliable in this runtime, see
+# VesTimeoutRetry.psm1) and not end-of-run ReadToEndAsync (the prior
+# design here, which lost 100% of a crashed process's diagnostic output
+# twice in a row on PRINCE: a hard access-violation crash (0xc0000005)
+# closes the process's stdio pipes without our side ever having read the
+# already-written bytes back, so ReadToEndAsync's single post-WaitForExit
+# .Result came back empty both times -- there was no way to tell whether
+# the encoder ever printed anything before it died). This loop calls
+# ReadLineAsync() against the child's stderr, waits on each line with a
+# bounded timeout so it can also poll $proc.HasExited, and appends+flushes
+# every line to $ErrorLogPath as it arrives -- so whatever the process did
+# manage to write before a hard crash is already durably on disk, not
+# sitting in an in-memory buffer that only gets persisted on a clean exit.
 
 function Invoke-VesTrackedProcess {
     <#
@@ -42,51 +43,70 @@ function Invoke-VesTrackedProcess {
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = $psi
 
+    # Opened once, up front, so a mid-encode crash still leaves whatever
+    # was already read on disk. Best-effort per-line write, matching the
+    # same non-fatal-diagnostic-write reasoning as the try/catch below
+    # (see the 2026-08-12 RANDYJ incident this whole pattern traces back
+    # to: a failed diagnostic write must never take down a job whose real
+    # encode work already succeeded/is still running).
+    $logStream = $null
+    try {
+        $logStream = New-Object System.IO.StreamWriter($ErrorLogPath, $false)
+        $logStream.AutoFlush = $true
+    } catch {
+        Write-Warning "Could not open stderr sidecar log for live capture (non-fatal, continuing without it): $ErrorLogPath -- $_"
+    }
+
     try {
         $proc.Start() | Out-Null
-        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
-        $stderrTask = $proc.StandardError.ReadToEndAsync()
 
-        $proc.WaitForExit()
-        [System.Threading.Tasks.Task]::WaitAll(@($stdoutTask, $stderrTask))
+        $stdoutBuf = New-Object System.Text.StringBuilder
+        $stderrBuf = New-Object System.Text.StringBuilder
+        $stdoutTask = $proc.StandardOutput.ReadLineAsync()
+        $stderrTask = $proc.StandardError.ReadLineAsync()
 
-        $stderrContent = $stderrTask.Result
-        if ($stderrContent) {
-            # Best-effort only (2026-08-12 fix): this is a diagnostic
-            # sidecar, not part of the encode's success/failure contract --
-            # every caller already treats these stderr logs as non-fatal
-            # (see VesTwoStageEncode.psm1's comment on this exact point).
-            # But a bare Set-Content throws on any write failure, and an
-            # uncaught exception here propagates out of this function
-            # entirely, past the caller's try/finally (finally does not
-            # swallow it), and up to the job-loop's own try/catch, which
-            # aborts the WHOLE job -- discarding an already-fully-completed
-            # real encode over nothing but a diagnostic-log write failure.
-            # Found via a real production incident on RANDYJ (ex-GruntBox2):
-            # every one of 36 jobs in an overnight Orville batch (~40+ hours
-            # of real encoding) threw "Access to the path ... stderr.log is
-            # denied" and was discarded with zero output, because icacls
-            # couldn't widen this particular NAS share's ACL (Set-
-            # VesEveryoneReadWrite's own self-heal also failed there, a
-            # separate NAS-permission issue not fixed here) and every
-            # resulting Set-Content threw. Source files were never touched
-            # (this write is output-side only), but the wasted compute was
-            # total. A failed diagnostic write should degrade to a warning,
-            # never take down the job whose real work already succeeded.
-            try {
-                Set-Content -Path $ErrorLogPath -Value $stderrContent -NoNewline
-            } catch {
-                Write-Warning "Could not write stderr sidecar log (non-fatal, continuing): $ErrorLogPath -- $_"
+        while ($true) {
+            $pending = @($stdoutTask, $stderrTask) | Where-Object { $_ }
+            if ($pending.Count -eq 0) {
+                if ($proc.HasExited) { break }
+                Start-Sleep -Milliseconds 200
+                continue
             }
+            [System.Threading.Tasks.Task]::WaitAny($pending, 500) | Out-Null
+
+            if ($stdoutTask -and $stdoutTask.IsCompleted) {
+                $line = $stdoutTask.Result
+                if ($null -eq $line) {
+                    $stdoutTask = $null
+                } else {
+                    [void]$stdoutBuf.AppendLine($line)
+                    $stdoutTask = $proc.StandardOutput.ReadLineAsync()
+                }
+            }
+            if ($stderrTask -and $stderrTask.IsCompleted) {
+                $line = $stderrTask.Result
+                if ($null -eq $line) {
+                    $stderrTask = $null
+                } else {
+                    [void]$stderrBuf.AppendLine($line)
+                    if ($logStream) {
+                        try { $logStream.WriteLine($line) } catch { }
+                    }
+                    $stderrTask = $proc.StandardError.ReadLineAsync()
+                }
+            }
+            if (-not $stdoutTask -and -not $stderrTask -and $proc.HasExited) { break }
         }
+        $proc.WaitForExit()
 
         return [PSCustomObject]@{
             ExitCode  = $proc.ExitCode
-            StdOut    = $stdoutTask.Result
-            StdErr    = $stderrContent
+            StdOut    = $stdoutBuf.ToString()
+            StdErr    = $stderrBuf.ToString()
             ProcessId = $proc.Id
         }
     } finally {
+        if ($logStream) { $logStream.Dispose() }
         $proc.Dispose()
     }
 }
