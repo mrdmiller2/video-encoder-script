@@ -4,6 +4,23 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.1P — 2026-08-21
+
+**Recalibrated the v5.1.1O RAM-disk opt-out gate**, explicit user
+direction: switched from a 64GB *total installed* RAM threshold to a
+59GB *currently available (free)* RAM threshold. Renamed
+`CONVERT_RAMDISK_MIN_TOTAL_GB` → `CONVERT_RAMDISK_MIN_AVAIL_GB` (bash,
+default 59) / `$RamDiskMinTotalBytes` → `$RamDiskMinAvailBytes`
+(Windows, `59GB`), both now keyed off the same available-memory basis
+`_mem_available_bytes()`/`Get-VesAvailableMemoryBytes` already uses for
+the two-tier sizing formula, instead of a separate total-installed-RAM
+figure. Removed the now-unused `_mem_total_bytes()`/
+`Get-VesTotalMemoryBytes` helpers added in v5.1.1O, since nothing else
+needed them once the gate switched basis. The gate's actual effect (skip
+ramdisk staging by default, fall through to the existing local-disk
+staging fallback) is unchanged — only what it measures and the exact
+number changed. Syntax-verified.
+
 ## v5.1.1O — 2026-08-21
 
 **RAM-disk staging is now opt-out by hardware class, not universal**,

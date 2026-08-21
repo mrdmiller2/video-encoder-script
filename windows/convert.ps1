@@ -251,14 +251,16 @@ $stageDir = $LocalStagingDir
 # both fixed, but the underlying tradeoff didn't hold up: video encoding
 # is CPU-bound, so a ramdisk's write-latency advantage over a real local
 # SSD is marginal for this workload, while the failure modes are real.
-# Machines with less than $RamDiskMinTotalBytes of TOTAL installed RAM
-# (not available -- see Get-VesTotalMemoryBytes' own comment) now skip
-# ramdisk staging entirely by default and fall straight through to local
-# disk staging (same write-back-to-NAS-on-completion, same local-only
-# logs). Sizing itself is unchanged for machines that still qualify.
-$RamDiskMinTotalBytes = 64GB
-$totalMem = Get-VesTotalMemoryBytes
-if (-not $NoRamDisk -and -not $DryRun -and $totalMem -ge $RamDiskMinTotalBytes) {
+# Machines with less than $RamDiskMinAvailBytes of currently AVAILABLE
+# (free) RAM -- same basis Get-VesAvailableMemoryBytes already uses for
+# sizing, not total installed RAM (explicit user direction, 2026-08-21) --
+# now skip ramdisk staging entirely by default and fall straight through
+# to local disk staging (same write-back-to-NAS-on-completion, same
+# local-only logs). Sizing itself is unchanged for machines that still
+# qualify.
+$RamDiskMinAvailBytes = 59GB
+$availMemForGate = Get-VesAvailableMemoryBytes
+if (-not $NoRamDisk -and -not $DryRun -and $availMemForGate -ge $RamDiskMinAvailBytes) {
     $ramDiskJob = New-VesRamDiskJob
     if ($ramDiskJob) {
         Write-VesLog "RAM disk staging: $($ramDiskJob.RootPath) ($($ramDiskJob.StagePath))"
@@ -267,8 +269,8 @@ if (-not $NoRamDisk -and -not $DryRun -and $totalMem -ge $RamDiskMinTotalBytes) 
         Write-VesLog 'RAM disk staging unavailable -- falling back to local disk staging'
     }
 } elseif (-not $NoRamDisk -and -not $DryRun) {
-    $totalGb = [math]::Round($totalMem / 1GB)
-    Write-VesLog "RAM disk staging: this machine has ${totalGb}GB total RAM, below the 64GB default threshold -- using local-disk staging by default"
+    $availGb = [math]::Round($availMemForGate / 1GB)
+    Write-VesLog "RAM disk staging: this machine has ${availGb}GB of free RAM right now, below the 59GB default threshold -- using local-disk staging by default"
 }
 
 $statePath = Get-VesResumeSidecarPath -JobRoot $JobRoot -Hostname $env:COMPUTERNAME -Kind 'state'

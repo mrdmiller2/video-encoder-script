@@ -40,18 +40,6 @@ function Get-VesAvailableMemoryBytes {
     return [long](Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory * 1KB
 }
 
-function Get-VesTotalMemoryBytes {
-    <#
-    .SYNOPSIS
-    Port of _mem_total_bytes(). TOTAL installed physical RAM, not
-    available-right-now -- deliberately separate from
-    Get-VesAvailableMemoryBytes above. Used only to decide WHETHER to use
-    a ramdisk at all (a fixed hardware characteristic), never to size one
-    (sizing stays keyed off available memory at creation time).
-    #>
-    return [long](Get-CimInstance Win32_OperatingSystem).TotalVisibleMemorySize * 1KB
-}
-
 function Get-VesFreeRamDiskDriveLetter {
     <#
     .SYNOPSIS
@@ -354,6 +342,6 @@ function Clear-VesRamDiskStaleAttemptFiles {
     }
 }
 
-Export-ModuleMember -Function Get-VesAvailableMemoryBytes, Get-VesTotalMemoryBytes, Get-VesFreeRamDiskDriveLetter, `
+Export-ModuleMember -Function Get-VesAvailableMemoryBytes, Get-VesFreeRamDiskDriveLetter, `
     New-VesRamDiskJob, Test-VesRamDiskOwnedByCurrentJob, Remove-VesRamDiskJob, Get-VesRamDiskLeftovers, `
     Clear-VesRamDiskStaleAttemptFiles
