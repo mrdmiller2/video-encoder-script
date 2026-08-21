@@ -53,6 +53,11 @@ function Invoke-VesTrackedProcess {
     try {
         $logStream = New-Object System.IO.StreamWriter($ErrorLogPath, $false)
         $logStream.AutoFlush = $true
+        # Diagnostic marker (2026-08-20, temporary -- pending a real crash
+        # to isolate whether a hard-crash scenario ever reaches the write
+        # loop below at all, vs. the file existing-but-empty, vs. never
+        # being created). Remove once that's confirmed either way.
+        $logStream.WriteLine("[capture started $(Get-Date -Format o)]")
     } catch {
         Write-Warning "Could not open stderr sidecar log for live capture (non-fatal, continuing without it): $ErrorLogPath -- $_"
     }
@@ -75,7 +80,16 @@ function Invoke-VesTrackedProcess {
             [System.Threading.Tasks.Task]::WaitAny($pending, 500) | Out-Null
 
             if ($stdoutTask -and $stdoutTask.IsCompleted) {
-                $line = $stdoutTask.Result
+                # .Result on a faulted task re-throws synchronously -- a
+                # broken pipe on a hard crash must not escape this loop
+                # uncaught (matches the same non-fatal-diagnostic
+                # reasoning as the try/catch around $logStream above).
+                try {
+                    $line = $stdoutTask.Result
+                } catch {
+                    if ($logStream) { try { $logStream.WriteLine("[stdout read faulted: $_]") } catch { } }
+                    $line = $null
+                }
                 if ($null -eq $line) {
                     $stdoutTask = $null
                 } else {
@@ -84,7 +98,12 @@ function Invoke-VesTrackedProcess {
                 }
             }
             if ($stderrTask -and $stderrTask.IsCompleted) {
-                $line = $stderrTask.Result
+                try {
+                    $line = $stderrTask.Result
+                } catch {
+                    if ($logStream) { try { $logStream.WriteLine("[stderr read faulted: $_]") } catch { } }
+                    $line = $null
+                }
                 if ($null -eq $line) {
                     $stderrTask = $null
                 } else {
@@ -98,6 +117,7 @@ function Invoke-VesTrackedProcess {
             if (-not $stdoutTask -and -not $stderrTask -and $proc.HasExited) { break }
         }
         $proc.WaitForExit()
+        if ($logStream) { try { $logStream.WriteLine("[capture ended, exitcode=$($proc.ExitCode)]") } catch { } }
 
         return [PSCustomObject]@{
             ExitCode  = $proc.ExitCode

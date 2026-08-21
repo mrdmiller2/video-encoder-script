@@ -4,6 +4,29 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.1M — 2026-08-20
+
+**Temporary diagnostic instrumentation**, added while root-causing the
+"Happiness for Beginners (2023)" `ffmpeg.exe` access-violation crash on
+PRINCE: after both the v5.1.1K live-capture fix and the v5.1.1L
+never-silently-delete fix, a 4th crash-reproduction attempt *still*
+produced no stderr sidecar file at all — no file, not even an empty one,
+and no warning from either fix path. To isolate exactly where the
+capture is failing (file never created vs. created-then-lost
+vs. genuinely zero bytes written by SVT-AV1 before the crash),
+`Invoke-VesTrackedProcess` (`windows/modules/VesTrackedProcess.psm1`) now
+writes an immediate `[capture started ...]` marker line right after
+opening the sidecar log (before the child process even starts) and a
+`[capture ended, exitcode=...]` marker right before returning — so the
+file's mere presence/absence, and which markers it contains, definitively
+answers the question on the next crash. Also hardened the stdout/stderr
+`.Result` reads against a faulted `Task` (accessing `.Result` on a
+faulted async read re-throws synchronously) so a broken pipe on a hard
+crash can't silently escape the capture loop uncaught. Intended to be
+removed once the real crash is root-caused — this is instrumentation, not
+a fix. Syntax-verified; deployed fleet-wide for version parity, no bash
+changes.
+
 ## v5.1.1L — 2026-08-20
 
 **Fixed a second, more severe logging bug found immediately while verifying
