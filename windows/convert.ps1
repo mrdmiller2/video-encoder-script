@@ -257,8 +257,11 @@ $stageDir = $LocalStagingDir
 # now skip ramdisk staging entirely by default and fall straight through
 # to local disk staging (same write-back-to-NAS-on-completion, same
 # local-only logs). Sizing itself is unchanged for machines that still
-# qualify.
-$RamDiskMinAvailBytes = 59GB
+# qualify. Overridable via $env:CONVERT_RAMDISK_MIN_AVAIL_GB (matching
+# bash's identically-named env-var-driven default), e.g. set to 0 to
+# force ramdisk staging on a machine below the default threshold for a
+# deliberate one-off test/comparison run.
+$RamDiskMinAvailBytes = if ($env:CONVERT_RAMDISK_MIN_AVAIL_GB) { [long]$env:CONVERT_RAMDISK_MIN_AVAIL_GB * 1GB } else { 59GB }
 $availMemForGate = Get-VesAvailableMemoryBytes
 if (-not $NoRamDisk -and -not $DryRun -and $availMemForGate -ge $RamDiskMinAvailBytes) {
     $ramDiskJob = New-VesRamDiskJob

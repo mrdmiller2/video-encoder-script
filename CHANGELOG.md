@@ -4,6 +4,21 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.1Q — 2026-08-21
+
+**Windows-only parity fix**: `convert.ps1`'s RAM-disk opt-out threshold
+(`$RamDiskMinAvailBytes`, v5.1.1P) was a hardcoded `59GB` literal with no
+override, unlike bash's `CONVERT_RAMDISK_MIN_AVAIL_GB` which was already
+env-var-driven (`${CONVERT_RAMDISK_MIN_AVAIL_GB:-59}`) from the same
+release. Needed live, mid-session: after updating and rebooting PRINCE
+(31.69GB total, well under the 59GB-free default), forcing a genuine
+RAM-disk-enabled retest required a real override mechanism, not a
+one-off hand-edit of the deployed script. Now reads
+`$env:CONVERT_RAMDISK_MIN_AVAIL_GB` if set (same variable name as bash,
+same override semantics — set to 0 to force ramdisk staging on a
+below-threshold machine), falling back to the 59GB default otherwise.
+No bash changes — bash already had this. Syntax-verified.
+
 ## v5.1.1P — 2026-08-21
 
 **Recalibrated the v5.1.1O RAM-disk opt-out gate**, explicit user
