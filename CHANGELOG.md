@@ -4,6 +4,54 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.1T — 2026-08-21/22
+
+**Windows port of `modules/ves-chunk-coordinator.sh`**: new
+`windows/modules/VesChunkCoordinator.psm1` (manifest creation with the
+same real keyframe-snapped boundaries and shared CRF/profile caching,
+per-chunk claim via `Enter-VesSharedMutexOnce`/`Exit-VesSharedMutex` —
+the same Windows-safe file-claim primitive `VesTitleLock.psm1` already
+uses, not `mkdir`, per this NAS's documented broken-ACL-on-fresh-
+directories behavior), wired into `windows/convert.ps1`'s
+`Import-Module` array (required on Windows — unlike bash, nothing
+auto-discovers new modules by glob). Validated on RANDYJ against a real
+file up through the manifest-creation and claim/status lifecycle before
+today's NAS incident interrupted further testing; the CRF-caching
+extension itself is not yet live-validated on Windows (documented as an
+open item) since real-file testing was blocked by the incident for the
+rest of this session.
+
+**Real bug found and fixed via live bash testing** (not assumed
+correct): `chunk_split_create_manifest()`'s CRF resolution called
+`resolve_crf_for_encode()` inside a `crf="$(...)"` capture without first
+calling `resolve_upscale_target()` as its own statement — the first-ever
+call to `resolve_upscale_target()` for a source logs a one-time
+"Upscale decision: ..." line via `log()` (stdout, this codebase's
+convention), and since `resolve_crf_for_encode()` calls it internally
+too, that log line was leaking into the captured CRF value
+(`crf=[convert] Upscale decision: ...\n26` instead of `crf=26`). Found
+by actually reading the stored `manifest.meta` after a live test, not by
+inspection. Fixed by resolving upscale target as its own statement
+first (populating the same cache `resolve_crf_for_encode` then hits
+silently), matching the call-order discipline the whole-file path
+(`ffmpeg_encode()`) already follows. Reverified end-to-end after the fix
+— `manifest.meta` now correctly shows `crf=26` for a real file, matching
+that title's known-correct CRF from every earlier whole-file test this
+session. Windows was never affected (`Write-Host`, this port's own
+logging primitive, isn't captured by PowerShell variable assignment the
+way bash's `log()`-to-stdout is by `$(...)`).
+
+Also fleet-wide this session (not a code change): root-caused and fixed
+a real NAS incident where attaching a pre-existing, actively-shared ZFS
+dataset (`BigMomma/Media`, `BigPoppa/Media`, `BabyBear/Media`) as an
+Incus disk-device source via the TrueNAS Virt API caused those datasets
+to become unmounted, breaking Media access fleet-wide — fixed via `zfs
+mount` + `exportfs -ra` (both real, safe, non-destructive administrative
+commands, no data was ever at risk). Documented in
+`~/.claude/plans/how-can-we-chaneg-cheeky-goose.md` (the distributed
+chunk-parallel encoding plan this release is part of) as a real
+constraint on that plan's Sting NAS instance.
+
 ## v5.1.1S — 2026-08-21
 
 **New `modules/ves-chunk-coordinator.sh`** (bash only so far; Windows port

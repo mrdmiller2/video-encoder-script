@@ -96,14 +96,26 @@ chunk_split_compute_boundaries() {
   done < <(_chunk_keyframe_timestamps "$src")
 }
 
-# Creates the manifest directory + one boundary file per chunk. Idempotent
-# -- if a complete manifest already exists (a ".complete" marker written
-# last, after every chunk file), does nothing and returns success, so a
-# second machine racing to split the same title is harmless (whichever
-# wins the mkdir below does the real work; the loser just walks away).
+# Creates the manifest directory + one boundary file per chunk, PLUS
+# resolves and caches the profile/codec/HDR/CRF that every chunk encoder
+# must use -- resolved exactly ONCE here (by the splitter), not
+# independently per chunk. Chunks are pieces of one continuous encode;
+# if each chunk's own encoder ran its own CRF search, different chunks
+# could land on different CRFs and produce visibly inconsistent
+# quality/bitrate across chunk boundaries in the final concatenated file.
+# Reuses resolve_crf_for_encode() (ves-vmaf-crf-search.sh) unchanged --
+# same VMAF-target search the whole-file path already runs, just cached
+# fleet-wide via the manifest instead of per-process.
+#
+# Idempotent -- if a complete manifest already exists (a ".complete"
+# marker written last, after every chunk file), does nothing and returns
+# success, so a second machine racing to split the same title is
+# harmless (whichever wins the mkdir below does the real work, including
+# the CRF search; the loser just walks away and reads the winner's
+# cached result later).
 chunk_split_create_manifest() {
-  local src="$1"
-  local mdir tmpdir n prev_ts ts
+  local src="$1" codec="${2:-av1}"
+  local mdir tmpdir n prev_ts ts profile hdr hdr_mode crf
   mdir="$(chunk_manifest_dir "$src")"
   [ -f "$mdir/.complete" ] && return 0
 
@@ -154,9 +166,34 @@ end_ts=EOF
 EOF
   n=$((n + 1))
 
+  profile="$(profile_for_source "$src")" || profile=""
+  hdr_mode="$(determine_hdr_mode "$src")"
+  case "$hdr_mode" in
+    pq|pq_reconstruct|hlg) hdr=true ;;
+    *) hdr=false ;;
+  esac
+  # Resolve upscale target FIRST, as its own statement, not inside the
+  # crf="$(...)" capture below. resolve_upscale_target logs a one-time
+  # "Upscale decision: ..." line via log() (stdout, this codebase's own
+  # convention) the first time it runs for a given source, then caches
+  # the result (UPSCALE_TARGET_CACHE) and stays silent on every later
+  # call. resolve_crf_for_encode calls it internally too -- if THAT were
+  # the first call, the log line would leak into this function's own
+  # $(...) capture and corrupt the stored CRF value. Found via a real
+  # live test: manifest.meta's crf field came back containing the log
+  # line's text instead of a clean number. Matches the exact call-order
+  # discipline the whole-file path (ffmpeg_encode()) already follows.
+  resolve_upscale_target "$src"
+  crf="$(resolve_crf_for_encode "$src" "$codec" "$profile" "$hdr")"
+
   cat >"${tmpdir}/manifest.meta" <<EOF
 source=$src
 chunk_count=$n
+codec=$codec
+profile=$profile
+hdr=$hdr
+hdr_mode=$hdr_mode
+crf=$crf
 created_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 created_host=$(hostname 2>/dev/null || echo unknown)
 EOF
@@ -175,6 +212,13 @@ EOF
   : >"$mdir/.complete"
   log "Chunk split: $n chunk(s) created for $(basename -- "$src")"
   return 0
+}
+
+chunk_manifest_read_field() {
+  local src="$1" field="$2"
+  local mdir
+  mdir="$(chunk_manifest_dir "$src")"
+  awk -F= -v f="^${field}=" '$0 ~ f{sub(f,""); print; exit}' "$mdir/manifest.meta" 2>/dev/null
 }
 
 chunk_lock_path() {
@@ -278,6 +322,98 @@ chunk_mark_status() {
   } >"$tmp"
   mv -f -- "$tmp" "$status_file"
   _restore_default_file_mode "$status_file"
+}
+
+# Encodes ONE already-claimed chunk and moves the result into the
+# manifest directory (NAS-visible, so other machines -- verifiers, the
+# concatenator -- can reach it later; this is the "sub directory under
+# the primary working file" every fleet machine writes chunks into,
+# explicit user direction). The actual ffmpeg write-in-progress still
+# stages locally/on the RAM disk first, exactly like the whole-file path
+# (RAMDISK_JOB_STAGE_DIR if set, else a local scratch dir) -- never
+# writes a partial/in-progress file directly into the NAS-visible
+# manifest dir.
+#
+# Reuses build_ffmpeg_video_args() (ves-twostage-encode.sh) unchanged for
+# the actual codec/profile/CRF args, and run_tracked_encoder/
+# _run_capturing_stderr (ves-tracked-process.sh) unchanged for process
+# tracking + diagnostic capture -- same machinery the whole-file encode
+# path already uses, just windowed to one chunk's time range via input-
+# side -ss/-to. Input-side (not output-side) -ss is both fast (a real
+# keyframe seek, not a full decode-from-start) and frame-accurate here
+# specifically because chunk boundaries are already real keyframes from
+# chunk_split_compute_boundaries()'s own ffprobe scan -- an arbitrary
+# (non-keyframe-aligned) -ss would need output-side seeking instead for
+# accuracy, which this function deliberately does not need to handle.
+chunk_encode_claimed() {
+  local src="$1" idx="$2"
+  local mdir chunk_meta start_ts end_ts codec profile hdr hdr_mode crf
+  local stage_dir out_tmp out_final errfile args rc
+
+  mdir="$(chunk_manifest_dir "$src")"
+  chunk_meta="$mdir/chunk-$(printf '%03d' "$idx").meta"
+  [ -f "$chunk_meta" ] || { warn "Chunk encode: no manifest entry for chunk $idx: $src"; return 1; }
+  start_ts="$(awk -F= '/^start_ts=/{print $2; exit}' "$chunk_meta")"
+  end_ts="$(awk -F= '/^end_ts=/{print $2; exit}' "$chunk_meta")"
+
+  codec="$(chunk_manifest_read_field "$src" codec)"
+  profile="$(chunk_manifest_read_field "$src" profile)"
+  hdr="$(chunk_manifest_read_field "$src" hdr)"
+  hdr_mode="$(chunk_manifest_read_field "$src" hdr_mode)"
+  crf="$(chunk_manifest_read_field "$src" crf)"
+  if [ -z "$codec" ] || [ -z "$crf" ]; then
+    warn "Chunk encode: manifest.meta missing codec/crf for $src -- was it created by chunk_split_create_manifest?"
+    return 1
+  fi
+
+  build_ffmpeg_video_args "$codec" "$crf" "$src" "$profile" "$hdr" "$hdr_mode" || {
+    warn "Chunk encode: build_ffmpeg_video_args failed for chunk $idx: $src"
+    return 1
+  }
+
+  # Staging dir: RAM disk if this run has one, else a local scratch dir
+  # beside the script's own deployment (guaranteed real local disk, not
+  # tmpfs-only-on-Linux/NFS -- same fallback _CONVERT_V4_SCRIPT_DIR-based
+  # convention this codebase already uses for diagnostic logs).
+  if [ -n "${RAMDISK_JOB_STAGE_DIR:-}" ]; then
+    stage_dir="$RAMDISK_JOB_STAGE_DIR"
+  else
+    stage_dir="${_CONVERT_V4_SCRIPT_DIR:-/tmp}/chunk-stage"
+    mkdir -p "$stage_dir" 2>/dev/null
+  fi
+  out_tmp="${stage_dir}/$(canonical_title_from_source "$src").chunk${idx}.$$.mkv"
+  out_final="${mdir}/chunk-$(printf '%03d' "$idx").output.mkv"
+
+  local _local_log_dir="${_CONVERT_V4_SCRIPT_DIR:-/tmp}/logs/ffmpeg-tmp"
+  mkdir -p "$_local_log_dir" 2>/dev/null
+  errfile="${_local_log_dir}/$(canonical_title_from_source "$src").chunk${idx}.${codec}.$$.stderr.log"
+
+  args=(-y -nostdin -v warning -stats -ss "$start_ts")
+  if [ "$end_ts" != "EOF" ]; then
+    args+=(-to "$end_ts")
+  fi
+  args+=(-thread_queue_size 4096 -i "$src" -map 0:v:0 -map "0:a?" "${FF_VIDEO_ARGS[@]}")
+  if [ "${#FF_VF[@]}" -gt 0 ]; then
+    local vf_joined
+    vf_joined="$(IFS=,; printf '%s' "${FF_VF[*]}")"
+    args+=(-vf "$vf_joined")
+  fi
+  args+=(-max_muxing_queue_size 8192 -fps_mode cfr -f matroska "$out_tmp")
+
+  rc=0
+  run_tracked_encoder "chunk $idx encode" _run_capturing_stderr "$errfile" "${FFMPEG_CMD[@]}" "${args[@]}" || rc=$?
+  if [ "$rc" -ne 0 ] || [ ! -s "$out_tmp" ]; then
+    warn "Chunk encode failed (chunk $idx, rc=$rc): $src -- stderr: $errfile"
+    rm -f -- "$out_tmp" 2>/dev/null
+    chunk_mark_status "$src" "$idx" "encode-failed" "rc=$rc"
+    return 1
+  fi
+
+  mv -f -- "$out_tmp" "$out_final"
+  _restore_default_file_mode "$out_final"
+  chunk_mark_status "$src" "$idx" "encoded" "output=$out_final"
+  log "Chunk $idx encoded: $(basename -- "$src") [$start_ts-$end_ts]"
+  return 0
 }
 
 # True (exit 0) only once every chunk in the manifest has status=verified.

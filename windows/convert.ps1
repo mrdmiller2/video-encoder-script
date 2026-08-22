@@ -83,7 +83,7 @@ foreach ($m in @(
         'VesRamDisk', 'VesOrphanReaper', 'VesShardedScan',
         'VesSubtitleFilter', 'VesProfileDecision', 'VesVmafCrfSearch', 'VesTwoStageEncode',
         'VesTelegram', 'VesOrganize', 'VesPipelineScan', 'VesHandBrake', 'VesDiscSource',
-        'VesLegacyFallback', 'VesHwDetect', 'VesSourceTraits', 'VesQtgmc'
+        'VesLegacyFallback', 'VesHwDetect', 'VesSourceTraits', 'VesQtgmc', 'VesChunkCoordinator'
     )) {
     Import-Module (Join-Path $ModuleDir "modules\$m.psm1") -Force
 }
