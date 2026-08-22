@@ -129,6 +129,13 @@ chunk_split_create_manifest() {
     # just retry chunk_should_split's caller path on its next scan pass.
     return 1
   fi
+  # This directory is shared write-target for every encoder-tier machine
+  # claiming chunks, not just the splitter -- fleet worker accounts are NOT
+  # UID/GID-aligned across machines (confirmed 2026-08-22: LAYTOYAJ=1000,
+  # Plex=1001, MJACKSON=1002, Sting=3000), so a restrictive default mkdir
+  # mode leaves every other host's writes silently failing. Matches this
+  # project's File Permissions CONSTANT (666/777 as needed).
+  chmod 0777 -- "$mdir" 2>/dev/null || true
 
   tmpdir="$(mktemp -d "${mdir}.build.XXXXXX")" || { rmdir -- "$mdir" 2>/dev/null; return 1; }
 
@@ -409,9 +416,17 @@ chunk_encode_claimed() {
     return 1
   fi
 
-  mv -f -- "$out_tmp" "$out_final"
+  if ! mv -f -- "$out_tmp" "$out_final"; then
+    warn "Chunk encode: failed to move output into manifest dir (chunk $idx, permission/space?): $out_final"
+    rm -f -- "$out_tmp" 2>/dev/null
+    chunk_mark_status "$src" "$idx" "encode-failed" "rc=mv-failed"
+    return 1
+  fi
   _restore_default_file_mode "$out_final"
-  chunk_mark_status "$src" "$idx" "encoded" "output=$out_final"
+  if ! chunk_mark_status "$src" "$idx" "encoded" "output=$out_final"; then
+    warn "Chunk encode: output written but failed to record status (chunk $idx, permission?): $out_final"
+    return 1
+  fi
   log "Chunk $idx encoded: $(basename -- "$src") [$start_ts-$end_ts]"
   return 0
 }
