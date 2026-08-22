@@ -4,6 +4,42 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.1S — 2026-08-21
+
+**New `modules/ves-chunk-coordinator.sh`** (bash only so far; Windows port
+pending), Phase 2 of the distributed chunk-parallel encoding initiative
+(see `~/.claude/plans/how-can-we-chaneg-cheeky-goose.md`): the manifest
+creation and per-chunk atomic claim primitives that let multiple specific
+fleet machines cooperate on one file, something no existing code path
+supports (`ves-sharded-scan.sh`/`ves-pipeline-scan.sh` are pull-based,
+single-machine-per-file throughout). Not yet wired into the main scan
+loop — this release only adds the new module as a self-contained,
+independently-tested unit, following this project's own precedent for
+introducing new subsystems incrementally.
+
+- Chunk boundaries are real, **keyframe-snapped source timestamps** (an
+  `ffprobe -skip_frame nokey` scan), not assumed at a fixed interval —
+  necessary for a clean later stream-copy concat, since a time-based cut
+  alone doesn't guarantee landing on a decodable boundary.
+- Per-chunk claiming reuses `ves-title-lock.sh`'s exact proven mkdir-lock
+  + mv-based-stale-reclaim primitive (atomic on NFS/CIFS, same 7200s
+  staleness ceiling), just keyed by `<title>.chunk<N>` instead of
+  `<title>` alone — no new locking mechanism, only a new key convention.
+- Manifest storage is one-file-per-chunk, not a single shared file
+  multiple machines append to — deliberately, per this project's own
+  prior finding that shared-file append is unreliable on this NAS (see
+  the ELVIS Phase 3 done-log precedent).
+- **Real bug found and fixed via live testing** (not assumed correct):
+  `ffprobe`'s `-of csv=print_section=0` still emits a trailing comma
+  after a single-field row, which was silently leaking into every stored
+  `start_ts`/`end_ts` value (`611.110000,` instead of `611.110000`) —
+  would have broken every downstream `ffmpeg -ss`/`-to` call. Found by
+  actually running the splitter against a real 6674-second movie and
+  reading the stored chunk files, not by inspection alone. Fixed, then
+  reverified end-to-end (11 real chunks, correct manifest structure,
+  claim → status write → release lifecycle all confirmed) on the same
+  file after the fix.
+
 ## v5.1.1R — 2026-08-21
 
 **New per-machine SVT-AV1 parallelism override plumbing** (spec'd out,

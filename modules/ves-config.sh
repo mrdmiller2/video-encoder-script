@@ -6,7 +6,7 @@
 # MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
 # bug fix) -- see its own comment.
 
-VERSION="5.1.1R"
+VERSION="5.1.1S"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
 # as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
@@ -209,6 +209,22 @@ CONVERT_RAMDISK_CAP_SMALL_GB="${CONVERT_RAMDISK_CAP_SMALL_GB:-12}"
 CONVERT_RAMDISK_MIN_AVAIL_GB="${CONVERT_RAMDISK_MIN_AVAIL_GB:-59}"
 CONVERT_NO_RAMDISK="${CONVERT_NO_RAMDISK:-false}"
 CONVERT_RAMDISK_DIR="${CONVERT_RAMDISK_DIR:-}"
+# Distributed chunk-parallel encoding (2026-08-21, Layer 1 of the
+# chunk-parallel + per-shot dynamic optimization initiative) -- opt-in,
+# default OFF (CONVERT_CHUNK_PARALLEL_ENABLED unset), so this new
+# coordination layer (modules/ves-chunk-coordinator.sh) has zero effect
+# on any machine until explicitly enabled per the plan's Phase 4
+# real-world validation step. CONVERT_CHUNK_MIN_DURATION_SECS: only
+# sources at least this long are worth chunk-splitting's coordination
+# overhead (default 3600s/1hr -- a short file finishes fast enough on one
+# machine that distributing it isn't worth the manifest/claim/verify
+# round-trips). CONVERT_CHUNK_TARGET_SECS: rough target chunk length
+# before keyframe-snapping (default 600s/10min) -- real boundaries always
+# land on the source's own actual keyframes, never exactly on this
+# number, see chunk_split_compute_boundaries().
+CONVERT_CHUNK_PARALLEL_ENABLED="${CONVERT_CHUNK_PARALLEL_ENABLED:-false}"
+CONVERT_CHUNK_MIN_DURATION_SECS="${CONVERT_CHUNK_MIN_DURATION_SECS:-3600}"
+CONVERT_CHUNK_TARGET_SECS="${CONVERT_CHUNK_TARGET_SECS:-600}"
 RAMDISK_SIZE_ESTIMATE_MARGIN_PCT=10
 # Set once per run by ramdisk_job_start(), read by every file's
 # resolve_encode_stage_path() -- not re-resolved per file, so a run that
