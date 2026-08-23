@@ -4,6 +4,44 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.1W — 2026-08-22
+
+**Phase 3 wiring: real automated verifier + finalizer, and the encoder-tier
+claim/encode driver, for the chunk-parallel pipeline.** Everything before
+this version required manually SSHing into each machine to drive the
+split/claim/encode/verify/concatenate steps by hand — the mechanism was
+proven correct (Mad Heidi test, 98.17 mean VMAF) but none of it ran on its
+own. This version wires it into the pipeline for real, still gated off by
+default (`CONVERT_CHUNK_PARALLEL_ENABLED=false`), per the plan's Phase 4
+requirement that it not go fleet-default until a real live end-to-end
+validation pass:
+
+- New `chunk_parallel_process_video()` (`ves-chunk-coordinator.sh`): the
+  entry point `try_av1_convert` now calls instead of a whole-file encode
+  whenever `chunk_should_split` is true. Splits (idempotent), claims one
+  chunk, encodes it, returns — same one-job-per-call contract every other
+  entry point in this loop already follows; the scan loop's own repeated
+  iteration drives a title's remaining chunks forward across passes.
+- New module `modules/ves-chunk-verify.sh` (intended for Sting, matching
+  the bake-off decision in `project_chunk_parallel_verifier_bakeoff_2026_08_22`,
+  but not host-specific code): `chunk_verify_pending()` does a cheap
+  structural decode check per newly-encoded chunk (not a VMAF judgment —
+  see the module header for why); `chunk_finalize_manifest()` concatenates
+  via `mkvmerge` once every chunk is verified, then runs the *same*
+  whole-file `measure_final_vmaf`/`vmaf_target_for_source` gate a normal
+  whole-file encode is held to, before promoting the result to the
+  canonical output path. Deliberately does NOT touch the original source,
+  write the done-log, or write anything the existing scan-time path
+  (`inspect_existing_outputs_for_queue` → `validate_mkv_output` →
+  `done_log_append`) doesn't already handle correctly for any valid file
+  sitting at `av1_output_path` — avoids a second, harder-to-keep-in-sync
+  copy of safety-critical completion logic.
+- `chunk_verifier_scan_once()`: one pass over every `*.chunks` manifest
+  under the scan roots, driving verify+finalize for whichever ones are
+  ready. No daemon/sleep-loop wrapper yet — that, and a real live
+  end-to-end validation run, are the explicit next steps (Phase 4) before
+  this is trusted unattended against production data.
+
 ## v5.1.1V — 2026-08-22
 
 **Real bug found live during the first Mad Heidi chunk-parallel fleet test**:

@@ -431,6 +431,45 @@ chunk_encode_claimed() {
   return 0
 }
 
+# Encoder-tier entry point (Phase 3 wiring, 2026-08-22): called from
+# try_av1_convert in place of a whole-file encode whenever
+# chunk_should_split "$src" is true. Splits (idempotent -- a no-op if
+# another machine already split or is mid-split) then claims and encodes
+# AT MOST ONE chunk before returning, matching this codebase's existing
+# one-job-per-call convention (the outer scan loop's own iteration is what
+# provides "keep going" -- see convert_run_pipeline_jobs/
+# convert_library_batch, both of which just call this again next pass).
+# Returns 0 whenever there was nothing IMMEDIATELY actionable (already
+# fully claimed by other machines, or fully encoded pending verification)
+# so the scan loop moves on to the next file rather than busy-looping on
+# one title; returns 1 only on a real encode failure, matching
+# process_video's other entry points' return-code contract.
+chunk_parallel_process_video() {
+  local src="$1"
+  local idx rc=0
+
+  if ! chunk_split_create_manifest "$src"; then
+    # Either another machine is mid-split (transient -- retry next scan
+    # pass) or .complete already existed (chunk_split_create_manifest's own
+    # early-return, not a failure). Either way, fall through to try
+    # claiming -- a manifest may already exist even though this call
+    # didn't create it.
+    :
+  fi
+
+  idx="$(chunk_claim_next "$src")" || {
+    log "Chunk-parallel: no claimable chunk right now for $(basename -- "$src") (fully claimed or awaiting verification) -- moving on"
+    return 0
+  }
+
+  chunk_encode_claimed "$src" "$idx" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    chunk_release_claim "$src" "$idx" 2>/dev/null || true
+    return 1
+  fi
+  return 0
+}
+
 # True (exit 0) only once every chunk in the manifest has status=verified.
 chunk_all_verified() {
   local src="$1"
