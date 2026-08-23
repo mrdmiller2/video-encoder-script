@@ -4,6 +4,36 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.1V — 2026-08-22
+
+**Real bug found live during the first Mad Heidi chunk-parallel fleet test**:
+`chunk_claim_next()` only skipped chunks already marked `verified`, not
+`encoded`. Since Phase 3's automated verifier isn't wired in yet, every
+encoder-tier machine finished its chunk, released the claim, and
+immediately re-claimed (and re-encoded) that same still-`encoded`
+chunk — all 4 active machines got stuck looping on their own first
+chunk, never advancing to the remaining unclaimed ones. Fixed by
+skipping both `verified` and `encoded` statuses.
+
+## v5.1.1U — 2026-08-22
+
+**Real bug found live during the same test**: `chunk_encode_claimed()`
+never checked the return code of its final output `mv` or its
+`chunk_mark_status` write, so a permission failure was silently reported
+as success while producing no durable output. Root cause: fleet worker
+accounts are not UID/GID-aligned across machines (LAYTOYAJ=1000,
+Plex=1001, MJACKSON=1002, Sting=3000) — a shared manifest directory
+created with a restrictive default mode left every other host's writes
+failing outright. LAYTOYAJ's log showed "chunk 1 encoded OK" four times
+in a row with no status file or output ever produced. Fixed two ways:
+`chunk_encode_claimed` now checks both write operations and reports
+failure on either; `chunk_split_create_manifest` now `chmod 0777`s the
+manifest directory it creates, matching this project's existing file-
+permissions convention (see [[feedback_never_delete_live_lock]] and
+[[feedback_chunk_parallel_tool_parity]] in project memory for the full
+incident writeup, including the tool-version-parity issue found in the
+same session).
+
 ## v5.1.1T — 2026-08-21/22
 
 **Windows port of `modules/ves-chunk-coordinator.sh`**: new
