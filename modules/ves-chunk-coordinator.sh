@@ -259,7 +259,7 @@ chunk_claim_next() {
       local st
       st="$(awk -F= '/^status=/{print $2; exit}' "$status_file" 2>/dev/null)"
       case "$st" in
-        verified) continue ;;
+        verified|encoded) continue ;;
       esac
     fi
     lockdir="$(chunk_lock_path "$src" "$idx").lock"
