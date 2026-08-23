@@ -26,12 +26,31 @@
 # finish with no ffmpeg errors? This is NOT a quality/VMAF judgment --
 # see the module header for why whole-file VMAF is deferred to
 # chunk_finalize_manifest instead of being duplicated per chunk.
+#
+# Retries once before condemning a chunk: found live, 2026-08-23, that a
+# perfectly good chunk can get a transient decode error under real
+# concurrent fleet load (Sting -- or whatever machine runs this -- shares
+# its host with unrelated heavy work; a single bad pass is not proof of
+# real corruption, only a corrupted/truncated FILE is). Two independent,
+# freshly-produced encodes of the same chunk were each condemned once by
+# a single-attempt check, then both independently confirmed to decode
+# perfectly cleanly moments later once contention eased -- a false
+# positive wastes a full re-encode (efficiency loss, not a safety issue,
+# since needs-requeue never accepts unverified data -- see
+# feedback_verify_before_delete), but is cheap to avoid: a short retry
+# after a real failure costs one extra decode pass on the (rare)
+# genuinely-bad chunk, and saves a full re-encode cycle on the (more
+# common, it turns out) transiently-contended good chunk.
 _chunk_output_decodes_clean() {
   local out="$1"
-  local errout
+  local errout attempt
   [ -s "$out" ] || return 1
-  errout="$("${FFMPEG_CMD[@]}" -v error -i "$out" -f null - 2>&1)"
-  [ -z "$errout" ]
+  for attempt in 1 2; do
+    errout="$("${FFMPEG_CMD[@]}" -v error -i "$out" -f null - 2>&1)"
+    [ -z "$errout" ] && return 0
+    [ "$attempt" -eq 1 ] && sleep 20
+  done
+  return 1
 }
 
 # Scans one manifest for chunks sitting at status=encoded and structurally
@@ -112,8 +131,15 @@ chunk_finalize_manifest() {
   for p in "${parts[@]:1}"; do
     mm_args+=(+"$p")
   done
-  if ! run_mkvmerge "${mm_args[@]}" >/dev/null 2>&1; then
-    warn "Chunk-parallel finalize: mkvmerge concat failed: $src"
+  local mm_out
+  # Diagnostics MUST be captured, not swallowed -- found live, 2026-08-23:
+  # an earlier version of this call redirected mkvmerge's output to
+  # /dev/null, so the actual root cause (mismatched per-chunk audio
+  # codecs; see chunk_encode_claimed's audio-codec-pinning fix) was
+  # invisible from the log alone and had to be reproduced by hand.
+  # feedback_verbose_encoder_diagnostics: never trust exit codes alone.
+  if ! mm_out="$(run_mkvmerge "${mm_args[@]}" 2>&1)"; then
+    warn "Chunk-parallel finalize: mkvmerge concat failed: $src -- $mm_out"
     rm -f -- "$concat_tmp" 2>/dev/null
     return 1
   fi

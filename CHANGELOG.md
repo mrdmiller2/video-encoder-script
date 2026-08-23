@@ -4,6 +4,53 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.1X — 2026-08-23
+
+**Phase 4 live end-to-end test: 4 real bugs found and fixed; one critical
+defect found and NOT yet fixed.** First real automated (not manually
+orchestrated) run of the chunk-parallel pipeline across 6 encoder-tier
+machines + Sting as verifier, against two real files (Mad Heidi, The
+Immaculate Room). Full details: memory
+`project_chunk_parallel_phase4_2026_08_23` in the operator's notes.
+
+Fixed:
+- `chunk_parallel_process_video()`: claim lock was only released on
+  encode failure, not success — harmless normally (status already blocks
+  re-claim) but blocked prompt reclaim of a later `needs-requeue` chunk
+  for the full 7200s stale-lock ceiling instead of immediately. Now
+  released on both outcomes.
+- `chunk_split_create_manifest()`: an interrupted splitter left a bare
+  incomplete manifest dir with no staleness/reclaim logic at all —
+  `mkdir` always fails against an existing dir, so one interrupted split
+  permanently broke that title's chunk-parallel path. Added a 900s
+  staleness reclaim (much shorter than the per-chunk 7200s ceiling, since
+  splitting is just a keyframe scan).
+- `chunk_encode_claimed()`: never pinned an explicit audio codec, letting
+  ffmpeg's own per-invocation default vary across chunks (Vorbis on some,
+  AC-3 on others, same source) — `mkvmerge` correctly hard-failed
+  concatenation ("the formats do not match"). Fixed by mirroring the
+  whole-file path's own audio-codec resolution exactly.
+- `chunk_finalize_manifest()`: mkvmerge failures were logged with no
+  error detail (`>/dev/null 2>&1`); now captures and logs real stderr.
+- `_chunk_output_decodes_clean()`: added a retry (2 attempts, 20s apart)
+  before condemning a chunk — found live that a perfectly good chunk can
+  get a transient decode error under real concurrent fleet load on a
+  shared, contended host.
+
+**NOT fixed — critical, open**: the concatenated output failed the
+whole-file VMAF quality gate (84.4 vs 95.0 target; per-window breakdown
+99.8 / 45.9 / 39.3 mean, getting worse later in the file) despite every
+individual chunk having an exactly correct frame count (verified via
+packet count against `duration × 24fps`, 9/10 chunks exact, across
+multiple different machines). The safety gate correctly refused to
+promote the bad file — nothing shipped — but the underlying defect
+(likely a timestamp/PTS drift during mkvmerge's stream-append, possibly
+connected to the source's own coarse `1/1000` container timebase not
+evenly dividing `24fps`) is unresolved. Investigation paused after
+hitting repeated tool-syntax obstacles in the low-level PTS forensics;
+reproducible failing case preserved on Sting for the next session.
+**Layer 1 chunk-parallel is NOT yet safe for production default-on.**
+
 ## v5.1.1W — 2026-08-22
 
 **Phase 3 wiring: real automated verifier + finalizer, and the encoder-tier

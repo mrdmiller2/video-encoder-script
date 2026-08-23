@@ -119,6 +119,30 @@ chunk_split_create_manifest() {
   mdir="$(chunk_manifest_dir "$src")"
   [ -f "$mdir/.complete" ] && return 0
 
+  # Stale-split reclaim: an mdir that exists with no .complete is
+  # ambiguous -- either another host is actively splitting right now (a
+  # real keyframe scan of a multi-GB source can take a couple minutes), or
+  # a prior splitter died mid-build (crash, kill, network drop) and left a
+  # permanently-stuck empty directory behind. Unlike chunk_claim_next's
+  # per-chunk locks, an incomplete mdir had NO staleness/reclaim logic at
+  # all until this fix -- mkdir below always fails against an already-
+  # existing dir, so a single interrupted split permanently broke this
+  # title's chunk-parallel path forever (found live via a real interrupted-
+  # splitter test, 2026-08-23). Threshold is far shorter than the 7200s
+  # per-chunk-encode lock ceiling since a split is just a keyframe scan,
+  # not an hours-long encode -- a genuinely still-splitting host should
+  # finish well inside 900s even on a very large 4K source.
+  if [ -d "$mdir" ]; then
+    local mdir_age mdir_mtime now
+    mdir_mtime="$(mkv_structure_stat_key "$mdir" 2>/dev/null)"; mdir_mtime="${mdir_mtime##*|}"
+    now="$(date +%s)"
+    mdir_age=$(( now - ${mdir_mtime:-$now} ))
+    if [ "$mdir_age" -gt 900 ]; then
+      warn "Chunk split: reclaiming stale incomplete manifest dir (age ${mdir_age}s, no .complete): $mdir"
+      rm -rf -- "$mdir" "${mdir}".build.* 2>/dev/null
+    fi
+  fi
+
   # mkdir as the race-avoidance primitive, same reasoning as
   # place_in_progress_flag's lockdir: atomic even on NFS/CIFS, and the
   # loser of the race backs off rather than duplicating the splitter's
@@ -355,7 +379,7 @@ chunk_mark_status() {
 chunk_encode_claimed() {
   local src="$1" idx="$2"
   local mdir chunk_meta start_ts end_ts codec profile hdr hdr_mode crf
-  local stage_dir out_tmp out_final errfile args rc
+  local stage_dir out_tmp out_final errfile args rc acodec abr
 
   mdir="$(chunk_manifest_dir "$src")"
   chunk_meta="$mdir/chunk-$(printf '%03d' "$idx").meta"
@@ -377,6 +401,22 @@ chunk_encode_claimed() {
     warn "Chunk encode: build_ffmpeg_video_args failed for chunk $idx: $src"
     return 1
   }
+
+  # Audio codec MUST be pinned explicitly, matching the whole-file path's
+  # own resolution exactly (ves-twostage-encode.sh) -- found live,
+  # 2026-08-23: chunk_encode_claimed originally had no -c:a at all, letting
+  # ffmpeg's own default audio-encoder selection decide per invocation.
+  # That produced genuinely different audio codecs across chunks of the
+  # SAME source (Vorbis on some, AC-3 on others), which made mkvmerge's
+  # concat step hard-fail ("the formats do not match") -- a real,
+  # concat-blocking bug, not a cosmetic one. build_ffmpeg_video_args only
+  # ever set VIDEO args (by name and by design); audio was always resolved
+  # separately at each whole-file call site, and chunk_encode_claimed had
+  # never picked that up.
+  case "$codec" in
+    av1)  if [ "$FF_HAS_LIBOPUS" = true ]; then acodec="libopus"; abr="$OPUS_BITRATE_V5"; else acodec="aac"; abr="$AAC_BITRATE_V5"; fi ;;
+    hevc) acodec="aac"; abr="$AAC_BITRATE_V5" ;;
+  esac
 
   # Staging dir: RAM disk if this run has one, else a local scratch dir
   # beside the script's own deployment (guaranteed real local disk, not
@@ -405,6 +445,8 @@ chunk_encode_claimed() {
     vf_joined="$(IFS=,; printf '%s' "${FF_VF[*]}")"
     args+=(-vf "$vf_joined")
   fi
+  args+=(-c:a "$acodec" -b:a "$abr" -af "$(ffmpeg_audio_filter_chain "$acodec")")
+  if [ "$acodec" = libopus ]; then args+=(-mapping_family 1); fi
   args+=(-max_muxing_queue_size 8192 -fps_mode cfr -f matroska "$out_tmp")
 
   rc=0
@@ -463,10 +505,21 @@ chunk_parallel_process_video() {
   }
 
   chunk_encode_claimed "$src" "$idx" || rc=$?
-  if [ "$rc" -ne 0 ]; then
-    chunk_release_claim "$src" "$idx" 2>/dev/null || true
-    return 1
-  fi
+  # Release the claim lock on BOTH outcomes, not just failure: once
+  # chunk_mark_status has durably recorded a terminal-for-now status
+  # (encoded or encode-failed), that status field -- not the lock -- is
+  # what chunk_claim_next checks to decide eligibility. A lock left held
+  # after a SUCCESSFUL encode is harmless today (status=encoded is already
+  # skipped outright), but it becomes a real problem the moment the
+  # verifier later marks this same index needs-requeue (ves-chunk-
+  # verify.sh): needs-requeue is NOT in chunk_claim_next's skip list, so
+  # another machine SHOULD be able to reclaim it immediately -- but an
+  # orphaned lock from the original (successful) claim would force that
+  # reclaim to wait out the full 7200s stale-lock ceiling instead. Found
+  # via reasoning through the corrupted-chunk failure-path test before
+  # running it live, 2026-08-23.
+  chunk_release_claim "$src" "$idx" 2>/dev/null || true
+  [ "$rc" -eq 0 ] || return 1
   return 0
 }
 
