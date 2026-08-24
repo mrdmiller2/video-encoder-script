@@ -236,10 +236,84 @@ implementation.
    as part of the full-codebase fork (it already is, since 6.0.0A is a
    direct copy of 5.1.2A which includes it) — no further action needed
    here, just noting it's already inherited correctly.
-7. A live re-encode test of Transference (2020) on JJACKSON (v5.1.2A,
-   testing the new sample-prediction-accuracy tracking from that release)
-   was started before this design-consolidation pass and is still running
-   in the background as of this writing — the AV1-vs-x265 bakeoff sample-
-   test has taken far longer than expected (multiple hours, still no
-   decision as of the last check) and has not yet produced a real chunk-
-   parallel run to validate. Left running (harmless), not yet resolved.
+7. **Resolved.** A live re-encode test of Transference (2020) on JJACKSON,
+   started to validate v5.1.2A's sample-prediction-accuracy tracking, ran
+   for 80+ minutes without reaching a decision (the AV1-vs-x265 bakeoff's
+   iterative per-point VMAF-targeted CRF search is far slower than
+   expected) and was superseded by the content-variance-gate investigation
+   below, which needed the same fleet machines. Killed across JJACKSON/
+   LAYTOYAJ/Plex; no chunk-parallel data was ever produced by this run.
+8. `main`/5.x has since been surgically cleaned of all chunk-parallel code
+   (v5.1.2B) — see that release's CHANGELOG entry. This design doc's home
+   is now exclusively this branch; `main` carries no chunk-related code or
+   documentation going forward.
+
+## Content-complexity-variance gate: tried, real-world tested, reverted
+
+2026-08-24, per explicit user direction, following a "does it make sense
+to gate on more than just duration" question: `chunk_should_split()` was
+extended with a second gate on top of the existing duration threshold —
+`chunk_content_variance_ratio()`, a cheap probe (reusing
+`find_complexity_sample_points()`'s `ffprobe -read_intervals` packet-size-
+only sampling — no decode, no encode, sub-second per file) computing a
+high/median compressed-packet-size ratio across ~15 sample windows. The
+premise: chunk-parallel's real value is per-scene bit reallocation (the
+"Netflix chunk model" reasoning this whole initiative started from), so a
+long but content-consistent source has little real opportunity for it to
+exploit and is better served by a single-machine whole-file encode even
+past the duration bar.
+
+**Real validation, not just the premise, was tested** — first two titles,
+then a 17-title sample deliberately spanning known reference points
+(extreme action: John Wick, Mad Max Fury Road, Mad Heidi; slow/
+contemplative: The Tree of Life, Barry Lyndon, There Will Be Blood, The
+Master; anime across several types; a static single-camera opera; a short
+anime TV episode):
+
+| Title | Category | Ratio |
+|---|---|---|
+| John Wick (2014) | extreme action | **10.04** |
+| 5cm Per Second (2007) | slow anime | 6.82 |
+| The Tree of Life (2011) | slow/contemplative | 4.91 |
+| Transference (2020) | thriller | 5.29 |
+| Your Name (2016) | mixed anime | 3.75 |
+| The Master (2012) | slow | 3.68 |
+| Barry Lyndon (1975) | slow/static-long-takes | 2.89 |
+| Mad Heidi (2022) | action | 2.82 |
+| 07-Ghost S01E01 | short anime TV | 2.27 |
+| Mad Max Fury Road (2015) | extreme action | **2.21** |
+| Ghost in the Shell (1995) | moody anime | 2.13 |
+| The Matrix (1999) | action | 1.94 |
+| La Boheme (1988) | static opera | 1.78 |
+| There Will Be Blood (2007) | slow-burn | 1.65 |
+| Spirited Away (2001) | whimsical anime | 1.48 |
+| Perfect Blue (1997) | psychological anime | 1.41 |
+| Akira (1988) | action anime | 1.39 |
+
+**No coherent genre/pacing correlation.** John Wick scored highest of all
+17; Mad Max Fury Road — arguably the most kinetically-edited action film
+in the sample — scored near the bottom, alongside Mad Heidi. "Slow" films
+spanned 1.65-4.91 with no consistent direction. Action anime clustered at
+the bottom. A smaller earlier round (2 titles) additionally cross-checked
+the metric against real sample-clip encoded-size spread at the same low/
+median/high points (fixed-CRF, no VMAF search) and found the two
+real-encode statistics (high/low vs. high/median) disagreed with each
+other on title ranking, let alone with the packet-size proxy.
+
+**Leading explanation, per explicit user direction, not further
+investigated**: every test source is an already-encoded release file, not
+raw/lossless content. The metric reflects whatever rate-control decisions
+*that prior encoder* made — one step removed from the source's true
+underlying content complexity, and plausibly smoothed over or distorted
+by it in ways a genre label can't predict or correct for.
+
+**Outcome**: reverted. `chunk_should_split()` is duration-only again,
+matching the original design. `chunk_content_variance_ratio()` itself is
+left in the codebase (`ves-chunk-coordinator.sh`), unused by any caller,
+as scaffolding for a future attempt with a better-grounded signal (real
+scene-cut detection via `ffmpeg`'s `scdet` filter was the leading
+alternative raised but not pursued; or access to true pre-encode source
+material, which this fleet generally doesn't have). This section, not
+deletion, is the record — so a future session doesn't re-attempt the same
+packet-size-variance approach blindly without knowing it was already
+tried and why it didn't hold up.
