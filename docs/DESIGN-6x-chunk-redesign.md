@@ -61,11 +61,34 @@ expectation didn't fully hold up.
 
 Decided 2026-08-24, per explicit user direction:
 
-- **Encoder tier (7 machines, x86_64 only)**: JJACKSON, MJACKSON, TITOJ,
-  PRINCE, AI-PROCESSOR, Plex, LAYTOYAJ. Same claim-based model as today,
-  just the roster. GPUs are irrelevant here — software encoding
-  (SVT-AV1/x265) is used fleet-wide, no hardware encode path is in use
-  currently, so machines without a real GPU aren't disadvantaged.
+- **Encoder tier (7 machines, x86_64 only), in a defined SLOT order**:
+  JJACKSON (slot 1), MJACKSON (slot 2), TITOJ (slot 3), PRINCE (slot 4),
+  AI-PROCESSOR (slot 5), Plex (slot 6), LAYTOYAJ (slot 7). GPUs are
+  irrelevant here — software encoding (SVT-AV1/x265) is used fleet-wide,
+  no hardware encode path is in use currently, so machines without a real
+  GPU aren't disadvantaged.
+
+  **The slot order is not just a roster — it's a real design requirement,
+  per explicit user direction**: when a title needs fewer than 7 machines'
+  worth of chunks, use the lowest-numbered slots first (4 chunks needed →
+  slots 1-4 only); when it needs all 7, use all in order. This makes chunk-
+  to-machine assignment **deterministic**, not the fully self-organizing
+  atomic-claim free-for-all the current (Layer 1, pre-redesign)
+  `chunk_claim_next()` uses — chunk N maps to a specific slot/machine by
+  design, not by whichever machine happens to poll first. The reason: pure
+  self-organizing claims make a specific chunk's *origin* untraceable after
+  the fact (any of N idle machines could have grabbed it) — if a
+  concatenated output shows a defect isolated to one chunk, deterministic
+  slot assignment means that chunk's encoding machine is known from its
+  index alone, so a real problem can be traced to "this is an encoder-N
+  issue" vs. "this is a codebase issue every machine would hit" without
+  needing to have logged which machine claimed what at the time. **Not yet
+  implemented** — `chunk_claim_next()` (still the pre-redesign Layer 1
+  logic, unchanged since the fork) is pure atomic self-claim with no slot
+  concept; a deterministic slot-based assignment scheme is real new
+  orchestrator-adjacent logic, to be designed alongside RANDYJ's
+  orchestrator role rather than bolted onto the existing claim primitive
+  in isolation.
 - **MARLONJ (arm64) deliberately excluded from the encoder tier.** Real,
   already-documented precedent: MARLONJ needed a dedicated SVT-AV1 parity
   fix (rebuilt from source at the exact fleet commit, swapped into the
