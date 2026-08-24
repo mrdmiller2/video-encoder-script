@@ -281,6 +281,87 @@ measure_source_baseline_vmaf() {  # src -> prints VMAF or fails
   printf '%s' "$vmaf"
 }
 
+# Cheap content-complexity-variance probe, prints "low median high" (raw
+# compressed bytes summed per sample window) or fails. 2026-08-24. Not a
+# gate on anything -- pure observability, logged via
+# log_source_content_variance() below for future pattern-mining across a
+# much larger real sample than any one investigation session can gather by
+# hand. Originated as chunk_content_variance_ratio() (ves-chunk-
+# coordinator.sh, 6.x-chunk-redesign branch only) while investigating
+# whether chunk-parallel eligibility should gate on more than duration --
+# a real 17-title validation against known reference titles (see
+# docs/DESIGN-6x-chunk-redesign.md on that branch) found no coherent
+# genre/pacing correlation for a collapsed high/median ratio, so that gate
+# was reverted. Per explicit user direction: 17 titles isn't a
+# statistically meaningful sample for something this potentially subtle,
+# so rather than abandon the signal, this generalized version (moved out
+# of the chunk-only module so it can run on both the 6.x branch AND
+# main/5.x, accumulating from real day-to-day fleet volume instead of only
+# deliberate test runs) keeps recording the RAW low/median/high values
+# (not just one ratio) for every file that finishes processing, so future
+# analysis isn't locked into whichever single statistic seemed reasonable
+# today. Reuses the exact same cheap probe mechanism
+# find_complexity_sample_points() already relies on (ves-vmaf-crf-
+# search.sh) -- ffprobe -read_intervals reading only compressed PACKET
+# SIZES across sparse sample windows, no decode and no encode, sub-second
+# even on a multi-GB file.
+source_content_variance_probe() {  # src -> prints "low median high" or fails
+  local src="$1" dur excl_secs=180
+  local usable_end usable_dur probe_width=10 num_probes=15 max_probes spacing pos i s spec="" starts_str
+  local -a probe_starts=()
+
+  dur="$(video_duration "$src" 2>/dev/null)" || return 1
+  usable_end="$(awk -v d="$dur" -v e="$excl_secs" 'BEGIN{r=d-e; if(r<0)r=0; printf "%.0f", r}')"
+  usable_dur="$(awk -v s="$excl_secs" -v e="$usable_end" 'BEGIN{r=e-s; if(r<0)r=0; printf "%.0f", r}')"
+  [ "$usable_dur" -gt 0 ] 2>/dev/null || return 1
+
+  max_probes="$(awk -v d="$usable_dur" -v w="$probe_width" 'BEGIN{ n=int(d/w); if(n<1)n=1; print n }')"
+  [ "$num_probes" -le "$max_probes" ] || num_probes="$max_probes"
+  spacing="$(awk -v d="$usable_dur" -v n="$num_probes" 'BEGIN{ s=d/n; if(s<1)s=1; printf "%.3f", s }')"
+
+  pos="$excl_secs"
+  for ((i = 0; i < num_probes; i++)); do
+    s="$(awk -v p="$pos" 'BEGIN{printf "%.3f", p}')"
+    probe_starts+=("$s")
+    spec+="${s}%+${probe_width},"
+    pos="$(awk -v p="$pos" -v sp="$spacing" 'BEGIN{printf "%.3f", p+sp}')"
+  done
+  spec="${spec%,}"
+  [ -n "$spec" ] || return 1
+  starts_str="${probe_starts[*]}"
+
+  run_ffprobe -v error -select_streams v:0 -read_intervals "$spec" -show_entries packet=pts_time,size -of csv=p=0 "$src" 2>/dev/null | \
+    awk -F, -v starts="$starts_str" -v width="$probe_width" '
+      BEGIN {
+        m = split(starts, arr, " ")
+        for (k = 1; k <= m; k++) probe[k-1] = arr[k] + 0
+      }
+      $1 != "" && $2 != "" {
+        t = $1 + 0; sz = $2 + 0
+        for (k = 0; k < m; k++) {
+          if (t >= probe[k] && t < probe[k] + width) { sum[k] += sz; seen[k] = 1; break }
+        }
+      }
+      END {
+        n = 0
+        for (k = 0; k < m; k++) { if (seen[k]) order[n++] = k }
+        if (n == 0) exit 1
+        high_v = -1
+        for (i = 0; i < n; i++) {
+          k = order[i]; v = sum[k]
+          vals[i] = v
+          if (high_v < 0 || v > high_v) high_v = v
+        }
+        for (i = 1; i < n; i++) {
+          v = vals[i]; j = i - 1
+          while (j >= 0 && vals[j] > v) { vals[j+1] = vals[j]; j-- }
+          vals[j+1] = v
+        }
+        low_v = vals[0]; med_v = vals[int(n/2)]
+        printf "%d %d %d\n", low_v, med_v, high_v
+      }'
+}
+
 source_traits_field_mode() {  # src -> field_mode string ("unknown" if never detected)
   local v="${SOURCE_TRAITS_CACHE[$1]:-}"
   [[ "$v" =~ field_mode=([a-z]+) ]] && printf '%s' "${BASH_REMATCH[1]}" || printf 'unknown'

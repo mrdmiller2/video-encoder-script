@@ -43,88 +43,6 @@ chunk_manifest_dir() {
   printf '%s/%s.chunks' "$dir" "$title"
 }
 
-# Cheap content-complexity-variance probe, prints one ratio (high/median,
-# 1.00 = perfectly uniform) or fails. 2026-08-24, per explicit user
-# direction: chunk-parallel's real value proposition is per-scene bit
-# reallocation (the "Netflix chunk model" reasoning this whole initiative
-# started from) -- a long, high-variance movie (quiet dialogue vs. action)
-# has real opportunity there, but a long, low-variance source (a
-# consistent-density OVA, a static talk show) doesn't, and chunking it
-# just pays coordination overhead (manifest/claim/verify/concat
-# round-trips, seam-segment re-encodes) for no real gain over a single-
-# machine whole-file encode. Reuses the exact same cheap probe mechanism
-# find_complexity_sample_points() already relies on (ves-vmaf-crf-
-# search.sh) -- ffprobe -read_intervals reading only compressed PACKET
-# SIZES across sparse sample windows, no decode and no encode, near-
-# instant even on a multi-GB file -- but returns a high/median ratio
-# instead of just timestamps, since find_complexity_sample_points'
-# existing callers depend on its timestamp-only contract and duplicating
-# this small a probe was safer than changing that. high/median, not
-# high/low: a real first test (2026-08-24, Transference vs. 5 Centimeters
-# Per Second) found high/low badly noisy -- dominated by a single
-# near-silent/near-static outlier sample window skewing the ratio into
-# the hundreds either way, drowning out the real relative signal.
-# high/median is far more stable since it isn't hostage to one extreme
-# sample, while still correctly ranking a genuinely more-variable source
-# above a consistent one.
-chunk_content_variance_ratio() {  # src -> prints high/low byte ratio, or fails
-  local src="$1" dur excl_secs=180
-  local usable_end usable_dur probe_width=10 num_probes=15 max_probes spacing pos i s spec="" starts_str
-  local -a probe_starts=()
-
-  dur="$(video_duration "$src" 2>/dev/null)" || return 1
-  usable_end="$(awk -v d="$dur" -v e="$excl_secs" 'BEGIN{r=d-e; if(r<0)r=0; printf "%.0f", r}')"
-  usable_dur="$(awk -v s="$excl_secs" -v e="$usable_end" 'BEGIN{r=e-s; if(r<0)r=0; printf "%.0f", r}')"
-  [ "$usable_dur" -gt 0 ] 2>/dev/null || return 1
-
-  max_probes="$(awk -v d="$usable_dur" -v w="$probe_width" 'BEGIN{ n=int(d/w); if(n<1)n=1; print n }')"
-  [ "$num_probes" -le "$max_probes" ] || num_probes="$max_probes"
-  spacing="$(awk -v d="$usable_dur" -v n="$num_probes" 'BEGIN{ s=d/n; if(s<1)s=1; printf "%.3f", s }')"
-
-  pos="$excl_secs"
-  for ((i = 0; i < num_probes; i++)); do
-    s="$(awk -v p="$pos" 'BEGIN{printf "%.3f", p}')"
-    probe_starts+=("$s")
-    spec+="${s}%+${probe_width},"
-    pos="$(awk -v p="$pos" -v sp="$spacing" 'BEGIN{printf "%.3f", p+sp}')"
-  done
-  spec="${spec%,}"
-  [ -n "$spec" ] || return 1
-  starts_str="${probe_starts[*]}"
-
-  run_ffprobe -v error -select_streams v:0 -read_intervals "$spec" -show_entries packet=pts_time,size -of csv=p=0 "$src" 2>/dev/null | \
-    awk -F, -v starts="$starts_str" -v width="$probe_width" '
-      BEGIN {
-        m = split(starts, arr, " ")
-        for (k = 1; k <= m; k++) probe[k-1] = arr[k] + 0
-      }
-      $1 != "" && $2 != "" {
-        t = $1 + 0; sz = $2 + 0
-        for (k = 0; k < m; k++) {
-          if (t >= probe[k] && t < probe[k] + width) { sum[k] += sz; seen[k] = 1; break }
-        }
-      }
-      END {
-        n = 0
-        for (k = 0; k < m; k++) { if (seen[k]) order[n++] = k }
-        if (n == 0) exit 1
-        high_v = -1
-        for (i = 0; i < n; i++) {
-          k = order[i]; v = sum[k]
-          vals[i] = v
-          if (high_v < 0 || v > high_v) high_v = v
-        }
-        for (i = 1; i < n; i++) {
-          v = vals[i]; j = i - 1
-          while (j >= 0 && vals[j] > v) { vals[j+1] = vals[j]; j-- }
-          vals[j+1] = v
-        }
-        med_v = vals[int(n/2)]
-        if (med_v <= 0) { print "1.00"; exit 0 }
-        printf "%.2f\n", high_v / med_v
-      }'
-}
-
 # Opt-in threshold: only genuinely long/demanding sources are worth the
 # coordination overhead of chunk-parallel encoding. Duration-based (not
 # size-based) since encode time tracks runtime much more directly than
@@ -132,29 +50,33 @@ chunk_content_variance_ratio() {  # src -> prints high/low byte ratio, or fails
 # same runtime take wildly different encode times, but chunk-parallel's
 # actual benefit -- wall-clock reduction -- is a runtime story).
 #
-# 2026-08-24: a content-complexity-variance gate (chunk_content_variance_
-# ratio() above, high/median packet-size ratio) was added here and then
-# REMOVED after real validation across 17 known reference titles (extreme
-# action: John Wick, Mad Max Fury Road, Mad Heidi; slow/contemplative: The
-# Tree of Life, Barry Lyndon, There Will Be Blood, The Master; anime of
-# various types; a static single-camera opera; a short TV episode) showed
-# no coherent correlation with genre/pacing at all -- John Wick (extreme
-# action) scored HIGHEST of all 17 (10.04), while Mad Max Fury Road,
-# arguably the most kinetically edited action film in the sample, scored
-# near the bottom (2.21) alongside Mad Heidi (2.82); "slow" films spanned
-# 1.65-4.91 with no consistent direction either. Leading explanation, per
-# explicit user direction, not further investigated: every test source was
-# an already-encoded release file, not raw/lossless content -- the metric
-# reflects whatever rate-control decisions THAT prior encoder made, which
-# is one step removed from true underlying content complexity and may
-# smooth over or introduce variance unrelated to the source itself. Kept
-# as a documented, real negative finding (see
+# 2026-08-24: a content-complexity-variance gate (high/median packet-size
+# ratio, then a chunk-only function living in this file) was added here
+# and then REMOVED after real validation across 17 known reference titles
+# (extreme action: John Wick, Mad Max Fury Road, Mad Heidi; slow/
+# contemplative: The Tree of Life, Barry Lyndon, There Will Be Blood, The
+# Master; anime of various types; a static single-camera opera; a short TV
+# episode) showed no coherent correlation with genre/pacing at all -- John
+# Wick (extreme action) scored HIGHEST of all 17 (10.04), while Mad Max
+# Fury Road, arguably the most kinetically edited action film in the
+# sample, scored near the bottom (2.21) alongside Mad Heidi (2.82); "slow"
+# films spanned 1.65-4.91 with no consistent direction either. Leading
+# explanation, per explicit user direction, not further investigated:
+# every test source was an already-encoded release file, not raw/lossless
+# content -- the metric reflects whatever rate-control decisions THAT
+# prior encoder made, one step removed from true underlying content
+# complexity. Kept as a documented, real negative finding (see
 # docs/DESIGN-6x-chunk-redesign.md) rather than deleted, so a future
 # session doesn't re-attempt the same approach blindly -- but NOT wired
-# into this gate. chunk_content_variance_ratio() itself is left in place,
-# unused by any caller, in case a future attempt with a better-grounded
-# signal (e.g. real scene-cut detection via ffmpeg's scdet filter, or
-# access to true pre-encode source) wants the same cheap-probe scaffolding.
+# into this gate. The underlying probe itself was generalized and moved to
+# source_content_variance_probe() (ves-source-traits.sh, exists on both
+# this branch and main/5.x) rather than kept here, since it's not
+# chunk-specific and per explicit user direction now runs as passive
+# tracking (log_source_content_variance(), ves-stats-log.sh) on every
+# finished file on BOTH lines -- 17 titles isn't a statistically
+# meaningful sample for something this potentially subtle, so real
+# day-to-day fleet volume accumulates the data instead of abandoning the
+# signal outright.
 chunk_should_split() {
   local src="$1" dur
   [ "${CONVERT_CHUNK_PARALLEL_ENABLED:-false}" = true ] || return 1
