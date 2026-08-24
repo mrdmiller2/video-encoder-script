@@ -206,6 +206,69 @@ production, once the queue/orchestrator exists to trigger it — the manual
 rsync above only proves the mechanism, it isn't the on-demand production
 path yet (see Open Items).
 
+**Fleet-wide reachability confirmed 2026-08-24** — every 10.200.200.x
+fleet machine can reach both `VESStaging` shares (`\\10.200.200.150` and
+`\\10.200.200.151`), verified with a real write+read+cleanup on each:
+
+- **Linux (NFS)**: MJACKSON, TITOJ (both pre-existing), JJACKSON, LAYTOYAJ
+  (new) — `/mnt/MinnieS` and `/mnt/MeiMeiS`, `noauto,x-systemd.automount`
+  fstab entries (the same fix that solved JJACKSON's earlier NFS
+  boot-race bug).
+- **macOS (NFS)**: MARLONJ — manual `mount -t nfs` at `/Volumes/MinnieS`/
+  `/Volumes/MeiMeiS`, matching how its existing primary-NAS mounts are
+  done (no fstab-equivalent persistence exists on this box). Also found
+  and removed a stray broken symlink at `/Volumes/Minnie -> /`, unrelated
+  leftover, harmless but confusing.
+- **Windows (SMB)**: PRINCE, ELVIS — **not** a persistent drive mapping;
+  the working pattern is a plain inline-credential `net use
+  \\<host>\VESStaging <password> /user:MCE\worker` issued at the top of
+  whatever script needs the share, run from the *local* `worker` account
+  each machine's automation already runs as. No domain-account switch,
+  scheduled task, or elevated rights needed for this — see the debugging
+  trail below for what those turned out to be red herrings for.
+
+**Windows debugging trail (2026-08-24), kept for the next time this class
+of bug shows up**: getting here took much longer than it should have,
+because the *actual* root cause (TrueNAS-side: `admin`/`truenas_admin`
+had `smb: false` at the account level, so SMB auth failed regardless of
+password — separate from the SSH `ssh_password_enabled` gotcha above) was
+masked by several real-but-irrelevant Windows issues investigated along
+the way:
+- `MCE\worker@10.200.200.104` SSH login hung — domain-qualified SSH login
+  syntax doesn't work against this OpenSSH-Windows setup.
+- Renaming the local `worker` account to force SSH's bare-username
+  resolution onto the domain account was inconclusive (the renamed local
+  account's SID kept authenticating) and was reverted rather than pursued
+  further.
+- `Register-ScheduledTask -LogonType S4U` reliably fails with "Access is
+  denied" over SSH even for a domain account in local Administrators with
+  non-filtered privileges confirmed (`whoami /priv` showing
+  Backup/Restore enabled) — looks like a hardened WMI/TaskScheduler
+  namespace ACL on this domain image, not a rights gap. Root cause not
+  fully pinned down; legacy `schtasks.exe` was used as a workaround
+  instead (see below), since it doesn't touch that CIM provider.
+- `schtasks /create /ru MCE\worker` **without** an explicit password only
+  ever produces `Logon Mode: Interactive only` (won't run
+  non-interactively) — true S4U/password logon types aren't reachable via
+  `schtasks.exe`'s classic syntax without `/rp`.
+- With `/rp` supplied, the task registered correctly (`Logon Mode:
+  Interactive/Background`, matching the fleet's other working `VES*`
+  tasks) but then failed at run time (`Last Result: 1`,
+  `ERROR_INVALID_FUNCTION`) until `MCE\worker` was temporarily added to
+  local Administrators — **removed again once the simpler `net use`
+  fix above was found to not need it at all.**
+- `nltest /user:worker` unexpectedly dumped raw NT/LM password hash
+  material into command output — flagged to the user, that account's
+  password should be treated as exposed/rotated; `nltest /user:` should
+  not be run this way again.
+
+**Net takeaway**: the TrueNAS-side `smb` flag was the only real blocker.
+Once fixed, the correct Windows-side pattern is the simple inline-
+credential `net use` above — no domain-account migration, no scheduled
+task, no elevated rights required. All local-admin-group and
+batch-logon-right grants made to `MCE\worker` on PRINCE during this
+investigation were reverted back to the pre-investigation state.
+
 **Trigger model, per explicit user direction**: cached on-demand, but
 *overlapped* — not "encoder waits for the file to arrive." Once a title
 enters the queue, the staging transfer to .151 and the VMAF baseline
@@ -245,11 +308,12 @@ at write time, like every other staging mechanism already in this
 codebase (RAM-disk staging, disc-extraction staging).
 
 **Not yet built**: the `CONVERT_STAGING_MEDIA_ROOT` lookup+fallback logic
-itself doesn't exist as code on either branch yet — only the underlying
-dataset/share infrastructure on OS1 and OS2 (above) and the manual
-rsync-mechanism proof are done. Primary target is OS2
-(10.200.200.151), with OS1 (10.200.200.150) built identically as a
-fallback target given OS2's 8/22-8/23 unplanned outage.
+itself doesn't exist as code on either branch yet — the underlying
+dataset/share infrastructure on OS1 and OS2, the manual rsync-mechanism
+proof, and now fleet-wide reachability from every 10.200.200.x machine
+(NFS on Linux/macOS, `net use` on Windows — see above) are all done.
+Primary target is OS2 (10.200.200.151), with OS1 (10.200.200.150) built
+identically as a fallback target given OS2's 8/22-8/23 unplanned outage.
 
 ## Orchestrator design (RANDYJ)
 
