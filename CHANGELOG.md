@@ -4,6 +4,45 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.2A — 2026-08-24
+
+**New: sample-prediction accuracy tracking.** Per explicit user direction —
+prompted by a question about whether `VMAF_SAMPLES=3` sample points are
+enough to reliably decide AV1-vs-x265-vs-skip before committing to a real
+full encode, or whether more sampling would pay for itself by avoiding
+wasted full-encode cycles on files that end up larger than predicted. No
+such tracking existed before; there was no empirical answer, only the
+qualitative reasoning already documented next to the offset-search logic
+(misalignment can only ever drag a score down, never inflate it).
+
+`av1_source_reencode_sample_decision()` (`ves-vmaf-crf-search.sh`) now
+emits a `PRED_DATA:` line alongside its existing decision token, carrying
+the predicted AV1/x265 sizes, original size, and how many of the requested
+sample points actually succeeded. Since this function runs inside a
+`$(...)` subshell at every call site, it can't set caller-visible globals
+directly — a new `_set_sample_pred_from_output()` helper parses that line
+in the *caller's* shell (both call sites in `process_existing_av1`/
+`process_existing_x265`) and populates new `SAMPLE_PRED_*` globals
+(`ves-config.sh`), only when the decision is `av1` or `x265` (a `skip`
+never leads to a real encode, so there's nothing to compare later).
+
+`record_conversion_result()` (`ves-stats-log.sh`) — the single choke point
+every finished real encode already passes through — now calls a new
+`log_sample_prediction_outcome()` right after computing the actual output
+size, which appends one line to `sample-prediction-log.tsv` (same
+`${JOB_SIDECAR_DIR:-.}` location convention as `bad_sources.txt`/
+`corrupt_files.txt`) recording predicted vs. actual size and whether the
+sample correctly predicted the DIRECTION (shrink vs. grow relative to the
+original) — that's the question that actually matters for wasted-cycle
+avoidance, not exact size accuracy. Clears the sticky `SAMPLE_PRED_*`
+state immediately after, so it can never leak into an unrelated later
+title's own result.
+
+No behavior change to the actual av1/x265/skip decision logic itself —
+this is observability only. Needs a real batch of conversions to
+accumulate before the original question (is 3 samples enough, should it
+be 5+) has real data behind it instead of a guess.
+
 ## v5.1.1Z — 2026-08-24
 
 **Chunk-parallel VMAF false-positive found and worked around — the

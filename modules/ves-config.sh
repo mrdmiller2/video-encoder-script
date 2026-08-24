@@ -6,7 +6,7 @@
 # MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
 # bug fix) -- see its own comment.
 
-VERSION="5.1.1Z"
+VERSION="5.1.2A"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
 # as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
@@ -91,6 +91,27 @@ MUST_ELIMINATE_AV1_CANDIDATE_SIZE=""
 QTGMC_FINAL_VMAF_SRC=""
 QTGMC_FINAL_VMAF_DST=""
 QTGMC_FINAL_VMAF_VALUE=""
+# Set by av1_source_reencode_sample_decision() right before its av1/x265
+# return (never for skip/failure -- those don't lead to a real encode, so
+# there's nothing to compare against an eventual actual result). Consumed
+# once by record_conversion_result(), which appends one line to
+# sample-prediction-log.tsv comparing this sample-based size prediction
+# against the real encode's actual output size, then clears these fields --
+# same sticky-state-cleared-once-consumed pattern as QTGMC_FINAL_VMAF_*
+# above, so a later unrelated title can never reuse stale prediction data.
+# 2026-08-24: added per explicit user direction, to start collecting real
+# data on how often the 3-sample-point (VMAF_SAMPLES) size prediction
+# actually matches the real full-encode outcome -- no such tracking existed
+# before, so "is 3 samples enough" had no empirical answer, only the
+# qualitative reasoning already in this file's own comments.
+SAMPLE_PRED_ACTIVE=false
+SAMPLE_PRED_KIND=""
+SAMPLE_PRED_DECISION=""
+SAMPLE_PRED_AV1_BYTES=""
+SAMPLE_PRED_X265_BYTES=""
+SAMPLE_PRED_ORIG_BYTES=""
+SAMPLE_PRED_POINTS_USED=""
+SAMPLE_PRED_POINTS_REQUESTED=""
 # Set by try_av1_convert/try_x265_convert's logical_source param (defaults
 # to their own $src when not a disc-extraction job) -- lets
 # record_conversion_result and done_log_append account size/identity

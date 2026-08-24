@@ -127,6 +127,54 @@ stats_log_running_totals() {
   stats_log_append ""
 }
 
+# Appends one line to sample-prediction-log.tsv comparing a sample-based
+# size prediction (SAMPLE_PRED_*, set by _set_sample_pred_from_output right
+# after av1_source_reencode_sample_decision returns "av1" or "x265") against
+# the real encode's actual output size, then clears SAMPLE_PRED_ACTIVE --
+# called once from record_conversion_result, right before it would
+# otherwise leave stale prediction state for a later unrelated title. Same
+# ${JOB_SIDECAR_DIR:-.} location convention as bad_sources.txt/
+# corrupt_files.txt (ves-validation.sh) -- per-scan-root, not a new sidecar
+# path. 2026-08-24: added per explicit user direction to start collecting
+# real predicted-vs-actual data, since no such tracking existed before and
+# "is VMAF_SAMPLES=3 enough" had no empirical answer.
+log_sample_prediction_outcome() {
+  local actual_out_bytes="$1" actual_codec="$2"
+  [ "$SAMPLE_PRED_ACTIVE" = true ] || return 0
+  local logf="${JOB_SIDECAR_DIR:-.}/sample-prediction-log.tsv"
+  local pred_bytes correct="unknown"
+  case "$SAMPLE_PRED_DECISION" in
+    av1) pred_bytes="$SAMPLE_PRED_AV1_BYTES" ;;
+    x265) pred_bytes="$SAMPLE_PRED_X265_BYTES" ;;
+  esac
+  if [[ "$pred_bytes" =~ ^[0-9]+$ ]] && [[ "$actual_out_bytes" =~ ^[0-9]+$ ]] \
+     && [[ "$SAMPLE_PRED_ORIG_BYTES" =~ ^[0-9]+$ ]]; then
+    # "correct" = the sample predicted the right DIRECTION (shrink vs grow
+    # vs original), not an exact size match -- that's the question that
+    # actually matters for wasted-cycle avoidance: did trusting the sample
+    # and running the real encode pay off, or was the real result on the
+    # wrong side of "original" from what the sample predicted.
+    correct="$(awk -v p="$pred_bytes" -v a="$actual_out_bytes" -v o="$SAMPLE_PRED_ORIG_BYTES" \
+      'BEGIN { pd = (p < o); ad = (a < o); print (pd == ad) ? "yes" : "no" }')"
+  fi
+  if [ ! -f "$logf" ]; then
+    printf 'timestamp\tkind\tdecision\tpoints_used\tpoints_requested\torig_bytes\tpred_av1_bytes\tpred_x265_bytes\tactual_codec\tactual_bytes\tpred_correct_direction\n' >>"$logf" 2>/dev/null
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$SAMPLE_PRED_KIND" "$SAMPLE_PRED_DECISION" \
+    "$SAMPLE_PRED_POINTS_USED" "$SAMPLE_PRED_POINTS_REQUESTED" "$SAMPLE_PRED_ORIG_BYTES" \
+    "$SAMPLE_PRED_AV1_BYTES" "$SAMPLE_PRED_X265_BYTES" "$actual_codec" "$actual_out_bytes" "$correct" \
+    >>"$logf" 2>/dev/null
+  SAMPLE_PRED_ACTIVE=false
+  SAMPLE_PRED_KIND=""
+  SAMPLE_PRED_DECISION=""
+  SAMPLE_PRED_AV1_BYTES=""
+  SAMPLE_PRED_X265_BYTES=""
+  SAMPLE_PRED_ORIG_BYTES=""
+  SAMPLE_PRED_POINTS_USED=""
+  SAMPLE_PRED_POINTS_REQUESTED=""
+}
+
 record_conversion_result() {
   local src="$1"
   local out="${2:-}"
@@ -140,6 +188,14 @@ record_conversion_result() {
     orig_sz="$(disc_source_size_bytes "$logical_source")"
   else
     orig_sz="$(file_size_bytes "$src")"
+  fi
+  if [ "$SAMPLE_PRED_ACTIVE" = true ] && [ -n "$out" ] && [ -f "$out" ] && [ "$DRY_RUN" = false ]; then
+    log_sample_prediction_outcome "$(file_size_bytes "$out")" "$SAMPLE_PRED_DECISION"
+  elif [ "$SAMPLE_PRED_ACTIVE" = true ]; then
+    # No real output (encode failed/skipped downstream of the decision) --
+    # nothing to compare, but still clear the sticky state so it can't leak
+    # into a later, unrelated title's own record_conversion_result call.
+    SAMPLE_PRED_ACTIVE=false
   fi
 
   if [ -n "$out" ] && [ -f "$out" ] && [ "$DRY_RUN" = false ]; then

@@ -1012,6 +1012,35 @@ find_complexity_sample_points() {
 # fails or the source is too short to usefully split into 3 windows. Prints
 # ONLY: skip | av1 | x265 (stdout is captured by callers). Use log_err for
 # messages. Returns 1 only when every sample point failed.
+# Parses av1_source_reencode_sample_decision's raw (pre-decision-filter)
+# output for its PRED_DATA line and populates the SAMPLE_PRED_* globals
+# (see their declaration in ves-config.sh) -- only when decision is "av1"
+# or "x265" (a real encode is about to follow); a "skip" or failed decision
+# leaves SAMPLE_PRED_ACTIVE false, since there's no real encode outcome to
+# ever compare the prediction against. Called by each av1_source_reencode_
+# sample_decision call site right after capturing its raw output, in the
+# real caller shell (not the subshell the decision function itself runs
+# in) so the globals actually stick for record_conversion_result to read
+# later. $1=raw output, $2=decision token, $3=kind label (distinguishes
+# call sites in the log, e.g. "av1-source-recheck"/"x265-source-recheck").
+_set_sample_pred_from_output() {
+  local raw="$1" decision="$2" kind="$3" line
+  case "$decision" in
+    av1 | x265) ;;
+    *) return 0 ;;
+  esac
+  line="$(printf '%s\n' "$raw" | grep '^PRED_DATA:' | tail -n1)"
+  [ -n "$line" ] || return 0
+  SAMPLE_PRED_AV1_BYTES="$(printf '%s' "$line" | sed -n 's/.*av1_bytes=\([0-9]*\).*/\1/p')"
+  SAMPLE_PRED_X265_BYTES="$(printf '%s' "$line" | sed -n 's/.*x265_bytes=\([0-9]*\).*/\1/p')"
+  SAMPLE_PRED_ORIG_BYTES="$(printf '%s' "$line" | sed -n 's/.*orig_bytes=\([0-9]*\).*/\1/p')"
+  SAMPLE_PRED_POINTS_USED="$(printf '%s' "$line" | sed -n 's/.*points_used=\([0-9]*\).*/\1/p')"
+  SAMPLE_PRED_POINTS_REQUESTED="$(printf '%s' "$line" | sed -n 's/.*points_requested=\([0-9]*\).*/\1/p')"
+  SAMPLE_PRED_DECISION="$decision"
+  SAMPLE_PRED_KIND="$kind"
+  SAMPLE_PRED_ACTIVE=true
+}
+
 av1_source_reencode_sample_decision() {
   local sample_src="$1"
   local orig_sz="$2"
@@ -1153,6 +1182,18 @@ av1_source_reencode_sample_decision() {
     fi
   fi
 
+  # Prediction-accuracy tracking (2026-08-24): this function runs inside a
+  # `$(...)` command substitution at every call site (a subshell), so it
+  # cannot set caller-visible globals directly -- setting SAMPLE_PRED_*
+  # here would silently vanish when the subshell exits. Instead, emit a
+  # second line carrying the prediction data alongside the existing
+  # decision token; call sites already grep the captured output down to
+  # just `^(skip|av1|x265)$` for the decision, so this extra line is
+  # invisible to that filter and must be parsed separately by the caller,
+  # which then sets SAMPLE_PRED_* itself (real shell scope, not a subshell)
+  # for record_conversion_result to pick up once the actual encode finishes.
+  printf 'PRED_DATA:av1_bytes=%s:x265_bytes=%s:orig_bytes=%s:points_used=%s:points_requested=%s\n' \
+    "$pred_av1" "$pred_x265" "$orig_sz" "$valid_points" "${#uniq_starts[@]}"
   printf '%s' "$pick"
   return 0
 }
