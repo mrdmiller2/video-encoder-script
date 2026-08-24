@@ -63,10 +63,17 @@ Decided 2026-08-24, per explicit user direction:
 
 - **Encoder tier (7 machines, x86_64 only), in a defined SLOT order**:
   JJACKSON (slot 1), MJACKSON (slot 2), TITOJ (slot 3), PRINCE (slot 4),
-  AI-PROCESSOR (slot 5), Plex (slot 6), LAYTOYAJ (slot 7). GPUs are
+  LAYTOYAJ (slot 5), Plex (slot 6), AI-PROCESSOR (slot 7). GPUs are
   irrelevant here — software encoding (SVT-AV1/x265) is used fleet-wide,
   no hardware encode path is in use currently, so machines without a real
   GPU aren't disadvantaged.
+
+  **Revised 2026-08-24**: Plex and AI-PROCESSOR moved to the last two
+  slots (were slots 5-6). Both have other earmarked tasks competing for
+  their time, so they're still available to pull into chunk-parallel work
+  when needed, but the lowest-numbered-slots-first rule (below) means
+  they're only actually used once a title needs more than 5 machines'
+  worth of chunks — favoring the five fully-dedicated machines first.
 
   **The slot order is not just a roster — it's a real design requirement,
   per explicit user direction**: when a title needs fewer than 7 machines'
