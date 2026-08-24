@@ -6,7 +6,7 @@
 # MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
 # bug fix) -- see its own comment.
 
-VERSION="6.0.0C"
+VERSION="6.0.0D"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
 # as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
@@ -246,6 +246,12 @@ CONVERT_RAMDISK_DIR="${CONVERT_RAMDISK_DIR:-}"
 CONVERT_CHUNK_PARALLEL_ENABLED="${CONVERT_CHUNK_PARALLEL_ENABLED:-false}"
 CONVERT_CHUNK_MIN_DURATION_SECS="${CONVERT_CHUNK_MIN_DURATION_SECS:-3600}"
 CONVERT_CHUNK_TARGET_SECS="${CONVERT_CHUNK_TARGET_SECS:-600}"
+# Phase 5 (scene_detect_boundaries(), ves-scene-detect.sh): ffmpeg's own
+# per-frame scene-change score (0.0-1.0) threshold above which a frame is
+# treated as a real shot cut. 0.3 matches ffmpeg's own commonly-documented
+# default for this exact use -- not yet independently tuned/validated
+# against real fleet content.
+SCENE_DETECT_THRESHOLD="${SCENE_DETECT_THRESHOLD:-0.3}"
 RAMDISK_SIZE_ESTIMATE_MARGIN_PCT=10
 # Set once per run by ramdisk_job_start(), read by every file's
 # resolve_encode_stage_path() -- not re-resolved per file, so a run that
