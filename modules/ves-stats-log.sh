@@ -197,18 +197,29 @@ log_sample_prediction_outcome() {
 # than blocking anything.
 log_source_content_variance() {
   local src="$1" actual_codec="$2" actual_out_bytes="$3" orig_bytes="$4"
-  local probe low med high ratio="" logf dur
+  local probe low med high ratio="" logf dur src_codec
   probe="$(source_content_variance_probe "$src" 2>/dev/null)" || return 0
   read -r low med high <<<"$probe"
   [[ "$low" =~ ^[0-9]+$ ]] && [[ "$med" =~ ^[0-9]+$ ]] && [[ "$high" =~ ^[0-9]+$ ]] || return 0
   [ "$med" -gt 0 ] && ratio="$(awk -v h="$high" -v m="$med" 'BEGIN{printf "%.2f", h/m}')"
   dur="$(video_duration "$src" 2>/dev/null)"
+  # 2026-08-24, per explicit user direction: track the SOURCE's own codec
+  # alongside the variance values -- open question this may help answer
+  # over enough real data is whether the packet-size-variance signal is
+  # itself an artifact of which encoder/rate-control produced the source
+  # (e.g. a modern AV1 source's own sophisticated rate control could
+  # "flatten" true content variance in a way an older x264 source's
+  # simpler rate control wouldn't) rather than the content itself -- this
+  # was the leading (untested) explanation for why the 17-title validation
+  # showed no genre correlation (see docs/DESIGN-6x-chunk-redesign.md on
+  # the 6.x-chunk-redesign branch).
+  src_codec="$(video_codec "$src" 2>/dev/null)"
   logf="${JOB_SIDECAR_DIR:-.}/content-variance-log.tsv"
   if [ ! -f "$logf" ]; then
-    printf 'timestamp\tsource\tduration_secs\tlow_bytes\tmedian_bytes\thigh_bytes\thigh_median_ratio\tactual_codec\tactual_out_bytes\torig_bytes\n' >>"$logf" 2>/dev/null
+    printf 'timestamp\tsource\tduration_secs\tsource_codec\tlow_bytes\tmedian_bytes\thigh_bytes\thigh_median_ratio\tactual_codec\tactual_out_bytes\torig_bytes\n' >>"$logf" 2>/dev/null
   fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(basename -- "$src")" "${dur:-}" "$low" "$med" "$high" \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(basename -- "$src")" "${dur:-}" "${src_codec:-}" "$low" "$med" "$high" \
     "${ratio:-}" "${actual_codec:-}" "${actual_out_bytes:-}" "${orig_bytes:-}" \
     >>"$logf" 2>/dev/null
 }

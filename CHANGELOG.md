@@ -4,6 +4,21 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.2D — 2026-08-24
+
+**Content-variance log now also records the source's own codec.** Per
+explicit user direction: `content-variance-log.tsv` gets a new
+`source_codec` column (`video_codec()`, already-available helper). Open
+question this may help answer over enough real data: whether the packet-
+size-variance signal is itself an artifact of which encoder/rate-control
+produced the source (a modern AV1 source's sophisticated rate control
+could flatten true content variance in a way an older x264 source's
+simpler rate control wouldn't) rather than the content itself — the
+leading, untested explanation for why the earlier 17-title validation (on
+`6.x-chunk-redesign`) found no genre correlation. Tested end-to-end
+against a real file before shipping. No behavior change — observability
+only.
+
 ## v5.1.2C — 2026-08-24
 
 **New: passive content-complexity-variance tracking.** Originated on the
