@@ -4,6 +4,29 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.2E — 2026-08-24
+
+**Stuck-script reaper** (`reap_stuck_script_processes()`,
+`modules/ves-orphan-reaper.sh`): found live on JJACKSON -- three nested
+`convert-v5.1.2A.sh` processes sitting at 0.0% CPU for up to ~3 hours,
+referencing a script file a routine version-deploy had already deleted
+days earlier. The existing orphan reaper (`reap_orphaned_encoders()`)
+explicitly skips any script PID that's still alive ("Live script job on
+this host — never touch"), so it never caught this class of bug. The new
+function is the complement: reaps a live top-level script process only
+when it has *no* live encoder-tool descendant (ffmpeg/HandBrakeCLI/
+mkvmerge, checked across its full descendant tree, not just direct
+children) *and* has been running for at least `STUCK_SCRIPT_GRACE_SECS`
+(default 900s, matching the 6.x branch's chunk-splitter stale-reclaim
+threshold). Both conditions together, not either alone -- a script
+legitimately between steps (keyframe scan, staging copy, VMAF setup)
+shows no encoder-tool child for well under 900s. Wired into the same
+Phase B startup pass as the existing reaper, gated by the same
+`AUTO_REAP`/`--no-auto-reap` flag. New config: `STUCK_SCRIPT_GRACE_SECS`,
+`STUCK_SCRIPT_KILL_GRACE_SECS` (`modules/ves-config.sh`). Shipped
+identically on `6.x-chunk-redesign` as v6.0.0C, since these are shared
+modules.
+
 ## v5.1.2D — 2026-08-24
 
 **Content-variance log now also records the source's own codec.** Per

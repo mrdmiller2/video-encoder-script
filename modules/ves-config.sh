@@ -6,7 +6,7 @@
 # MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
 # bug fix) -- see its own comment.
 
-VERSION="5.1.2D"
+VERSION="5.1.2E"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
 # as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
@@ -372,6 +372,16 @@ CLEAN_JUNK=false
 CLEAN_JUNK_APPLY=false
 # Phase B: startup orphan reaper (default on; --no-auto-reap to skip)
 AUTO_REAP=true
+# Stuck-script reaper (part of the same Phase B pass, see
+# reap_stuck_script_processes() in ves-orphan-reaper.sh): a live
+# convert-vX.sh/convert-current.sh process with no active encoder-tool
+# descendant for longer than this is considered wedged, not just between
+# steps. 900s matches this project's existing chunk-split-stale-reclaim
+# threshold on the 6.x branch (ves-chunk-coordinator.sh) -- the same "no
+# legitimate non-encoding step should take longer than this" reasoning.
+STUCK_SCRIPT_GRACE_SECS="${STUCK_SCRIPT_GRACE_SECS:-900}"
+# Grace period between SIGTERM and SIGKILL when reaping a stuck script.
+STUCK_SCRIPT_KILL_GRACE_SECS="${STUCK_SCRIPT_KILL_GRACE_SECS:-8}"
 IGNORE_DONE_FOLDERS=false
 HAS_PYTHON3=false
 HAS_GREP_OR_RG=false

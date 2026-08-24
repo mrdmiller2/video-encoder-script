@@ -870,6 +870,114 @@ reap_orphaned_encoders() {
   _reap_orphaned_hbprog_dirs
 }
 
+# Recursively lists every descendant PID of $1, one per line (depth-first,
+# via repeated `pgrep -P`). Local-host only -- pgrep can't see other hosts,
+# which is fine since the caller only ever needs this for its own machine.
+_all_descendants_of() {
+  local root="$1"
+  local -a queue=("$root") out=()
+  local cur child
+  while [ "${#queue[@]}" -gt 0 ]; do
+    cur="${queue[0]}"
+    queue=("${queue[@]:1}")
+    while IFS= read -r child; do
+      [[ "$child" =~ ^[0-9]+$ ]] || continue
+      out+=("$child")
+      queue+=("$child")
+    done < <(pgrep -P "$cur" 2>/dev/null)
+  done
+  [ "${#out[@]}" -gt 0 ] && printf '%s\n' "${out[@]}"
+  return 0
+}
+
+# Finds and reaps top-level convert-vX.sh/convert-current.sh SCRIPT
+# processes that are alive but genuinely wedged -- the complement of
+# reap_orphaned_encoders() above, which only ever handles the opposite
+# case (script dead, encoder orphaned) and explicitly leaves any script
+# PID that's still alive alone ("Live script job on this host — never
+# touch"). That assumption -- alive script PID implies legitimate
+# progress -- doesn't hold: found live 2026-08-24 on JJACKSON, three
+# nested `convert-v5.1.2A.sh` processes sitting at 0.0% CPU for up to
+# ~3 hours, referencing a script file that had already been deleted by a
+# routine version-deploy days earlier. Left running, these confuse
+# tracking/logs and never self-clear (see feedback request that prompted
+# this function).
+#
+# Deliberately conservative (feedback_never_delete_live_lock,
+# feedback_verify_before_delete): a script PID is only reaped when BOTH of
+# the following hold, not either alone --
+#   1. No live encoder-tool process (ffmpeg/HandBrakeCLI/mkvmerge, via the
+#      existing is_encoder_process()) anywhere in its full descendant
+#      tree. If one exists, it's genuinely working regardless of how long
+#      that's taken -- a real 4K encode can legitimately run for hours.
+#   2. It has been alive for at least STUCK_SCRIPT_GRACE_SECS (default
+#      900s, matching the 6.x branch's chunk-splitter stale-reclaim
+#      threshold -- "no legitimate non-encoding step should take longer
+#      than this"). A script briefly between steps (ffprobe scan, staging
+#      copy, VMAF setup) shows no encoder-tool descendant for well under
+#      900s; only a genuinely wedged process fails both checks at once.
+#
+# Host-local only, like reap_orphaned_encoders() -- ps/pgrep can't see
+# other machines' processes, so there's no cross-host race to guard
+# against for the kill decision itself.
+reap_stuck_script_processes() {
+  local this_host self_pid self_chain walk ppid
+  local -i candidates_seen=0 reaped=0 survived=0
+  local pid args elapsed has_encoder_child descendant
+
+  this_host="$(hostname 2>/dev/null || echo unknown)"
+  self_pid=$$
+  # Never touch our own process or any of its ancestors.
+  self_chain=" $self_pid "
+  walk="$self_pid"
+  while :; do
+    ppid="$(ps -o ppid= -p "$walk" 2>/dev/null | tr -d '[:space:]')"
+    [[ "$ppid" =~ ^[0-9]+$ ]] || break
+    [ "$ppid" -le 1 ] && break
+    self_chain="$self_chain $ppid "
+    walk="$ppid"
+  done
+
+  log "Stuck-script reaper: scanning (host=$this_host, grace=${STUCK_SCRIPT_GRACE_SECS:-900}s)"
+
+  while IFS= read -r pid; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    case "$self_chain" in *" $pid "*) continue ;; esac
+    is_convert_script_process "$pid" || continue
+    candidates_seen=$((candidates_seen + 1))
+
+    elapsed="$(_process_elapsed_secs "$pid")" || continue
+    [ "${elapsed:-0}" -ge "${STUCK_SCRIPT_GRACE_SECS:-900}" ] || continue
+
+    has_encoder_child=false
+    while IFS= read -r descendant; do
+      if is_encoder_process "$descendant"; then
+        has_encoder_child=true
+        break
+      fi
+    done < <(_all_descendants_of "$pid")
+    [ "$has_encoder_child" = true ] && continue
+
+    args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+    warn "Stuck-script reaper: PID $pid alive ${elapsed}s with no live encoder-tool descendant -- reaping: $args"
+    kill -TERM "$pid" 2>/dev/null
+    sleep 2
+    if kill -0 "$pid" 2>/dev/null; then
+      sleep "${STUCK_SCRIPT_KILL_GRACE_SECS:-8}"
+      kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+    fi
+    if kill -0 "$pid" 2>/dev/null; then
+      warn "Stuck-script reaper: PID $pid survived SIGTERM+SIGKILL -- manual review needed"
+      survived=$((survived + 1))
+    else
+      reaped=$((reaped + 1))
+      log "Stuck-script reaper: reaped PID $pid (wedged ${elapsed}s, no active encoder)"
+    fi
+  done < <(pgrep -f 'convert-v[0-9]|convert-current\.sh' 2>/dev/null)
+
+  log "Stuck-script reaper summary: candidates=$candidates_seen reaped=$reaped survived=$survived"
+}
+
 # HandBrake's progress-FIFO staging dirs (run_handbrake_with_progress,
 # .convert-hbprog-*) live under the machine's OWN local ${TMPDIR:-/tmp}, not
 # under the NAS-shared $root the reaper above walks -- a crashed/killed
