@@ -125,6 +125,29 @@ chunk_finalize_manifest() {
   done
   [ "${#parts[@]}" -gt 0 ] || { warn "Chunk-parallel finalize: no chunk outputs found: $src"; return 1; }
 
+  # Plain concatenation, in manifest index order (2026-08-23 -- see
+  # project_chunk_parallel_phase4_2026_08_23 / reference_chunk_parallel_
+  # pts_fix_consultation_2026_08_23 in project memory for the full
+  # investigation this came from). No PTS/timestamp manipulation of any
+  # kind is needed here. Splicing two independently-encoded chunks with
+  # SVT-AV1's default hierarchical B-frame ("random access") prediction
+  # structure directly against each other produces genuine packet
+  # decode-order corruption on concatenation -- confirmed empirically,
+  # and confirmed NOT fixable by relabeling timestamps (three different
+  # strategies tried and falsified: global rank-based, global rank with
+  # a pre-computed absolute offset, per-chunk local rank-based -- all
+  # either baked in existing corruption or were simply insufficient,
+  # per full untruncated decode verification). The actual fix lives
+  # upstream in ves-chunk-coordinator.sh's chunk_split_create_manifest:
+  # small independently-encoded SEAM segments are now inserted between
+  # body chunks (covering [boundary-overlap, boundary+overlap], with body
+  # chunks trimmed to stop/start short of the boundary instead of exactly
+  # at it), so no two directly-hierarchical-B-GOP-encoded body chunks are
+  # ever spliced against each other -- verified via a full, untimed,
+  # un-truncated decode: zero DTS errors. This finalize step now trusts
+  # that upstream design and simply concatenates whatever units the
+  # manifest lists, in index order (bodies and seams interleaved by the
+  # splitter already).
   concat_tmp="${mdir}/.concat.$$.mkv"
   local -a mm_args=(-o "$concat_tmp" "${parts[0]}")
   local p
@@ -146,6 +169,20 @@ chunk_finalize_manifest() {
 
   if ! validate_mkv_output "$src" "$concat_tmp" "" true; then
     warn "Chunk-parallel finalize: concatenated output failed structural validation, leaving chunks in place for review: $src"
+    rm -f -- "$concat_tmp" 2>/dev/null
+    return 1
+  fi
+
+  # Safety net (2026-08-23): a strict decode check catches DTS/structural
+  # corruption that validate_mkv_output and even a full whole-file VMAF
+  # pass can both miss -- VMAF compares decoded pixel content and
+  # ffmpeg's own decoder is lenient about muxer-level DTS errors, so a
+  # structurally broken file can still score well on VMAF (confirmed
+  # live: an earlier, since-superseded version of this fix produced a
+  # DTS-corrupted file that scored 99.2). This is a single fast decode
+  # pass (seconds) run before the expensive VMAF measurement, not after.
+  if ! _chunk_output_decodes_clean "$concat_tmp"; then
+    warn "Chunk-parallel finalize: concatenated output failed strict decode check (DTS/structural) -- leaving chunks in place for review, NOT proceeding to VMAF: $(basename -- "$src")"
     rm -f -- "$concat_tmp" 2>/dev/null
     return 1
   fi
@@ -203,9 +240,17 @@ chunk_verifier_scan_once() {
       [ -f "$mdir/manifest.meta" ] || continue
       src="$(awk -F= '/^source=/{sub(/^source=/,""); print; exit}' "$mdir/manifest.meta")"
       [ -n "$src" ] && [ -f "$src" ] || continue
-      chunk_verify_pending "$src"
+      # Both calls guarded with `|| true`: under this codebase's `set -e`,
+      # a bare failing call here (e.g. chunk_finalize_manifest returning
+      # 1 on a bad/incomplete manifest -- found live, 2026-08-23, when a
+      # manifest whose chunk parts had already been cleaned up by an
+      # earlier successful finalize was retried and failed) would abort
+      # the ENTIRE verifier process on the very next scan pass, not just
+      # skip that one manifest -- a single bad title should never be able
+      # to take down verification for every other title in flight.
+      chunk_verify_pending "$src" || true
       if chunk_all_verified "$src"; then
-        chunk_finalize_manifest "$src"
+        chunk_finalize_manifest "$src" || true
       fi
     done < <(find "$root" -type d -name '*.chunks' 2>/dev/null)
   done

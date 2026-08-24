@@ -174,24 +174,74 @@ chunk_split_create_manifest() {
     return 1
   fi
 
+  # Seam segments (2026-08-23 fix -- see project_chunk_parallel_phase4_
+  # 2026_08_23 / reference_chunk_parallel_pts_fix_consultation_2026_08_23
+  # in project memory for the full investigation this came from).
+  #
+  # Splicing two independently-encoded chunks with SVT-AV1's default
+  # hierarchical B-frame ("random access") prediction structure directly
+  # at their shared boundary produces genuine packet decode-order
+  # corruption on concatenation ("non monotonically increasing dts to
+  # muxer") -- confirmed empirically, and confirmed NOT fixable by any
+  # form of timestamp relabeling (three different strategies tried and
+  # falsified). A small independently-encoded SEAM segment inserted
+  # between each pair of body chunks -- covering
+  # [boundary-OVERLAP, boundary+OVERLAP], with each body chunk trimmed to
+  # stop/start OVERLAP seconds short of the boundary instead of exactly
+  # at it -- empirically eliminates the defect (verified via a full,
+  # untimed, un-truncated decode: zero DTS errors). No timestamp
+  # manipulation is needed at all with this approach; plain mkvmerge `+`
+  # concatenation of body/seam/body/seam/... in order works correctly,
+  # because no two DIRECTLY-hierarchical-B-frame-GOP-encoded segments are
+  # ever spliced against each other at a real content boundary -- both
+  # sides of every splice are now either a body-chunk edge or a
+  # short, simple seam encode, not two independently-GOP-structured
+  # multi-hundred-second bodies meeting directly.
+  #
+  # Deliberately NOT re-snapped to a source keyframe: chunk_encode_claimed
+  # already does a real re-encode (not a stream copy) for every unit,
+  # body or seam, so ffmpeg's normal accurate-seek-then-decode-forward
+  # input-side -ss behavior is frame-accurate regardless of keyframe
+  # alignment -- keyframe-snapping only ever mattered for where body
+  # chunks *start* (their own first frame becomes a real encoded
+  # keyframe), which is unaffected by trimming their end short.
+  local overlap="${CONVERT_CHUNK_SEAM_OVERLAP_SECS:-3}"
   n=0
   prev_ts="${boundaries[0]}"
-  local i
+  local i seam_start seam_end body_end
   for ((i = 1; i < ${#boundaries[@]}; i++)); do
     ts="${boundaries[$i]}"
+    body_end="$(awk -v t="$ts" -v o="$overlap" -v p="$prev_ts" 'BEGIN { e = t - o; printf "%.6f", (e > p ? e : t) }')"
     cat >"${tmpdir}/chunk-$(printf '%03d' "$n").meta" <<EOF
 index=$n
+kind=body
 start_ts=$prev_ts
-end_ts=$ts
+end_ts=$body_end
 EOF
     n=$((n + 1))
-    prev_ts="$ts"
+    if awk -v b="$body_end" -v t="$ts" 'BEGIN { exit !(b < t) }'; then
+      seam_start="$body_end"
+      seam_end="$(awk -v t="$ts" -v o="$overlap" 'BEGIN { printf "%.6f", t + o }')"
+      cat >"${tmpdir}/chunk-$(printf '%03d' "$n").meta" <<EOF
+index=$n
+kind=seam
+start_ts=$seam_start
+end_ts=$seam_end
+EOF
+      n=$((n + 1))
+      prev_ts="$seam_end"
+    else
+      # Overlap didn't fit (boundary spacing smaller than 2x overlap) --
+      # no seam segment for this boundary, chunk normally.
+      prev_ts="$ts"
+    fi
   done
   # Final chunk runs to the real end of the file -- end_ts=EOF, not a
   # numeric timestamp, since the source's exact end may not land on a
   # detected keyframe and ffmpeg's own -to naturally handles an EOF cut.
   cat >"${tmpdir}/chunk-$(printf '%03d' "$n").meta" <<EOF
 index=$n
+kind=body
 start_ts=$prev_ts
 end_ts=EOF
 EOF
@@ -217,6 +267,17 @@ EOF
   resolve_upscale_target "$src"
   crf="$(resolve_crf_for_encode "$src" "$codec" "$profile" "$hdr")"
 
+  # Exact rational source frame rate, captured once here so
+  # chunk_finalize_manifest's global PTS-regeneration pass (see
+  # ves-chunk-verify.sh, project_chunk_parallel_phase4_2026_08_23) can
+  # derive every frame's timestamp from cumulative frame index without
+  # re-probing the source later -- r_frame_rate is the container's
+  # declared rational rate (e.g. "24000/1001"), not something to
+  # recompute from possibly-imprecise decoded PTS deltas.
+  local fps_rate fps_num fps_den
+  fps_rate="$("${FFPROBE_CMD[@]}" -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 -- "$src" 2>/dev/null)"
+  fps_num="${fps_rate%/*}"; fps_den="${fps_rate#*/}"
+
   cat >"${tmpdir}/manifest.meta" <<EOF
 source=$src
 chunk_count=$n
@@ -225,6 +286,8 @@ profile=$profile
 hdr=$hdr
 hdr_mode=$hdr_mode
 crf=$crf
+fps_num=$fps_num
+fps_den=$fps_den
 created_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 created_host=$(hostname 2>/dev/null || echo unknown)
 EOF

@@ -4,6 +4,66 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.1Y — 2026-08-23
+
+**Chunk-parallel DTS/concatenation defect: seam-based fix implemented,
+but a NEW real issue found — do not consider this resolved.** Full
+details: memory `project_chunk_parallel_phase4_2026_08_23` and
+`reference_chunk_parallel_pts_fix_consultation_2026_08_23`.
+
+Extensive investigation (8 external consultations across 4 sources —
+Gemini, an independent Claude instance, DeepSeek, Kimi — converging
+unanimously) established: concatenating independently-encoded AV1 chunks
+with SVT-AV1's default hierarchical B-frame ("random access") prediction
+structure produces genuine packet decode-order corruption at splice
+points. This is a packet-storage-order defect, not a timestamp-value
+defect — three separate timestamp-relabeling strategies were tried and
+empirically falsified (global rank-based; global rank with a
+pre-computed absolute offset, falsified because mkvmerge's `+` ignores
+pre-set absolute timestamps and always recomputes its own continuation
+offset; per-chunk local rank-based, falsified by a proper full-decode
+re-test after an EARLIER "clean" result turned out to be a false
+positive from an insufficient 90s verification timeout on content that
+needed many minutes to fully decode).
+
+The consulted-and-implemented fix: small independently-encoded SEAM
+segments now inserted between body chunks at each internal boundary
+(`ves-chunk-coordinator.sh`, `chunk_split_create_manifest`) — body
+chunks trimmed to stop/start short of the boundary, the gap covered by
+its own small encode, so no two directly-hierarchical-B-GOP-encoded body
+chunks are ever spliced against each other. `chunk_finalize_manifest`
+(`ves-chunk-verify.sh`) simplified back to plain `mkvmerge +`
+concatenation in manifest order — no timestamp manipulation needed with
+this design. Verified via a real automated pipeline run (6 encoder-tier
+machines + Sting verifier, no manual orchestration): all 11 units
+(6 body + 5 seam) encoded and structurally verified correctly, and a
+full sequential decode of the concatenated result was completely clean
+(zero DTS errors) — the sequential-decode-order defect this session
+spent most of its time on does appear to be genuinely fixed by this
+design.
+
+**However**: a live VMAF gate failure on this same file (56.9 vs 94.0
+target) led to a deeper check that found something new — **windowed
+random-access seeks (`ffmpeg -ss ...`) into the concatenated file
+produce catastrophic corruption** (VMAF collapsing to near-zero,
+including a fresh DTS violation at one seek point) even though a plain
+sequential top-to-bottom decode of the exact same file is clean. Since
+`measure_final_vmaf` (and this project's whole VMAF-gate architecture)
+samples via `-ss`, this may mean the TRUE root cause was never fully
+addressed — possibly a broken/imprecise seek index (cues) in the
+mkvmerge-appended multi-segment file, not (or not only) the
+sequential-decode-order issue this session focused on. **Not yet
+investigated further** — flagged for the next session rather than rushed
+given how many prior "fixes" in this same investigation turned out to be
+false positives from insufficient verification.
+
+**Status: Layer 1 chunk-parallel remains NOT safe for production
+default-on** (unchanged from v5.1.1X). `CONVERT_CHUNK_PARALLEL_ENABLED`
+stays `false` by default. The seam-based body/seam chunk-splitting design
+is a real, meaningful step forward (confirmed fixes the sequential-decode
+DTS defect) but is not sufficient on its own until the seek-index issue
+is understood and resolved.
+
 ## v5.1.1X — 2026-08-23
 
 **Phase 4 live end-to-end test: 4 real bugs found and fixed; one critical
