@@ -4,6 +4,54 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.0A — 2026-08-24 (branch `6.x-chunk-redesign`)
+
+**Fork point for the chunk-based redesign.** Per explicit user direction:
+the shift to chunk-parallel encoding (splitting one file into pieces
+encoded independently across the fleet, then concatenated) is a real
+architectural pivot away from the fleet's original model (each machine
+independently owns and encodes one whole file end-to-end, fully
+decentralized, no coordination needed). Per this project's own versioning
+convention, a major version bump marks "a complete re-architecture" --
+this qualifies, so rather than keep layering chunk/orchestrator work onto
+the 5.x line, it forks here.
+
+Unlike every prior version bump (5.0.x through 5.1.2A, all new files on
+`main`), this fork uses a real git branch (`6.x-chunk-redesign`) --
+explicit user direction, since this redesign is expected to take real
+design/build work before it's ready to sit alongside the proven 5.x line.
+`main` (5.x) stays the stable, maintained line; all chunk/orchestrator
+redesign work happens on this branch until it's ready.
+
+`convert-v6.0.0A.sh` is a byte-for-byte copy of `convert-v5.1.2A.sh` (only
+`VERSION` bumped) -- explicit user direction to bring the entire existing
+codebase over as the starting baseline rather than curate/prune modules
+upfront. Nothing is being left behind or judged obsolete yet; pruning
+happens deliberately as the redesign takes shape, not by guessing now
+what won't be needed.
+
+Known open design questions for this branch, not yet resolved:
+- A live orchestrator role (tentatively RANDYJ) that watches the existing
+  chunk-manifest shared state, confirms chunk/verify/concat success or
+  failure, and drives the queue forward -- intentionally designed to
+  enforce/aggregate over the manifest's already-durable shared state
+  rather than become a dispatcher other machines must ask permission
+  from, so encoders can still self-organize via the existing atomic
+  claims if the orchestrator itself is down.
+- A dedicated VMAF-generation role, decoupled from the per-encode inline
+  CRF-search/quality-tag flow that exists today -- candidate machines
+  (ELVIS, Sting) are being timed/bake-off-tested for this before either
+  is trusted with it.
+- A dedicated scene-detection role (MARLONJ) for shot-cut-based chunk
+  boundaries -- this is Phase 5 from the original chunk-parallel plan,
+  not yet built on either line.
+- Fleet role reassignment: encoder tier narrowed to x86_64-only machines
+  (JJACKSON/MJACKSON/TITOJ/PRINCE/AI-PROCESSOR/Plex/LAYTOYAJ), keeping
+  MARLONJ (the fleet's only arm64 machine, Apple M2 Max) off the encoder
+  tier to avoid cross-architecture encoder-output parity concerns (a real
+  prior issue -- see `project_marlonj_svtav1_parity_fix_2026_08_22`
+  memory).
+
 ## v5.1.2A — 2026-08-24
 
 **New: sample-prediction accuracy tracking.** Per explicit user direction —
