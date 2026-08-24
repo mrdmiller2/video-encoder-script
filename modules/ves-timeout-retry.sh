@@ -231,39 +231,6 @@ _remux_timeout_for_args() {
 
 run_ffmpeg_remux() { _run_timeout_retry "$(_remux_timeout_for_args "$@")" "${FFMPEG_CMD[@]}" "$@"; }
 
-# Separate, generous timeout curve for full-sequential (no -ss, no window)
-# VMAF measurement (measure_final_vmaf_sequential) -- NOT the same curve as
-# _validation_timeout_for_args, which is sized for short, bounded windowed
-# probes (VMAF_SAMPLE_SECS each). A full-file sequential decode of BOTH
-# streams through libvmaf is CPU-bound decode+compare work, slower than the
-# remux curve's plain stream-copy I/O -- same reasoning as
-# _remux_timeout_for_args (2026-07-29 review), scaled more generously since
-# this is decode work, not a copy. 2026-08-24: adopted for chunk-parallel
-# finalize specifically, after `_vmaf_compare_window_once`'s windowed
-# dual-input `-ss`+`setpts` construction was found to manufacture false
-# catastrophic scores on multi-segment-concatenated content (mechanism not
-# fully root-caused; full sequential decode has been reliable in every test
-# throughout that investigation) -- see
-# project_chunk_parallel_vmaf_false_positive_2026_08_24 memory.
-_sequential_vmaf_timeout_for_args() {
-  local base=600 cap=14400 extra_per_gib=1200
-  local f="" prev="" a sz total=0 extra scaled
-  for a in "$@"; do
-    [ "$prev" = "-i" ] && f="$a"
-    prev="$a"
-  done
-  if [ -n "$f" ]; then
-    sz="$(stat -c%s -- "$f" 2>/dev/null || stat -f%z -- "$f" 2>/dev/null)" && [ -n "$sz" ] && total="$sz"
-  fi
-  [ "$total" -gt 0 ] || { printf '%s' "$base"; return; }
-  extra=$(( (total * extra_per_gib) / 1073741824 ))
-  scaled=$(( base + extra ))
-  [ "$scaled" -gt "$cap" ] && scaled="$cap"
-  printf '%s' "$scaled"
-}
-
-run_ffmpeg_sequential_vmaf() { _run_timeout_retry "$(_sequential_vmaf_timeout_for_args "$@")" "${FFMPEG_CMD[@]}" "$@"; }
-
 # 3-way review (2026-07-27) independently caught the same real bug in the
 # first draft: callers like validate_mkv_mkvalidator redirect this whole
 # call's stdout/stderr to a shared file once (`run_mkvalidator ... 2>"$errf"`).

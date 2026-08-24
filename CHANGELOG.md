@@ -4,6 +4,57 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.2B — 2026-08-24
+
+**Surgical removal of chunk-parallel code from the 5.x line — moved to
+the `6.x-chunk-redesign` branch.** Per explicit user direction: the
+chunk-based redesign is now developed exclusively on the `6.x-chunk-
+redesign` git branch (see `docs/DESIGN-6x-chunk-redesign.md` there), and
+5.x/`main` should stay a clean whole-file-encoding codebase — no chunk-
+parallel machinery, since main may continue to be used standalone (or in
+tandem with 6.x, e.g. for shorter/lower-variance content like anime TV
+episodes that likely won't benefit from chunk-parallel's per-scene bit
+allocation the way longer, higher-variance films would).
+
+**Scope, confirmed precisely via `git log -S`/diff review before
+removal**: chunk-parallel code was introduced across v5.1.1S through
+v5.1.1Z (8 commits) and was cleanly self-contained in every one of
+them — no incidental non-chunk fixes were bundled into any of those
+commits, confirmed by reviewing each commit's full diff before deciding
+what to remove. v5.1.2A's sample-prediction-accuracy tracking is
+**not** chunk-related (it applies to the ordinary whole-file AV1-vs-x265
+bakeoff, `av1_source_reencode_sample_decision`, used on every
+already-AV1 source regardless of chunking) and stays.
+
+Removed from `main` (all still present, untouched, on `6.x-chunk-
+redesign`):
+- `modules/ves-chunk-coordinator.sh`, `modules/ves-chunk-verify.sh`
+  (deleted entirely)
+- `windows/modules/VesChunkCoordinator.psm1` (deleted; Windows never
+  received the Phase 3 wiring bash got, so this was already dead/unused
+  code on that platform even before removal) and its `Import-Module`
+  entry in `windows/convert.ps1`
+- `CONVERT_CHUNK_PARALLEL_ENABLED`/`CONVERT_CHUNK_MIN_DURATION_SECS`/
+  `CONVERT_CHUNK_TARGET_SECS` from `modules/ves-config.sh`
+  (`CONVERT_CHUNK_SEAM_OVERLAP_SECS` was never separately declared there,
+  only read inline with a default from the now-deleted coordinator module)
+- The `chunk_should_split`/`chunk_parallel_process_video` call site inside
+  `try_av1_convert`
+- `measure_final_vmaf_sequential()` (`modules/ves-vmaf-crf-search.sh`)
+  and its dedicated timeout curve `_sequential_vmaf_timeout_for_args()`/
+  `run_ffmpeg_sequential_vmaf()` (`modules/ves-timeout-retry.sh`) — per
+  explicit user direction, removed along with the rest even though the
+  underlying VMAF false-positive fix it implements could theoretically
+  be useful outside chunking: it was only ever called from
+  `chunk_finalize_manifest`, so no current 5.x code path uses it, and
+  keeping unreferenced code around specifically to hedge against a
+  hypothetical future use is exactly the kind of pollution this cleanup
+  is meant to avoid.
+
+Historical CHANGELOG entries for v5.1.1S through v5.1.1Z are left
+unedited above — this removes code, not documented history of what was
+tried and learned on this line before the redesign forked off.
+
 ## v5.1.2A — 2026-08-24
 
 **New: sample-prediction accuracy tracking.** Per explicit user direction —
