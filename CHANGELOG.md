@@ -4,6 +4,49 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.1Z — 2026-08-24
+
+**Chunk-parallel VMAF false-positive found and worked around — the
+"seek-index corruption" reported in v5.1.1Y was itself a false positive
+of the verification tooling, not a real defect.** Full details: memory
+`project_chunk_parallel_vmaf_false_positive_2026_08_24`.
+
+Direct empirical testing (keyframe-flag dump, remux, alternate concat
+tool, isolated pre-concat chunk file, plain source self-compare,
+byte-identical single-frame MD5 check, and a duration sweep) systematically
+disproved every "real file corruption" theory from the v5.1.1Y
+investigation, including the "broken mkvmerge seek index" hypothesis a
+4-source consultation panel had converged on. The actual trigger: the
+pipeline's own windowed VMAF construction (`_vmaf_compare_window_once` in
+`ves-vmaf-crf-search.sh` — two independent `-ss` seeks, each rewritten via
+`setpts=PTS-STARTPTS`, merged through `libvmaf` into a `-f null -` muxer)
+reproducibly manufactures a catastrophic false score (seen: mean 18.5, min
+0.0 on a file later proven undamaged) specifically when reading
+multi-segment-concatenated content, regardless of concat tool. The exact
+ffmpeg-internal mechanism was not root-caused — three synthetic
+reproducers at increasing scale (up to 150s / 11 real-GOP-length
+segments) all failed to trigger it cheaply, so whatever the trigger is
+needs real full-length body chunks (~1000s), not a cheap stand-in.
+
+Fix: new `measure_final_vmaf_sequential()` (`ves-vmaf-crf-search.sh`) —
+decodes both streams fully sequentially, no `-ss` and no `setpts` rewrite
+anywhere, sidestepping the buggy construction entirely. Wired into
+`chunk_finalize_manifest` (`ves-chunk-verify.sh`) in place of the windowed
+`measure_final_vmaf`, since that's the path the false positive was found
+on. New dedicated timeout curve (`_sequential_vmaf_timeout_for_args`,
+`ves-timeout-retry.sh`) since a full-file decode+VMAF pass is a
+genuinely slower regime than the short bounded windows the existing
+validation timeout curve was tuned for. Validated against small
+already-encoded reproducer files (not a full movie re-run): a clean
+self-compare scored 98.8 as expected, and a real 3-segment splice test
+produced a sane score with no catastrophic collapse, matching earlier
+manual verification.
+
+Scope: this change is chunk-parallel-specific (`chunk_finalize_manifest`
+only) — the windowed sampling `measure_final_vmaf` uses elsewhere in the
+pipeline has run reliably for months on normal whole-file encodes and was
+not touched.
+
 ## v5.1.1Y — 2026-08-23
 
 **Chunk-parallel DTS/concatenation defect: seam-based fix implemented,

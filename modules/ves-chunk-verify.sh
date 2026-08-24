@@ -187,7 +187,17 @@ chunk_finalize_manifest() {
     return 1
   fi
 
-  vmaf_score="$(measure_final_vmaf "$src" "$concat_tmp" 0)" || {
+  # measure_final_vmaf_sequential, NOT measure_final_vmaf -- the windowed
+  # dual-`-ss` construction the latter uses was found (2026-08-24) to
+  # manufacture false catastrophic scores specifically on multi-segment-
+  # concatenated content like this finalize step's output. See
+  # measure_final_vmaf_sequential's own header comment and
+  # project_chunk_parallel_vmaf_false_positive_2026_08_24 memory for the
+  # full investigation. Costs a full-file decode instead of a few short
+  # windows -- accepted here since chunk-parallel finalize is not yet a
+  # high-frequency path and correctness matters more than speed for this
+  # specific gate.
+  vmaf_score="$(measure_final_vmaf_sequential "$src" "$concat_tmp" 0)" || {
     warn "Chunk-parallel finalize: VMAF measurement failed, leaving chunks in place for review: $src"
     rm -f -- "$concat_tmp" 2>/dev/null
     return 1

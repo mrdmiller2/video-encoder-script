@@ -169,6 +169,50 @@ measure_final_vmaf() {  # src out target_height -> prints VMAF or fails
   awk -v s="$vsum" -v n="$n" 'BEGIN{printf "%.1f", s/n}'
 }
 
+# Full-file, zero-seek VMAF measurement -- decodes src and out SEQUENTIALLY
+# start to finish (no -ss, no setpts=PTS-STARTPTS rewrite) and feeds both
+# straight into libvmaf. Distinct from measure_final_vmaf/
+# _vmaf_compare_window_once, which samples short windows via independent
+# `-ss` seeks on both inputs -- found 2026-08-24, after an extensive
+# investigation (see project_chunk_parallel_vmaf_false_positive_2026_08_24
+# memory), to reproducibly manufacture catastrophic false-negative scores
+# (real case: mean 18.5, min 0.0 on a file later proven undamaged) when
+# that windowed construction reads a multi-segment-concatenated file --
+# confirmed via mkvmerge remux (no fix), an alternate concat tool (identical
+# failure), a standalone pre-concat chunk (clean), the plain source (clean
+# at every window length), and a byte-identical single-frame MD5 match
+# between cold-seek and full-sequential extraction. The exact ffmpeg-
+# internal mechanism was never root-caused (three synthetic reproducers at
+# increasing scale, up to 150s/11 real-length segments, all failed to
+# reproduce it cheaply -- whatever triggers it needs real full-length body
+# chunks, not a cheap synthetic stand-in), so this function exists as the
+# verification path for chunk-parallel finalize specifically: no -ss
+# anywhere means no seek-index/cold-decode-context involvement is possible,
+# and full sequential decode has been reliable in every test throughout
+# that investigation, including on the real production splice. Costs a
+# full decode of the whole file (a genuinely different regime from the
+# short bounded windows every other VMAF path in this file uses -- see
+# run_ffmpeg_sequential_vmaf's dedicated timeout curve), so this is NOT a
+# drop-in replacement for measure_final_vmaf's windowed sampling elsewhere
+# in the pipeline, where the windowed approach has run reliably for months.
+measure_final_vmaf_sequential() {  # src out target_height -> prints VMAF or fails
+  local src="$1" out="$2" target_height="${3:-0}"
+  local model scale_filter="" vlog v
+  [ -f "$src" ] && [ -f "$out" ] || return 1
+  model="$(vmaf_model_for_source "$src")"
+  case "$target_height" in
+    720) scale_filter='scale=1280:720:flags=lanczos:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,' ;;
+    1080) scale_filter='scale=1920:1080:flags=lanczos:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,' ;;
+  esac
+  vlog="$(mktemp "${RAMDISK_JOB_DIR:-${TMPDIR:-/tmp}}/ves-vmaf-seq-XXXXXX.json")" || return 1
+  run_ffmpeg_sequential_vmaf -y -v error -i "$out" -i "$src" -lavfi \
+    "[0:v]format=yuv420p10le[d];[1:v]${scale_filter}format=yuv420p10le[r];[d][r]libvmaf=model=$model:n_threads=$(nproc 2>/dev/null || sysctl -n hw.ncpu):log_fmt=json:log_path=$vlog" \
+    -f null - 2>/dev/null || { rm -f "$vlog"; return 1; }
+  v="$(python3 -c "import json;print(round(json.load(open('$vlog'))['pooled_metrics']['vmaf']['mean'],2))" 2>/dev/null)" || { rm -f "$vlog"; return 1; }
+  rm -f "$vlog"
+  printf '%s' "$v"
+}
+
 video_display_metrics() {  # prints: display_width display_height fps bitrate bpppf
   local src="$1" w h sar dar fps br fmt_br sn sd dn dd fn fd dw dh bpp
   w="$(video_width "$src")"; h="$(video_height "$src")"
