@@ -151,21 +151,60 @@ needs to be revisited with the network variable actually controlled for.
 focused on its concat/validation role. Not yet finalized as a committed
 decision — no code changes made based on this yet.
 
-## Staging server (10.200.200.151) for the encoder tier
+## Staging server (10.200.200.151, OS2) for the encoder tier — OS1 (.150) built in parity as fallback
 
 **Problem**: encoder-tier machines on 10.200.200.x cross a VPN link to
 read source files from the primary NAS (10.10.10.150) — a real, if not
 yet precisely measured, I/O tax for every encode job on 6 of the 7
 encoder-tier machines.
 
-**Proposal**: a same-subnet staging replica on 10.200.200.151 (confirmed
-live 2026-08-24: SSH+HTTPS reachable, sub-ms ping from that subnet,
-currently unused — a second TrueNAS box, distinct from both the primary
-NAS at 10.10.10.150 and 10.200.200.150). Encoder-tier machines on
-10.200.200.x would read their source file from .151 instead of crossing
-the VPN to .150. TrueNAS's native rsync task feature (not a custom
-VES-script-driven copy) handles the actual transfer + checksum validation
-(`--checksum`), rather than reinventing that logic.
+**2026-08-23/24 incident, why both boxes are built out**: OS2
+(10.200.200.151) went unreachable overnight 8/22→8/23 and needed a
+physical cold-boot. Post-mortem via `journalctl -b -1` on OS2 found no
+USB-specific kernel error (contrary to the initial "USB failures"
+suspicion) — instead the previous boot's log simply stops dead at
+08:07:06 PDT with no shutdown target reached, no panic/oops, consistent
+with a hard hang rather than a logged software fault. Root cause not
+pinned down (candidate: the onboard NIC flapped twice earlier that night —
+an OS-level link down/up at ~20:20 on 8/22, and an independent BMC-level
+"all links down" fault in the iLO IML at 03:18:21 on 8/23 — neither alone
+fatal, final hang ~5h after the second one). **Decision: use OS2 as the
+primary staging target (nearly 3.5x the free space of OS1 — 27.2TB vs
+8TB), but build the identical dataset/share structure on OS1 as a live
+fallback**, so a repeat OS2 hang doesn't block staging entirely — just
+requires re-pointing `CONVERT_STAGING_MEDIA_ROOT` (below) at OS1 instead.
+
+**Also fixed 2026-08-24**: SSH password login to OS2 was blocked by a
+per-user flag (`truenas_admin`'s `ssh_password_enabled: false`), which
+silently overrides the SSH *service's* global `passwordauth: true` — a
+TrueNAS SCALE gotcha (per-account gate is separate from the service-level
+toggle and from `password_disabled`, which only covers the web UI).
+Fixed via `PUT /api/v2.0/user/id/<id>` `{"ssh_password_enabled": true}`.
+OS1's `admin` account already had this set correctly. Worth checking this
+flag on any TrueNAS box that inexplicably rejects password SSH despite
+correct credentials.
+
+**Built 2026-08-24, both boxes, identical structure**:
+- Dataset `<pool>/Shares/VESStaging` (`Minnie/Shares/VESStaging` on OS1,
+  `MeiMei/Shares/VESStaging` on OS2) — POSIX ACL, DISCARD aclmode,
+  SENSITIVE casesensitivity, LZ4 compression, 128K recordsize, `0777
+  root:root` on-disk permissions.
+- SMB share `VESStaging` and NFS share, both pointed at that dataset,
+  both enabled, comment `"video-encoder-script chunk-parallel staging
+  cache"`.
+- End-to-end verified on OS2 (OS1 was verified 2026-08-22): mounted the
+  primary NAS's `BigMomma/Media` NFS export read-only, `rsync
+  --checksum`'d a real ~246MB file into `VESStaging`, confirmed identical
+  size + SHA-256 on both sides, cleaned up the test file and the temp
+  mount.
+
+**Mechanism**: encoder-tier machines on 10.200.200.x read their source
+file from OS2 instead of crossing the VPN to the primary NAS at .150.
+TrueNAS's native rsync task feature (not a custom VES-script-driven copy)
+should handle the actual transfer + checksum validation (`--checksum`) in
+production, once the queue/orchestrator exists to trigger it — the manual
+rsync above only proves the mechanism, it isn't the on-demand production
+path yet (see Open Items).
 
 **Trigger model, per explicit user direction**: cached on-demand, but
 *overlapped* — not "encoder waits for the file to arrive." Once a title
@@ -205,9 +244,12 @@ meant to provide, and conflicts with nothing in this project's existing
 at write time, like every other staging mechanism already in this
 codebase (RAM-disk staging, disc-extraction staging).
 
-**Not yet built**: none of this exists as code on either branch yet. Test
-target is 10.200.200.151 specifically (currently unused, per explicit user
-direction, to avoid touching anything already relying on .150).
+**Not yet built**: the `CONVERT_STAGING_MEDIA_ROOT` lookup+fallback logic
+itself doesn't exist as code on either branch yet — only the underlying
+dataset/share infrastructure on OS1 and OS2 (above) and the manual
+rsync-mechanism proof are done. Primary target is OS2
+(10.200.200.151), with OS1 (10.200.200.150) built identically as a
+fallback target given OS2's 8/22-8/23 unplanned outage.
 
 ## Orchestrator design (RANDYJ)
 
@@ -243,11 +285,14 @@ implementation.
    manifest state and what "the queue" concretely is (a new shared file?
    a lightweight service RANDYJ runs?).
 2. Staging-cache module (`CONVERT_STAGING_MEDIA_ROOT` lookup + fallback
-   logic) — designed above, not implemented.
-3. Real rsync task setup between 10.10.10.150 and 10.200.200.151 — not
-   yet configured; TrueNAS-native rsync task vs. something VES-script-
-   driven still to be decided operationally (likely TrueNAS-native, per
-   the reasoning above, but not confirmed).
+   logic, including OS2→OS1 fallback target switching) — designed above,
+   not implemented.
+3. Real *on-demand/automated* rsync task setup between 10.10.10.150 and
+   10.200.200.151 — the manual mechanism is proven (2026-08-24, real file,
+   checksum-verified) but not yet wired to run automatically; TrueNAS-
+   native rsync task vs. something VES-script-driven still to be decided
+   operationally (likely TrueNAS-native, per the reasoning above, but not
+   confirmed).
 4. Network-isolated ELVIS-vs-Sting re-test (pre-staged local file, compute-
    only timing) — queued, not run. Current bake-off result stands as the
    real-world/as-deployed number in the meantime.
