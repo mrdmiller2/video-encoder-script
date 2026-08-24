@@ -175,6 +175,44 @@ log_sample_prediction_outcome() {
   SAMPLE_PRED_POINTS_REQUESTED=""
 }
 
+# Appends one line to content-variance-log.tsv recording the raw low/
+# median/high packet-size sample values (source_content_variance_probe(),
+# ves-source-traits.sh) for every file that finishes processing, alongside
+# the real outcome (codec chosen, actual output size vs. original) --
+# pure observability, no gate depends on this. 2026-08-24, per explicit
+# user direction: this originated as a chunk-parallel-eligibility gate
+# (high/median ratio) on the 6.x-chunk-redesign branch that a real
+# 17-title validation against known reference titles found had no
+# coherent genre/pacing correlation (see docs/DESIGN-6x-chunk-redesign.md
+# on that branch) -- reverted as a gate there, but 17 titles isn't a
+# statistically meaningful sample for something this potentially subtle,
+# so rather than abandon the signal, this keeps recording the RAW low/
+# median/high values (not just one collapsed ratio, so future analysis
+# isn't locked into today's statistic choice) for every file processed on
+# BOTH this line and the 6.x branch, accumulating from real day-to-day
+# fleet volume instead of only deliberate test runs. Same
+# ${JOB_SIDECAR_DIR:-.} location convention as sample-prediction-log.tsv/
+# bad_sources.txt. Best-effort: a probe failure (e.g. an unusual source
+# ffprobe can't read packet sizes for) just skips this file's row rather
+# than blocking anything.
+log_source_content_variance() {
+  local src="$1" actual_codec="$2" actual_out_bytes="$3" orig_bytes="$4"
+  local probe low med high ratio="" logf dur
+  probe="$(source_content_variance_probe "$src" 2>/dev/null)" || return 0
+  read -r low med high <<<"$probe"
+  [[ "$low" =~ ^[0-9]+$ ]] && [[ "$med" =~ ^[0-9]+$ ]] && [[ "$high" =~ ^[0-9]+$ ]] || return 0
+  [ "$med" -gt 0 ] && ratio="$(awk -v h="$high" -v m="$med" 'BEGIN{printf "%.2f", h/m}')"
+  dur="$(video_duration "$src" 2>/dev/null)"
+  logf="${JOB_SIDECAR_DIR:-.}/content-variance-log.tsv"
+  if [ ! -f "$logf" ]; then
+    printf 'timestamp\tsource\tduration_secs\tlow_bytes\tmedian_bytes\thigh_bytes\thigh_median_ratio\tactual_codec\tactual_out_bytes\torig_bytes\n' >>"$logf" 2>/dev/null
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(basename -- "$src")" "${dur:-}" "$low" "$med" "$high" \
+    "${ratio:-}" "${actual_codec:-}" "${actual_out_bytes:-}" "${orig_bytes:-}" \
+    >>"$logf" 2>/dev/null
+}
+
 record_conversion_result() {
   local src="$1"
   local out="${2:-}"
@@ -196,6 +234,13 @@ record_conversion_result() {
     # nothing to compare, but still clear the sticky state so it can't leak
     # into a later, unrelated title's own record_conversion_result call.
     SAMPLE_PRED_ACTIVE=false
+  fi
+  if [ "$DRY_RUN" = false ]; then
+    if [ -n "$out" ] && [ -f "$out" ]; then
+      log_source_content_variance "$src" "$(video_codec "$out" 2>/dev/null)" "$(file_size_bytes "$out")" "$orig_sz"
+    else
+      log_source_content_variance "$src" "" "" "$orig_sz"
+    fi
   fi
 
   if [ -n "$out" ] && [ -f "$out" ] && [ "$DRY_RUN" = false ]; then

@@ -4,6 +4,43 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v5.1.2C — 2026-08-24
+
+**New: passive content-complexity-variance tracking.** Originated on the
+`6.x-chunk-redesign` branch as a chunk-parallel-eligibility gate (a
+high/median compressed-packet-size ratio, intended to detect whether a
+source has enough scene-to-scene complexity variance for chunking's
+per-scene bit reallocation to pay off) — a real validation across 17
+known reference titles (extreme action: John Wick, Mad Max Fury Road,
+Mad Heidi; slow/contemplative: The Tree of Life, Barry Lyndon, There Will
+Be Blood, The Master; anime of various types; a static single-camera
+opera; a short TV episode) found no coherent genre/pacing correlation —
+John Wick scored highest of all 17 (10.04), Mad Max Fury Road (arguably
+the most kinetically-edited action film in the sample) scored near the
+bottom (2.21). That gate was reverted on 6.x.
+
+Per explicit user direction: 17 titles isn't a statistically meaningful
+sample for something this potentially subtle, so rather than abandon the
+signal, the underlying probe was generalized (moved out of the chunk-only
+module into `source_content_variance_probe()`, `ves-source-traits.sh`,
+since it isn't chunk-specific) and is now recorded as **pure passive
+observability** — no gate depends on it — for every file that finishes
+processing, on **both** this line and 6.x, so it accumulates from real
+day-to-day fleet volume instead of only deliberate test runs.
+
+New `log_source_content_variance()` (`ves-stats-log.sh`) appends one row
+per finished file to `content-variance-log.tsv` (same
+`${JOB_SIDECAR_DIR:-.}` convention as `sample-prediction-log.tsv`),
+recording the **raw** low/median/high packet-size values (not just a
+collapsed ratio, so future analysis isn't locked into today's statistic
+choice) alongside the real outcome — codec chosen, actual output size vs.
+original. Wired into `record_conversion_result()`, the same universal
+choke point sample-prediction tracking already uses. Best-effort: a probe
+failure just skips that file's row. Tested end-to-end against a real file
+on both branches before shipping.
+
+No behavior change to any decision logic — observability only.
+
 ## v5.1.2B — 2026-08-24
 
 **Surgical removal of chunk-parallel code from the 5.x line — moved to
