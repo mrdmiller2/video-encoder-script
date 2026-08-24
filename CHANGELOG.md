@@ -52,6 +52,40 @@ Known open design questions for this branch, not yet resolved:
   prior issue -- see `project_marlonj_svtav1_parity_fix_2026_08_22`
   memory).
 
+## v6.0.0C — 2026-08-24 (branch `6.x-chunk-redesign`)
+
+**Stuck-script reaper** (`reap_stuck_script_processes()`,
+`modules/ves-orphan-reaper.sh`): found live on JJACKSON -- three nested
+`convert-v5.1.2A.sh` processes sitting at 0.0% CPU for up to ~3 hours,
+referencing a script file a routine version-deploy had already deleted
+days earlier. The existing orphan reaper (`reap_orphaned_encoders()`)
+explicitly skips any script PID that's still alive ("Live script job on
+this host — never touch"), so it never caught this class of bug. The new
+function is the complement: reaps a live top-level script process only
+when it has *no* live encoder-tool descendant (ffmpeg/HandBrakeCLI/
+mkvmerge, checked across its full descendant tree, not just direct
+children) *and* has been running for at least `STUCK_SCRIPT_GRACE_SECS`
+(default 900s, matching the chunk-splitter's own stale-reclaim
+threshold). Both conditions together, not either alone -- a script
+legitimately between steps (keyframe scan, staging copy, VMAF setup)
+shows no encoder-tool child for well under 900s. Wired into the same
+Phase B startup pass as the existing reaper, gated by the same
+`AUTO_REAP`/`--no-auto-reap` flag. New config: `STUCK_SCRIPT_GRACE_SECS`,
+`STUCK_SCRIPT_KILL_GRACE_SECS` (`modules/ves-config.sh`).
+
+Also: `ves-config.sh`/`ves-orphan-reaper.sh` are shared with `main`, so
+this ships there too as part of `main`'s own next version.
+
+## v6.0.0B — 2026-08-24 (branch `6.x-chunk-redesign`)
+
+Version bump for accumulated module changes since the fork (v6.0.0A):
+content-complexity-variance probe generalized into passive cross-branch
+tracking (`log_source_content_variance()`, now also recording source
+codec), deterministic SLOT-order documentation for the encoder tier, and
+the `chunk_should_split()` variance-gate experiment (added, validated
+against 17 real titles, then reverted per the negative-result findings --
+see `docs/DESIGN-6x-chunk-redesign.md`).
+
 ## v5.1.2A — 2026-08-24
 
 **New: sample-prediction accuracy tracking.** Per explicit user direction —
