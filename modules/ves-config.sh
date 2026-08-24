@@ -6,7 +6,7 @@
 # MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
 # bug fix) -- see its own comment.
 
-VERSION="6.0.0D"
+VERSION="6.0.0E"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
 # as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
@@ -252,6 +252,12 @@ CONVERT_CHUNK_TARGET_SECS="${CONVERT_CHUNK_TARGET_SECS:-600}"
 # default for this exact use -- not yet independently tuned/validated
 # against real fleet content.
 SCENE_DETECT_THRESHOLD="${SCENE_DETECT_THRESHOLD:-0.3}"
+# Phase 6 (shot_claim_next(), ves-per-shot-qp.sh): staleness ceiling for a
+# claimed-but-not-yet-resolved shot search. Deliberately much shorter than
+# CONVERT_CHUNK's 7200s chunk-encode ceiling -- a shot's bounded QP search
+# (a handful of short sample encodes) finishes in minutes (confirmed live
+# 2026-08-24, ~3-9 min per shot including VMAF measurement), not hours.
+SHOT_SEARCH_STALE_SECS="${SHOT_SEARCH_STALE_SECS:-1800}"
 RAMDISK_SIZE_ESTIMATE_MARGIN_PCT=10
 # Set once per run by ramdisk_job_start(), read by every file's
 # resolve_encode_stage_path() -- not re-resolved per file, so a run that
