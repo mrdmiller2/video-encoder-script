@@ -165,20 +165,25 @@ _interp_qp() {
 # shape (QP instead of CRF), refinement steps use curve interpolation
 # instead of blind bisection to reach the same guaranteed-optimal (gap<=1)
 # answer faster (see _interp_qp() above and the comment inline below).
-# Scored via _vmaf_score_shot() instead of
-# sampling several clips. Prints "qp achieved_vmaf" or fails (caller should
-# fall back to a fixed default QP for this shot, same "search failed,
-# don't block the pipeline" philosophy resolve_crf_for_encode() already
-# uses for whole-file search).
-# Populated fresh by every resolve_per_shot_qp() call: every (qp,vmaf,bytes)
-# sample that call's search actually probed, as "qp:vmaf:bytes" entries --
-# a side-channel global rather than a return-value change (matching this
-# codebase's own established pattern for "extra data from the last call",
-# e.g. QTGMC_FINAL_VMAF_* in ves-config.sh), so existing callers that only
-# want the winning "qp vmaf" pair are unaffected. Feeds the Phase 6.1
-# equal-slope allocator's per-shot rate-distortion hull -- the search
-# already produces these samples as a side effect of finding its own
-# winner; this just stops discarding them.
+# Scored via _vmaf_score_shot() instead of sampling several clips. Prints
+# "qp achieved_vmaf samples" (3 whitespace-separated fields -- parse with
+# `read -r qp vmaf samples <<<"$result"`, NOT the old first/last-field
+# shortcut) or fails (caller should fall back to a fixed default QP for
+# this shot, same "search failed, don't block the pipeline" philosophy
+# resolve_crf_for_encode() already uses for whole-file search). `samples`
+# is every (qp,vmaf,bytes) this call actually probed, comma-joined
+# "qp:vmaf:bytes" entries -- feeds the Phase 6.1 equal-slope allocator's
+# per-shot rate-distortion data (the search already produces these as a
+# side effect of finding its own winner; this just stops discarding them).
+#
+# LAST_SHOT_SEARCH_SAMPLES below is populated during the search purely as
+# this function's own internal accumulator for building that 3rd field --
+# NOT a usable side-channel for callers. Every real caller invokes this
+# function via $(...) command substitution, which forks a subshell; a
+# global written inside that subshell never reaches the caller. Found
+# live 2026-08-25: an earlier version of this comment described the
+# global itself as the intended hand-off mechanism, and it was silently
+# always empty in every caller as a result.
 LAST_SHOT_SEARCH_SAMPLES=()
 
 resolve_per_shot_qp() {
@@ -259,7 +264,17 @@ resolve_per_shot_qp() {
     best="$closest"; bv="$cv"
   fi
   [ -n "$best" ] || return 1
-  printf '%s %s' "$best" "$bv"
+  # 3rd field: every (qp,vmaf,bytes) sample this search actually probed,
+  # comma-joined -- feeds the Phase 6.1 equal-slope allocator. Printed
+  # here (not via a global) because every real caller invokes this
+  # function through $(...) command substitution, which forks a subshell;
+  # a global set inside that subshell never reaches the caller (found
+  # live 2026-08-25: LAST_SHOT_SEARCH_SAMPLES was silently always empty in
+  # every caller despite being populated correctly inside this function).
+  # Callers must parse 3 whitespace-separated fields (e.g. `read -r qp
+  # vmaf samples <<<"$result"`), not the old first/last-field shortcut.
+  local IFS=,
+  printf '%s %s %s' "$best" "$bv" "${LAST_SHOT_SEARCH_SAMPLES[*]}"
 }
 
 # Orchestrates the full per-shot search for one title and writes a
@@ -534,13 +549,11 @@ shot_search_claimed() {
   result="$(resolve_per_shot_qp "$src" "$start_ts" "$end_ts" "$codec" "$target" "$model" "$profile")"
   local samples=""
   if [ -n "$result" ]; then
-    qp="${result%% *}"; vmaf="${result##* }"
-    # LAST_SHOT_SEARCH_SAMPLES is set by the resolve_per_shot_qp() call just
-    # above, in this same process -- safe to read here (see Phase 6.1 in
-    # docs/DESIGN-6x-chunk-redesign.md for what consumes this).
-    local IFS=,
-    samples="${LAST_SHOT_SEARCH_SAMPLES[*]}"
-    unset IFS
+    # 3 whitespace-separated fields (qp, vmaf, samples) -- read, not the
+    # old first/last-field shortcut, since the samples field itself would
+    # otherwise be mistaken for the last field (see resolve_per_shot_qp()'s
+    # own header comment for why this isn't a side-channel global instead).
+    read -r qp vmaf samples <<<"$result"
   else
     qp="$(fixed_crf_for "$codec" "$profile" false)"
     vmaf=""
