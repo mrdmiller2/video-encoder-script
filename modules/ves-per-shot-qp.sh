@@ -48,35 +48,87 @@ _shot_ffmpeg_timeout() {
   printf '%s' "$scaled"
 }
 
+# Resolves the standalone SvtAv1EncApp binary. Kept separate from
+# discover_tools()'s shared startup checklist/banner (ves-tool-discovery.sh)
+# since it's only ever needed for Phase 6 (per-shot search + the final
+# qpfile-driven encode), not the general whole-file pipeline every run goes
+# through -- a machine that's never touched Phase 6 shouldn't fail its
+# checklist over a tool it doesn't need yet. Fleet-wide install location is
+# fixed (/usr/bin/SvtAv1EncApp, built from source at a pinned commit -- see
+# the fleet parity note below), so a plain PATH lookup is enough.
+SVTAV1ENCAPP_CMD=()
+discover_svtav1encapp() {
+  [ "${#SVTAV1ENCAPP_CMD[@]}" -gt 0 ] && return 0
+  local tool
+  tool="$(command -v SvtAv1EncApp 2>/dev/null)" || return 1
+  SVTAV1ENCAPP_CMD=("$tool")
+  return 0
+}
+
 # Scores one shot at one candidate QP: encodes the shot's own real frame
 # range (stream-copy extracted, not re-decoded first) at a HARD uniform
-# QP -- deliberately -qp, never -crf, because the final application (one
-# continuous encode driven by a per-frame qpfile) applies an explicit,
-# non-adaptive QP to every frame in this shot's range; searching with an
-# internally-adaptive -crf would not predict that behavior correctly.
+# QP via the exact same mechanism the final application uses (SvtAv1EncApp
+# --qpfile, all frames set to the same value), not ffmpeg's -qp flag.
+#
+# 2026-08-25: this used to use `ffmpeg -c:v libsvtav1 -qp X` -- reasonable
+# on its face (both are "the same SVT-AV1 library, just a different QP
+# value"), but a real controlled experiment (same isolated clip, same exact
+# QP, both encode paths) found ffmpeg's -qp wrapper and the standalone
+# --qpfile mechanism do NOT deliver equivalent quality for the same nominal
+# QP -- a real, substantial, consistent gap (mean ~8 VMAF points across a
+# 6-shot sample, larger than the whole-file target-vs-actual gap this was
+# found while investigating). A separate context-padding fix was tried
+# first and made things worse, not better, before this was found -- the
+# real bug was never "context," it was that the search was calibrating
+# against a DIFFERENT encode code path than the one the final continuous
+# encode actually uses. Now both use identical SvtAv1EncApp --qpfile
+# invocations (a uniform one-QP-per-frame file here; a real varying one in
+# the final assembled encode), so whatever quirk distinguishes the two
+# paths no longer matters -- the search is calibrated against reality by
+# construction, not by guessing at the cause.
+#
+# Requires SvtAv1EncApp to be fleet-wide version-pinned the same way
+# ffmpeg's libsvtav1 already is (see feedback_svtav1_version_constant) --
+# confirmed 2026-08-25 the distro-packaged binary on at least one fleet
+# machine was a mismatched, much older build entirely missing features the
+# real encode depends on (variance-boost, sharpness). Every machine running
+# this function must have the fleet-pinned SvtAv1EncApp built from source
+# and installed to /usr/bin, not whatever a package manager happens to
+# provide.
 # Prints "vmaf bytes" or fails.
 _vmaf_score_shot() {
   local src="$1" start="$2" end="$3" qp="$4" codec="$5" model="$6" profile="$7"
-  local work clip out vlog v b enc_timeout
+  local work clip y4m out out_mkv vlog v b enc_timeout nframes qpfile
   local -a grain_decode_flag=()
+  discover_svtav1encapp || return 1
   work="$(mktemp -d "${RAMDISK_JOB_DIR:-${TMPDIR:-/tmp}}/ves-shotqp-XXXXXX")" || return 1
   clip="$work/shot.mkv"
   run_ffmpeg_validation -y -v error -ss "$start" -to "$end" -i "$src" \
     -map 0:v:0 -c copy "$clip" 2>/dev/null || { rm -rf "$work"; return 1; }
   [ -s "$clip" ] || { rm -rf "$work"; return 1; }
-  out="$work/shot-enc-$qp.mkv"
-  vlog="${out}.vmaf.json"
   enc_timeout="$(_shot_ffmpeg_timeout "$(awk -v s="$start" -v e="$end" 'BEGIN{d=e-s; if(d<0)d=0; print d}')")"
   case "$codec" in
     av1)
       local svtp; svtp="$(profile_svt_params "$profile")" || { rm -rf "$work"; return 1; }
-      _run_timeout_retry "$enc_timeout" "${FFMPEG_CMD[@]}" -y -v error -i "$clip" -c:v libsvtav1 -preset "$SVT_PRESET_SEARCH" -qp "$qp" \
-        -pix_fmt yuv420p10le -svtav1-params "${svtp}:rc=0" -an "$out" 2>/dev/null || { rm -rf "$work"; return 1; }
+      y4m="$work/shot.y4m"
+      run_ffmpeg_validation -y -v error -i "$clip" -map 0:v:0 -pix_fmt yuv420p10le -strict -1 "$y4m" 2>/dev/null \
+        || { rm -rf "$work"; return 1; }
+      nframes="$("${FFPROBE_CMD[@]}" -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of csv=p=0 "$clip" 2>/dev/null)"
+      [[ "$nframes" =~ ^[0-9]+$ ]] && [ "$nframes" -gt 0 ] || { rm -rf "$work"; return 1; }
+      qpfile="$work/uniform-$qp.qp"
+      yes "$qp" 2>/dev/null | head -n "$nframes" > "$qpfile"
+      out="$work/shot-enc-$qp.ivf"
+      _run_timeout_retry "$enc_timeout" "${SVTAV1ENCAPP_CMD[@]}" -i "$y4m" --use-q-file 1 --qpfile "$qpfile" \
+        --svtav1-params "${svtp}:rc=0" -b "$out" 2>/dev/null || { rm -rf "$work"; return 1; }
+      [ -s "$out" ] || { rm -rf "$work"; return 1; }
+      out_mkv="$work/shot-enc-$qp.mkv"
+      run_ffmpeg_validation -y -v error -i "$out" -c copy "$out_mkv" 2>/dev/null || { rm -rf "$work"; return 1; }
       svtav1_profile_uses_grain_synthesis "$profile" && grain_decode_flag=(-export_side_data film_grain)
       ;;
     *) rm -rf "$work"; return 1 ;;
   esac
-  _run_timeout_retry "$enc_timeout" "${FFMPEG_CMD[@]}" -y -v error "${grain_decode_flag[@]}" -i "$out" -i "$clip" -lavfi \
+  vlog="${out}.vmaf.json"
+  _run_timeout_retry "$enc_timeout" "${FFMPEG_CMD[@]}" -y -v error "${grain_decode_flag[@]}" -i "$out_mkv" -i "$clip" -lavfi \
     "[0:v]setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]setpts=PTS-STARTPTS,format=yuv420p10le[r];[d][r]libvmaf=model=$model:n_threads=$(nproc 2>/dev/null || sysctl -n hw.ncpu):log_fmt=json:log_path=$vlog" \
     -f null - 2>/dev/null || { rm -rf "$work"; return 1; }
   v="$(python3 -c "import json;print(round(json.load(open('$vlog'))['pooled_metrics']['vmaf']['mean'],2))" 2>/dev/null)" || { rm -rf "$work"; return 1; }
