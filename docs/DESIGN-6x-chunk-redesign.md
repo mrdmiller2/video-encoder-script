@@ -456,3 +456,120 @@ material, which this fleet generally doesn't have). This section, not
 deletion, is the record — so a future session doesn't re-attempt the same
 packet-size-variance approach blindly without knowing it was already
 tried and why it didn't hold up.
+
+## Phase 6.1 (scoping, not yet built) — equal-slope global bit allocation
+
+Prompted by a real, still-unexplained gap found live 2026-08-25: the
+per-shot search (`resolve_per_shot_qp()`, `modules/ves-per-shot-qp.sh`)
+targets a fixed VMAF (94.0 for the anime test episode,
+`vmaf_target_for_source()`) independently per shot, but a real 199-shot
+run's assembled qpfile measured 89.41 whole-file VMAF — a ~4.6 point gap
+between what every shot's own isolated search believed it achieved and
+what the single continuous encode actually delivers. Two contributing
+causes already identified/fixed this session (see git log,
+v6.0.0F/v6.0.0G): (1) shots whose search never found a QP that cleanly
+met target within its probe budget were silently accepted at a real,
+measured VMAF *below* target (a real quality-floor violation, fixed by
+the Av1an-style tolerance-band early exit); (2) isolated per-shot VMAF
+measurement (short re-decoded clip, no cross-shot reference-frame
+context) may systematically diverge from the same footage's VMAF inside
+one continuous encode — unconfirmed, not yet isolated from cause (1).
+
+This section scopes a third, more fundamental question raised by the
+user: is "every shot independently hits the same fixed VMAF" even the
+right objective, or is Netflix's actual published approach (per-shot
+rate-distortion convex hulls + a single global equal-slope operating
+point, see
+[Dynamic Optimizer](https://netflixtechblog.com/dynamic-optimizer-a-perceptual-video-encoding-optimization-framework-e19f1e3a277f))
+a better fit — allocating bits so every shot's *marginal* quality-per-bit
+is equalized, rather than chasing an identical absolute quality number
+everywhere regardless of how cheaply or expensively each shot can reach
+it.
+
+### Why this doesn't require new encode/VMAF compute
+
+The expensive part of Phase 6 — real sample encodes + VMAF measurement
+per shot — is unchanged. `resolve_per_shot_qp()` already produces 2-6 real
+`(QP, VMAF, bytes)` samples per shot as a side effect of its own search;
+today it keeps only the winner and discards the rest
+(`shot_search_claimed()` currently writes a single `qp=`/`vmaf=` pair to
+each shot's `.status` file). The equal-slope allocator is a **pure
+post-processing pass over data we're already generating** — no new
+ffmpeg/VMAF calls, just math over retained sample points. The real cost
+is a data-model change (retain the full sample set, not just the winner)
+and a new allocation stage between "all shots searched" and "assemble
+qpfile."
+
+### Concrete algorithm (standard Lagrangian/water-filling, adapted to a quality floor instead of a bit budget)
+
+Netflix's own formulation targets a fixed bit *budget* (their per-title
+ladder use case: given B total bits, maximize quality). Ours is the dual
+problem — given a quality *floor* (the existing VMAF target), minimize
+total bits while never dropping below it, which is the same Lagrangian
+machinery solved by walking λ (the "shadow price" of one more bit) in the
+other direction:
+
+1. **Per-shot hull construction.** For each shot, filter its retained
+   `(QP, VMAF, bytes)` samples down to the Pareto-optimal subset (drop any
+   point convex-dominated by a combination of its neighbors — standard
+   upper-hull-in-quality/lower-hull-in-bits check). With only 2-6 samples
+   per shot this is a small, cheap computation, not a real "convex hull
+   library" problem.
+2. **Per-shot local slope.** Between adjacent hull points, the local slope
+   is `Δvmaf / Δbytes` — how much quality one more byte buys *at that
+   point on that shot's curve*. Flatter/easier shots (e.g. static scenes)
+   have some hull segments with very high slope (cheap quality); harder
+   shots (motion, grain, detail) have uniformly lower slope everywhere.
+3. **Global λ search.** For a candidate shadow price λ, walk every shot's
+   hull and pick whichever point's local slope is closest to λ (or,
+   equivalently, the highest-VMAF point whose *marginal* slope to the next
+   point exceeds λ — standard water-filling stopping rule). Sum the
+   resulting whole-title bits and duration-weighted mean VMAF. Bisect on λ
+   until the duration-weighted mean VMAF lands at the target (94.0) —
+   mirrors `vmaf_crf_search_internal()`'s own bisection shape, just over λ
+   instead of CRF/QP, and entirely in-memory (no new encodes per λ trial).
+4. **Result:** a per-shot QP assignment where every shot sits at
+   (approximately) the same marginal bits-per-quality point instead of the
+   same absolute VMAF — cheap shots end up higher quality than target,
+   expensive shots end up allowed to sit slightly under the flat per-shot
+   target *as long as the duration-weighted whole-title average still
+   clears it* (a materially different guarantee than today's "every shot
+   individually clears target," worth flagging as a real policy change,
+   not just an implementation detail — needs explicit user sign-off before
+   shipping, since "no quality regression" today is enforced per-shot and
+   this would relax that to per-title on average).
+
+### Real costs / open questions, not yet resolved
+
+- **Status-file format change.** `shot-NNN.status` currently stores one
+  `qp=`/`vmaf=` pair. Needs to become a small list of `(qp,vmaf,bytes)`
+  triples (the full retained sample set) — a breaking format change for
+  `assemble_qpfile_from_shot_manifest()` and any debug tooling that reads
+  today's format. `_write_shot_qps_to_qpfile()`'s contract (one QP per
+  shot) stays the same downstream of the allocator; only what's stored
+  *before* the allocator runs changes.
+- **Minimum samples per shot.** The Av1an-style tolerance-band early exit
+  (already shipped, v6.0.0G) can stop a shot's search at just 2 real
+  samples — not enough points to estimate a meaningful local slope for
+  hull-walking. The allocator needs at least 3 real samples per shot to
+  be useful; either the early exit needs a floor of 3 probes even when
+  tolerance is hit early (small efficiency cost, already-cheap shots stay
+  cheap), or slope estimation falls back to a fitted sigmoid curve shape
+  (ties into the dynamic-crf-style blended-interpolation refinement also
+  queued this session) rather than pure real-sample interpolation for
+  under-sampled shots.
+- **Per-shot VMAF measurement gap (cause 2 above) is still unresolved**
+  and affects this design too: if isolated per-shot VMAF systematically
+  diverges from in-context VMAF, the allocator's hull points are built on
+  the same potentially-biased measurements as today's search, and the
+  bisection-on-λ step would converge to a whole-title *predicted* average
+  that still doesn't match the real measured `measure_final_vmaf_
+  sequential()` result. Worth validating with a real before/after
+  comparison (predicted duration-weighted mean vs. actual whole-file
+  measurement) before trusting the allocator's own quality guarantee.
+- **Not yet built.** This section is scope only, per explicit user
+  direction to design in parallel with the in-flight gap-closure test
+  (v6.0.0G search-algorithm rerun) rather than block on its result.
+  Implementation should wait for that run's real numbers (a second
+  data point on how much of the gap the tolerance-band fix alone closes)
+  before deciding how much of this is actually still needed.
