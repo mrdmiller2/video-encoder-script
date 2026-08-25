@@ -85,12 +85,39 @@ _vmaf_score_shot() {
   printf '%s %s' "$v" "$b"
 }
 
-# Bounded bisection QP search for one shot -- same anchor+bisect shape as
-# vmaf_crf_search_internal(), just over QP instead of CRF and scored via
-# _vmaf_score_shot() instead of sampling several clips. Prints
-# "qp achieved_vmaf" or fails (caller should fall back to a fixed default
-# QP for this shot, same "search failed, don't block the pipeline"
-# philosophy resolve_crf_for_encode() already uses for whole-file search).
+# Linear interpolation between two real, bracketing (QP,VMAF) samples to
+# predict which QP's VMAF should land closest to target -- ported from
+# Av1an's real target-quality search (av1an-core/src/target_quality.rs
+# predict_quantizer(), the n==2-history case), used here once >=2 real
+# samples bracket the target instead of blindly bisecting the QP range.
+# Clamped strictly inside (above_qp, below_qp) so it can never repeat an
+# already-probed point or extrapolate past the known-bracketing pair.
+_interp_qp() {
+  local above_qp="$1" above_score="$2" below_qp="$3" below_score="$4" target="$5"
+  awk -v aq="$above_qp" -v as="$above_score" -v bq="$below_qp" -v bs="$below_score" -v t="$target" '
+    BEGIN {
+      # No integer strictly between aq and bq -- callers guard against this
+      # (the gap<=1 check breaks the search loop before ever calling this
+      # function), but degenerate input would otherwise double-clamp and
+      # bounce back to aq below; return aq directly instead.
+      if (bq - aq <= 1) { print aq; exit; }
+      if (bs == as) { q = int((aq + bq) / 2 + 0.5); }
+      else { q = aq + (t - as) * (bq - aq) / (bs - as); q = int(q + 0.5); }
+      if (q <= aq) q = aq + 1;
+      if (q >= bq) q = bq - 1;
+      print q;
+    }'
+}
+
+# Bounded search for one shot -- anchors match vmaf_crf_search_internal()'s
+# shape (QP instead of CRF), refinement steps use curve interpolation
+# instead of blind bisection to reach the same guaranteed-optimal (gap<=1)
+# answer faster (see _interp_qp() above and the comment inline below).
+# Scored via _vmaf_score_shot() instead of
+# sampling several clips. Prints "qp achieved_vmaf" or fails (caller should
+# fall back to a fixed default QP for this shot, same "search failed,
+# don't block the pipeline" philosophy resolve_crf_for_encode() already
+# uses for whole-file search).
 resolve_per_shot_qp() {
   local src="$1" start="$2" end="$3" codec="$4" target="$5" model="$6" profile="$7"
   local -A score=() bytes=()
@@ -108,6 +135,32 @@ resolve_per_shot_qp() {
   # (lower value = more bits = higher quality) -- same anchor/bisect shape
   # as vmaf_crf_search_internal(), "above"/"below" naming kept identical
   # to that function on purpose so the two stay easy to compare.
+  #
+  # 2026-08-25: refinement probe PLACEMENT switched from blind bisection to
+  # linear interpolation on the real (QP,VMAF) curve once two bracketing
+  # samples exist -- ported from Av1an's real target-quality search
+  # (av1an-core/src/target_quality.rs predict_quantizer(), confirmed via
+  # its actual GitHub source). Pure speed win, no downside: it still
+  # searches for the same true answer (gap<=1, i.e. the highest/most
+  # bit-efficient QP that still meets target), just reaches it in fewer
+  # probes than blindly halving the remaining range, since it uses where
+  # the curve actually crosses the target instead of the range's midpoint.
+  #
+  # An earlier version of this fix also added a tolerance-band EARLY EXIT
+  # (stop the instant any probe lands within [target,target+0.5], not only
+  # once gap<=1) -- ported from the same Av1an source, but REVERTED same
+  # day after review: it stops before confirming no more-efficient
+  # (higher, fewer-bits) QP exists just beyond the accepted one, trading
+  # guaranteed bit-optimality for speed. That's the wrong tradeoff given
+  # this project's own priority order (quality > size > *speed* last) --
+  # confirmed on a real shot where the old bisection search's extra probes
+  # (which the tolerance exit would have skipped) were doing exactly this
+  # check: shot 52.594-52.803 of the 2026-08-24 test episode landed on the
+  # identical qp=30/vmaf=94.17 either way, but bisection spent 4 extra
+  # probes (all landing below target) specifically confirming nothing
+  # between 30 and 46 could beat 30 -- real, deliberate thoroughness, not
+  # wasted work. Keep interpolation (faster path to the same guaranteed-
+  # optimal answer); don't accept "good enough" in its place.
   local anchors="$VMAF_SEARCH_MIN_CRF 30 $VMAF_SEARCH_MAX_CRF"
   for qp in $anchors; do _probe_qp "$qp" || return 1; done
   for i in 1 2 3; do
@@ -118,7 +171,9 @@ resolve_per_shot_qp() {
     if [ -z "$above" ]; then _probe_qp "$VMAF_SEARCH_MIN_CRF" || break; continue; fi
     if [ -z "$below" ]; then _probe_qp "$VMAF_SEARCH_MAX_CRF" || break; continue; fi
     gap=$(( below - above )); [ "$gap" -le 1 ] && break
-    _probe_qp $(( above + gap / 2 )) || break
+    local next_qp
+    next_qp="$(_interp_qp "$above" "${score[$above]}" "$below" "${score[$below]}" "$target")"
+    _probe_qp "$next_qp" || break
   done
 
   local best="" bv="" closest="" cv=""

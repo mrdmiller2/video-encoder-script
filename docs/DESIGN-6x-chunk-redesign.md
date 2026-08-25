@@ -465,15 +465,33 @@ targets a fixed VMAF (94.0 for the anime test episode,
 `vmaf_target_for_source()`) independently per shot, but a real 199-shot
 run's assembled qpfile measured 89.41 whole-file VMAF — a ~4.6 point gap
 between what every shot's own isolated search believed it achieved and
-what the single continuous encode actually delivers. Two contributing
-causes already identified/fixed this session (see git log,
-v6.0.0F/v6.0.0G): (1) shots whose search never found a QP that cleanly
-met target within its probe budget were silently accepted at a real,
-measured VMAF *below* target (a real quality-floor violation, fixed by
-the Av1an-style tolerance-band early exit); (2) isolated per-shot VMAF
-measurement (short re-decoded clip, no cross-shot reference-frame
-context) may systematically diverge from the same footage's VMAF inside
-one continuous encode — unconfirmed, not yet isolated from cause (1).
+what the single continuous encode actually delivers.
+
+**Correction, same day**: v6.0.0G initially shipped an Av1an-style
+tolerance-band early exit (stop probing the instant any sample lands in
+`[target,target+0.5]`) on the belief it fixed a real quality-floor
+violation in the old bisection search. That belief was wrong — verified
+directly against the old search's real backed-up result for the same
+shot (`shot-016.status` in the `.v1-old-bisection-backup` manifest): its
+final answer was `qp=30 vmaf=94.17`, identical to the new search, not the
+below-target `qp=32 vmaf=93.97` an intermediate probe line was mistakenly
+read as. The old search's extra probes were real, deliberate thoroughness
+(confirming no more bit-efficient QP existed between the accepted answer
+and the next-worse anchor), not wasted work. Per real user pushback
+(2026-08-25: "make sure we have enough potential 'points' so we're not
+allocating more bits... because a closer number wasn't possible to find"),
+the tolerance-band exit was reverted the same day it shipped — it traded
+guaranteed bit-optimality for speed, the wrong tradeoff given this
+project's own priority order (quality > size > speed last). Interpolation
+for probe *placement* was kept (a pure speed win with no such tradeoff:
+it still searches all the way to the same gap<=1 guaranteed-optimal
+answer, just reaches it in fewer probes). See `modules/ves-per-shot-qp.sh`
+for the current, corrected implementation.
+
+This leaves the ~4.6-point gap's cause still genuinely open: isolated
+per-shot VMAF measurement (short re-decoded clip, no cross-shot
+reference-frame context) may systematically diverge from the same
+footage's VMAF inside one continuous encode — not yet confirmed.
 
 This section scopes a third, more fundamental question raised by the
 user: is "every shot independently hits the same fixed VMAF" even the
@@ -548,16 +566,14 @@ other direction:
   today's format. `_write_shot_qps_to_qpfile()`'s contract (one QP per
   shot) stays the same downstream of the allocator; only what's stored
   *before* the allocator runs changes.
-- **Minimum samples per shot.** The Av1an-style tolerance-band early exit
-  (already shipped, v6.0.0G) can stop a shot's search at just 2 real
-  samples — not enough points to estimate a meaningful local slope for
-  hull-walking. The allocator needs at least 3 real samples per shot to
-  be useful; either the early exit needs a floor of 3 probes even when
-  tolerance is hit early (small efficiency cost, already-cheap shots stay
-  cheap), or slope estimation falls back to a fitted sigmoid curve shape
-  (ties into the dynamic-crf-style blended-interpolation refinement also
-  queued this session) rather than pure real-sample interpolation for
-  under-sampled shots.
+- **Minimum samples per shot: resolved by the tolerance-band revert
+  above**, not a separate concern anymore. With the early exit reverted,
+  the search always runs to gap<=1 (true integer precision), so every
+  shot naturally retains 3-6 real samples -- already enough points for a
+  meaningful local-slope estimate. Still worth layering the dynamic-crf-
+  style blended bisection/interpolation refinement (queued this session)
+  on top for better-placed samples near the sigmoid's flat extremes, but
+  it's no longer a blocker for this design.
 - **Per-shot VMAF measurement gap (cause 2 above) is still unresolved**
   and affects this design too: if isolated per-shot VMAF systematically
   diverges from in-context VMAF, the allocator's hull points are built on
@@ -569,7 +585,10 @@ other direction:
   measurement) before trusting the allocator's own quality guarantee.
 - **Not yet built.** This section is scope only, per explicit user
   direction to design in parallel with the in-flight gap-closure test
-  (v6.0.0G search-algorithm rerun) rather than block on its result.
-  Implementation should wait for that run's real numbers (a second
-  data point on how much of the gap the tolerance-band fix alone closes)
-  before deciding how much of this is actually still needed.
+  rather than block on its result. That test's search algorithm changed
+  mid-flight (tolerance-band exit shipped then reverted same day, see
+  above) -- its real numbers are still a useful data point on interpolation
+  alone (no tolerance shortcut), just not the "does tolerance close the
+  gap" test originally intended. Implementation of this allocator should
+  wait for that run's real numbers before deciding how much is still
+  needed.
