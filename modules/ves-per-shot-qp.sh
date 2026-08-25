@@ -20,6 +20,34 @@
 # 85.32 for the qpfile approach using the same per-shot QP values) --
 # see the same design doc section for the full comparison.
 
+# run_ffmpeg_validation's timeout curve (_validation_timeout_for_args) scales
+# off the INPUT FILE'S SIZE, calibrated for fast structural validation and
+# stream-copy work -- it has nothing to do with how long a real CPU-bound
+# encode takes. A short shot clip is tiny on disk (a few MB) but a genuinely
+# complex shot at preset 8 with film-grain synthesis enabled can still take
+# several minutes to encode (SVT-AV1 itself warns film-grain>0 above preset 6
+# has "significant compute overhead"), so the size-scaled timeout comes out
+# far too short for the actual encode/VMAF-measurement steps below. Found
+# live 2026-08-24: shot 22 of the Yama no Susume S02E12 test episode (5.88s,
+# 1080p, heavy motion) took ~5 minutes to encode a single QP candidate on
+# JJACKSON -- well past the ~121s the size-based curve computed for its
+# ~6MB extracted clip -- so the encode got killed mid-run and the shot
+# silently fell back to the static fixed-QP default, defeating the entire
+# point of per-shot search for exactly the shots most likely to need it.
+# Scales off the shot's own duration instead: real encode/VMAF cost tracks
+# how much video there is, not how many bytes the (post-copy, pre-encode)
+# clip happens to occupy.
+_shot_ffmpeg_timeout() {
+  local duration="$1" base=300 per_sec=120 cap=3600
+  local d_int extra scaled
+  d_int="$(printf '%.0f' "$duration" 2>/dev/null)"
+  case "$d_int" in ''|*[!0-9]*) d_int=0 ;; esac
+  extra=$(( d_int * per_sec ))
+  scaled=$(( base + extra ))
+  [ "$scaled" -gt "$cap" ] && scaled="$cap"
+  printf '%s' "$scaled"
+}
+
 # Scores one shot at one candidate QP: encodes the shot's own real frame
 # range (stream-copy extracted, not re-decoded first) at a HARD uniform
 # QP -- deliberately -qp, never -crf, because the final application (one
@@ -29,7 +57,7 @@
 # Prints "vmaf bytes" or fails.
 _vmaf_score_shot() {
   local src="$1" start="$2" end="$3" qp="$4" codec="$5" model="$6" profile="$7"
-  local work clip out vlog v b
+  local work clip out vlog v b enc_timeout
   local -a grain_decode_flag=()
   work="$(mktemp -d "${RAMDISK_JOB_DIR:-${TMPDIR:-/tmp}}/ves-shotqp-XXXXXX")" || return 1
   clip="$work/shot.mkv"
@@ -38,16 +66,17 @@ _vmaf_score_shot() {
   [ -s "$clip" ] || { rm -rf "$work"; return 1; }
   out="$work/shot-enc-$qp.mkv"
   vlog="${out}.vmaf.json"
+  enc_timeout="$(_shot_ffmpeg_timeout "$(awk -v s="$start" -v e="$end" 'BEGIN{d=e-s; if(d<0)d=0; print d}')")"
   case "$codec" in
     av1)
       local svtp; svtp="$(profile_svt_params "$profile")" || { rm -rf "$work"; return 1; }
-      run_ffmpeg_validation -y -v error -i "$clip" -c:v libsvtav1 -preset "$SVT_PRESET_SEARCH" -qp "$qp" \
+      _run_timeout_retry "$enc_timeout" "${FFMPEG_CMD[@]}" -y -v error -i "$clip" -c:v libsvtav1 -preset "$SVT_PRESET_SEARCH" -qp "$qp" \
         -pix_fmt yuv420p10le -svtav1-params "${svtp}:rc=0" -an "$out" 2>/dev/null || { rm -rf "$work"; return 1; }
       svtav1_profile_uses_grain_synthesis "$profile" && grain_decode_flag=(-export_side_data film_grain)
       ;;
     *) rm -rf "$work"; return 1 ;;
   esac
-  run_ffmpeg_validation -y -v error "${grain_decode_flag[@]}" -i "$out" -i "$clip" -lavfi \
+  _run_timeout_retry "$enc_timeout" "${FFMPEG_CMD[@]}" -y -v error "${grain_decode_flag[@]}" -i "$out" -i "$clip" -lavfi \
     "[0:v]setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]setpts=PTS-STARTPTS,format=yuv420p10le[r];[d][r]libvmaf=model=$model:n_threads=$(nproc 2>/dev/null || sysctl -n hw.ncpu):log_fmt=json:log_path=$vlog" \
     -f null - 2>/dev/null || { rm -rf "$work"; return 1; }
   v="$(python3 -c "import json;print(round(json.load(open('$vlog'))['pooled_metrics']['vmaf']['mean'],2))" 2>/dev/null)" || { rm -rf "$work"; return 1; }

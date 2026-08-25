@@ -6,7 +6,7 @@
 # MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
 # bug fix) -- see its own comment.
 
-VERSION="6.0.0E"
+VERSION="6.0.0F"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
 # as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
@@ -253,11 +253,22 @@ CONVERT_CHUNK_TARGET_SECS="${CONVERT_CHUNK_TARGET_SECS:-600}"
 # against real fleet content.
 SCENE_DETECT_THRESHOLD="${SCENE_DETECT_THRESHOLD:-0.3}"
 # Phase 6 (shot_claim_next(), ves-per-shot-qp.sh): staleness ceiling for a
-# claimed-but-not-yet-resolved shot search. Deliberately much shorter than
-# CONVERT_CHUNK's 7200s chunk-encode ceiling -- a shot's bounded QP search
-# (a handful of short sample encodes) finishes in minutes (confirmed live
-# 2026-08-24, ~3-9 min per shot including VMAF measurement), not hours.
-SHOT_SEARCH_STALE_SECS="${SHOT_SEARCH_STALE_SECS:-1800}"
+# claimed-but-not-yet-resolved shot search. Originally set to 1800s on the
+# assumption that a shot's bounded QP search always finishes in minutes
+# (true for most shots, confirmed live 2026-08-24: ~3-9 min including VMAF
+# measurement) -- but that assumption broke once _shot_ffmpeg_timeout()
+# (also ves-per-shot-qp.sh) started correctly scaling each candidate
+# encode's own timeout off the SHOT'S duration instead of its (tiny,
+# post-copy) file size. A genuinely long/complex shot can legitimately need
+# up to ~3540s per candidate and up to 6 candidates -- found live
+# 2026-08-24/25: a real 27.3s shot on JJACKSON was still actively encoding
+# (not stalled -- confirmed via `ps`, ~1400% CPU) 42 minutes in, past the
+# old 1800s ceiling, so a second machine (TITOJ) correctly-by-the-old-rule
+# but wastefully reclaimed and redid the same shot. Raised well past the
+# real worst case (6 candidates x 3600s cap = 21600s) so a still-working
+# search on a genuinely expensive shot is never mistaken for a dead one;
+# a truly crashed worker still gets reclaimed, just after a longer wait.
+SHOT_SEARCH_STALE_SECS="${SHOT_SEARCH_STALE_SECS:-25200}"
 RAMDISK_SIZE_ESTIMATE_MARGIN_PCT=10
 # Set once per run by ramdisk_job_start(), read by every file's
 # resolve_encode_stage_path() -- not re-resolved per file, so a run that
