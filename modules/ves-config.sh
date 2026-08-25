@@ -6,7 +6,7 @@
 # MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
 # bug fix) -- see its own comment.
 
-VERSION="6.0.0I"
+VERSION="6.0.0K"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
 # as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
@@ -588,6 +588,11 @@ OUTPUT_DUPLICATE_FRAME_CV_MAX=0.15
 # Phase F resolved constants. These complete strings are shared by sample
 # search and final encode so profile tuning cannot drift (the v5.0.29 lesson).
 SVT_PARAMS_WANIME='enable-qm=1:qm-min=0:keyint=15s:scd=1:aq-mode=2:sharpness=2'
+# tune=0 (VQ) confirmed 2026-08-25 to stay the default: a real full-episode
+# A/B test of tune=5 (VMAF, SVT-AV1 4.2.0-only) against this mechanism-
+# parity baseline showed only +0.26 VMAF at +2.0% file size -- a worse
+# bits-for-quality tradeoff, not the ~15% BD-rate win the changelog
+# claimed for this content. Reverted per that real result.
 SVT_PARAMS_ANIME='enable-qm=1:film-grain-denoise=1:film-grain=6:qm-min=0:scd=1:enable-tf=0:keyint=15s:aq-mode=2:enable-variance-boost=1:variance-boost-strength=3:variance-octile=4:enable-overlays=1:tune=0:sharpness=2'
 # Classic/heavily-lined anime (<=1997 -- see CLASSIC_ANIME_YEAR_CUTOFF): a
 # line-art preservation problem, not a photochemical-grain problem (team

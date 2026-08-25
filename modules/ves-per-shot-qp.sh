@@ -170,16 +170,29 @@ _interp_qp() {
 # fall back to a fixed default QP for this shot, same "search failed,
 # don't block the pipeline" philosophy resolve_crf_for_encode() already
 # uses for whole-file search).
+# Populated fresh by every resolve_per_shot_qp() call: every (qp,vmaf,bytes)
+# sample that call's search actually probed, as "qp:vmaf:bytes" entries --
+# a side-channel global rather than a return-value change (matching this
+# codebase's own established pattern for "extra data from the last call",
+# e.g. QTGMC_FINAL_VMAF_* in ves-config.sh), so existing callers that only
+# want the winning "qp vmaf" pair are unaffected. Feeds the Phase 6.1
+# equal-slope allocator's per-shot rate-distortion hull -- the search
+# already produces these samples as a side effect of finding its own
+# winner; this just stops discarding them.
+LAST_SHOT_SEARCH_SAMPLES=()
+
 resolve_per_shot_qp() {
   local src="$1" start="$2" end="$3" codec="$4" target="$5" model="$6" profile="$7"
   local -A score=() bytes=()
   local qp above below gap
+  LAST_SHOT_SEARCH_SAMPLES=()
 
   _probe_qp() {
     local q="$1" r
     [ -n "${score[$q]:-}" ] && return 0
     r="$(_vmaf_score_shot "$src" "$start" "$end" "$q" "$codec" "$model" "$profile")" || return 1
     score[$q]="${r%% *}"; bytes[$q]="${r##* }"
+    LAST_SHOT_SEARCH_SAMPLES+=("${q}:${score[$q]}:${bytes[$q]}")
     log_err "  per-shot qp-search [$codec] shot=${start}-${end} qp=$q vmaf=${score[$q]}"
   }
 
@@ -519,8 +532,15 @@ shot_search_claimed() {
   model="$(awk -F= '/^model=/{print substr($0,index($0,"=")+1); exit}' "$mdir/manifest.meta")"
 
   result="$(resolve_per_shot_qp "$src" "$start_ts" "$end_ts" "$codec" "$target" "$model" "$profile")"
+  local samples=""
   if [ -n "$result" ]; then
     qp="${result%% *}"; vmaf="${result##* }"
+    # LAST_SHOT_SEARCH_SAMPLES is set by the resolve_per_shot_qp() call just
+    # above, in this same process -- safe to read here (see Phase 6.1 in
+    # docs/DESIGN-6x-chunk-redesign.md for what consumes this).
+    local IFS=,
+    samples="${LAST_SHOT_SEARCH_SAMPLES[*]}"
+    unset IFS
   else
     qp="$(fixed_crf_for "$codec" "$profile" false)"
     vmaf=""
@@ -533,6 +553,7 @@ shot_search_claimed() {
     printf 'status=resolved\n'
     printf 'qp=%s\n' "$qp"
     printf 'vmaf=%s\n' "$vmaf"
+    printf 'samples=%s\n' "$samples"
     printf 'searched_host=%s\n' "$(hostname 2>/dev/null || echo unknown)"
     printf 'searched_utc=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   } >"$tmp"
@@ -589,4 +610,115 @@ assemble_qpfile_from_shot_manifest() {
 
   _write_shot_qps_to_qpfile shot_qps "$total_frames" "$fps" "$qpfile_out"
   log "Assembled qpfile from shot manifest: ${#shot_qps[@]} shots, $qpfile_out ($total_frames frames)"
+}
+
+# Phase 6.1 (docs/DESIGN-6x-chunk-redesign.md): equal-slope global bit
+# allocation, an alternative to assemble_qpfile_from_shot_manifest()'s
+# "every shot independently picks the QP that meets the same fixed target"
+# policy. Instead: given a global shadow price (lambda) for one more byte,
+# every shot independently picks whichever of ITS OWN already-probed
+# samples maximizes (vmaf - lambda*bytes) -- the standard Lagrangian
+# relaxation of "maximize quality subject to a bit budget", here solved in
+# the dual direction (find the lambda whose resulting duration-weighted
+# mean VMAF lands at the target) via bisection on log(lambda), mirroring
+# vmaf_crf_search_internal()'s own bisection shape.
+#
+# No new encodes: reuses the (qp,vmaf,bytes) samples resolve_per_shot_qp()
+# already produced and shot_search_claimed() now persists in each shot's
+# status file (`samples=`). At any fixed lambda, the per-shot optimum is
+# provably just argmax over that shot's own samples -- no explicit convex-
+# hull construction needed, since a dominated (non-hull) sample can never
+# win that argmax for any lambda, so hull-filtering happens for free.
+#
+# REAL POLICY CHANGE from assemble_qpfile_from_shot_manifest(): individual
+# shots are no longer guaranteed to hit the target -- only the duration-
+# weighted whole-title average is. "No quality regression" today is
+# enforced per-shot; this relaxes it to per-title-average, trading some
+# hard-shot quality for cheap-shot bit savings. Not shipped as the default
+# path -- call explicitly, compare against assemble_qpfile_from_shot_
+# manifest()'s output, and get real user sign-off before switching.
+assemble_qpfile_via_equal_slope() {
+  local src="$1" qpfile_out="$2" target="$3"
+  local mdir f idx start_ts end_ts dur fps_rate fps_num fps_den fps total_frames
+  local -a shot_qps=()
+  mdir="$(shot_manifest_dir "$src")"
+  shot_manifest_all_resolved "$src" || return 1
+
+  local samples_flat durations_flat
+  samples_flat="$(mktemp)" || return 1
+  durations_flat="$(mktemp)" || { rm -f "$samples_flat"; return 1; }
+  local -A shot_start=() shot_end=()
+
+  for f in "$mdir"/shot-*.meta; do
+    [ -e "$f" ] || continue
+    idx="$(awk -F= '/^index=/{print $2; exit}' "$f")"
+    start_ts="$(awk -F= '/^start_ts=/{print $2; exit}' "$f")"
+    end_ts="$(awk -F= '/^end_ts=/{print $2; exit}' "$f")"
+    shot_start[$idx]="$start_ts"; shot_end[$idx]="$end_ts"
+    printf '%s %s %s\n' "$idx" "$start_ts" "$end_ts" >>"$durations_flat"
+    local status_file samples_line
+    status_file="$mdir/shot-$(printf '%03d' "$idx").status"
+    samples_line="$(awk -F= '/^samples=/{print substr($0,index($0,"=")+1); exit}' "$status_file")"
+    [ -n "$samples_line" ] || continue
+    local IFS=,; local -a parts=($samples_line); unset IFS
+    local p
+    for p in "${parts[@]}"; do
+      [ -n "$p" ] || continue
+      local IFS=:; local -a triple=($p); unset IFS
+      [ "${#triple[@]}" -eq 3 ] || continue
+      printf '%s %s %s %s\n' "$idx" "${triple[0]}" "${triple[1]}" "${triple[2]}" >>"$samples_flat"
+    done
+  done
+
+  local qp_lines
+  qp_lines="$(awk -v target="$target" -v durations_file="$durations_flat" '
+    BEGIN {
+      while ((getline line < durations_file) > 0) {
+        split(line, a, " ")
+        d = a[3] - a[2]; if (d < 0) d = 0
+        dur[a[1]] = d
+        total_dur += d
+      }
+      close(durations_file)
+    }
+    { n++; sidx[n]=$1; sqp[n]=$2; svmaf[n]=$3; sbytes[n]=$4 }
+    END {
+      if (total_dur <= 0 || n == 0) { exit 1 }
+      lo = 1e-10; hi = 1e-1
+      for (iter = 0; iter < 50; iter++) {
+        lambda = exp((log(lo) + log(hi)) / 2)
+        for (idx in dur) has_best[idx] = 0
+        for (i = 1; i <= n; i++) {
+          idx = sidx[i]
+          obj = svmaf[i] - lambda * sbytes[i]
+          if (!has_best[idx] || obj > best_obj[idx]) {
+            has_best[idx] = 1; best_obj[idx] = obj
+            best_qp[idx] = sqp[i]; best_vmaf[idx] = svmaf[i]
+          }
+        }
+        wsum = 0
+        for (idx in dur) wsum += best_vmaf[idx] * dur[idx]
+        mean_vmaf = wsum / total_dur
+        if (mean_vmaf > target) { lo = lambda } else { hi = lambda }
+      }
+      printf "LAMBDA=%.10g FINAL_MEAN_VMAF=%.4f\n", lambda, mean_vmaf > "/dev/stderr"
+      for (idx in best_qp) printf "%s %s %s\n", idx, best_qp[idx], best_vmaf[idx]
+    }
+  ' "$samples_flat")" || { rm -f "$samples_flat" "$durations_flat"; return 1; }
+  rm -f "$samples_flat" "$durations_flat"
+
+  local line
+  while IFS=' ' read -r idx qp vmaf; do
+    [ -n "$idx" ] || continue
+    shot_qps[$idx]="${shot_start[$idx]}:${shot_end[$idx]}:$qp"
+  done <<<"$qp_lines"
+
+  dur="$(video_duration "$src")" || return 1
+  fps_rate="$("${FFPROBE_CMD[@]}" -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 -- "$src" 2>/dev/null)"
+  fps_num="${fps_rate%/*}"; fps_den="${fps_rate#*/}"
+  fps="$(awk -v n="$fps_num" -v d="$fps_den" 'BEGIN{printf "%.6f", n/d}')"
+  total_frames="$(awk -v d="$dur" -v f="$fps" 'BEGIN{printf "%d", d*f + 1}')"
+
+  _write_shot_qps_to_qpfile shot_qps "$total_frames" "$fps" "$qpfile_out"
+  log "Assembled qpfile via equal-slope allocation: ${#shot_qps[@]} shots, $qpfile_out ($total_frames frames)"
 }
