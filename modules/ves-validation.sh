@@ -153,6 +153,24 @@ video_duration() {
     printf '%s' "$dur"
     return 0
   fi
+  # Real bug found 2026-08-26 (broader library survey while validating Phase
+  # 6.2 credits detection across regions): a genuinely malformed/truncated
+  # Matroska file (Sanctuary S01E01 -- missing ~40% of its runtime vs. every
+  # sibling episode, "File ended prematurely" during packet demux) has NEITHER
+  # a format nor stream duration, and this function used to silently return
+  # "0" for that case -- which would have corrupted every downstream
+  # frame-count calculation (total_frames = dur*fps, i.e. ~1 frame) rather
+  # than surfacing the real problem. Last resort: read the actual last
+  # packet's pts_time via a full demux pass. Expensive (a full read-through,
+  # confirmed ~26s on a 27min file) but only reached when both cheap header
+  # paths have already failed, and correctness here matters more than speed
+  # -- a wrong duration silently breaks every later stage that trusts it.
+  dur="$(run_ffprobe -v error -select_streams v:0 -show_entries packet=pts_time \
+    -of csv=p=0 "$src" 2>/dev/null | tail -1)"
+  if [ -n "$dur" ] && awk -v d="$dur" 'BEGIN { exit !(d+0 > 0) }'; then
+    printf '%s' "$dur"
+    return 0
+  fi
   printf '0'
 }
 
