@@ -793,8 +793,47 @@ assemble_qpfile_via_equal_slope() {
 # for: given about the same bits standard already spends, can they be
 # redistributed for a better result (higher floor on hard shots) instead
 # of a higher average?
+
+# Phase 6.2 (2026-08-26), first increment: detect a plausible end-credits
+# segment via the file's own last chapter marker. Checked against real
+# files in this library first (Discovery/Reacher/one anime title): none
+# carry semantic chapter names ("Chapter 01", not "Credits"), but the
+# boundaries themselves are real structural cuts -- Reacher's last
+# chapter starts at 50:59 in a ~55min episode, a plausible credits-length
+# remainder. Gate on a plausible duration (30s-5min) so a short final
+# SCENE (not credits) doesn't get misclassified and starved. Prints
+# "start end" (seconds) on stdout if a plausible range is found; prints
+# nothing and returns 1 otherwise -- callers must treat "not detected" as
+# "don't deprioritize anything", never guess.
+#
+# Deliberately NOT attempting opening-titles detection here -- explicit
+# user direction 2026-08-26 (Star Trek Lower Decks example: real story,
+# then intro, then back to story, cold-open length varies per episode)
+# ruled out any fixed-position/duration heuristic for that case. The
+# right tool is cross-episode audio fingerprinting (the same mechanism
+# Jellyfin's Intro Skipper / Plex's own intro detection use, both built
+# on Chromaprint -- confirmed already present on this machine as
+# /usr/bin/fpcalc + a python chromaprint binding). That's real, separate
+# work (needs a handful of episodes of the same show to compare against,
+# not a single-file heuristic) -- queued as the next Phase 6.2 increment,
+# not built yet.
+detect_credits_range() {
+  local src="$1"
+  local dur last_start last_dur
+  dur="$(video_duration "$src")" || return 1
+  local chap_starts
+  chap_starts="$(run_ffprobe -v error -show_chapters -show_entries chapter=start_time -of csv=p=0 -- "$src" 2>/dev/null)"
+  [ -n "$chap_starts" ] || return 1
+  last_start="$(printf '%s\n' "$chap_starts" | tail -1 | cut -d, -f1)"
+  [[ "$last_start" =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 1
+  last_dur="$(awk -v d="$dur" -v s="$last_start" 'BEGIN{print d-s}')"
+  awk -v d="$last_dur" 'BEGIN{exit !(d>=30 && d<=300)}' || return 1
+  printf '%s %s\n' "$last_start" "$dur"
+}
+
 assemble_qpfile_via_equal_slope_budget() {
   local src="$1" qpfile_out="$2" byte_budget="$3"
+  local deprio_start="${4:-}" deprio_end="${5:-}" deprio_weight="${6:-1.0}"
   local mdir f idx start_ts end_ts dur fps_rate fps_num fps_den fps total_frames
   local -a shot_qps=()
   mdir="$(shot_manifest_dir "$src")"
@@ -831,11 +870,26 @@ assemble_qpfile_via_equal_slope_budget() {
   done
 
   local qp_lines
-  qp_lines="$(awk -v budget="$byte_budget" -v durations_file="$durations_flat" '
+  qp_lines="$(awk -v budget="$byte_budget" -v durations_file="$durations_flat" \
+    -v deprio_start="$deprio_start" -v deprio_end="$deprio_end" -v deprio_weight="$deprio_weight" '
     BEGIN {
+      have_deprio = (deprio_start != "" && deprio_end != "")
       while ((getline line < durations_file) > 0) {
         split(line, a, " ")
         dur[a[1]] = 1
+        shot_s[a[1]] = a[2]; shot_e[a[1]] = a[3]
+        # Phase 6.2: a shot whose midpoint falls inside the detected
+        # low-viewer-value range (credits/intro) gets its VMAF term
+        # discounted in the objective below, biasing the allocator to
+        # accept lower quality there for the same marginal bytes --
+        # freeing budget for weight[idx]==1.0 main content within the
+        # SAME total spend, without touching the bisection core.
+        mid = (a[2] + a[3]) / 2
+        if (have_deprio && mid >= deprio_start && mid <= deprio_end) {
+          weight[a[1]] = deprio_weight
+        } else {
+          weight[a[1]] = 1.0
+        }
       }
       close(durations_file)
     }
@@ -853,7 +907,7 @@ assemble_qpfile_via_equal_slope_budget() {
         for (idx in dur) has_best[idx] = 0
         for (i = 1; i <= n; i++) {
           idx = sidx[i]
-          obj = svmaf[i] - lambda * sbytes[i]
+          obj = weight[idx] * svmaf[i] - lambda * sbytes[i]
           if (!has_best[idx] || obj > best_obj[idx]) {
             has_best[idx] = 1; best_obj[idx] = obj
             best_qp[idx] = sqp[i]; best_vmaf[idx] = svmaf[i]; best_bytes[idx] = sbytes[i]
@@ -868,18 +922,19 @@ assemble_qpfile_via_equal_slope_budget() {
       for (idx in dur) has_best[idx] = 0
       for (i = 1; i <= n; i++) {
         idx = sidx[i]
-        obj = svmaf[i] - lambda * sbytes[i]
+        obj = weight[idx] * svmaf[i] - lambda * sbytes[i]
         if (!has_best[idx] || obj > best_obj[idx]) {
           has_best[idx] = 1; best_obj[idx] = obj
           best_qp[idx] = sqp[i]; best_vmaf[idx] = svmaf[i]; best_bytes[idx] = sbytes[i]
         }
       }
-      total_bytes = 0; min_vmaf = 999; min_idx = ""
+      total_bytes = 0; min_vmaf = 999; min_idx = ""; deprio_n = 0
       for (idx in best_vmaf) {
         total_bytes += best_bytes[idx]
         if (best_vmaf[idx] < min_vmaf) { min_vmaf = best_vmaf[idx]; min_idx = idx }
+        if (weight[idx] < 1.0) deprio_n++
       }
-      printf "LAMBDA=%.10g TOTAL_BYTES=%d BUDGET=%d MIN_SHOT_VMAF=%.2f (shot %s)\n", lambda, total_bytes, budget, min_vmaf, min_idx > "/dev/stderr"
+      printf "LAMBDA=%.10g TOTAL_BYTES=%d BUDGET=%d MIN_SHOT_VMAF=%.2f (shot %s) DEPRIORITIZED_SHOTS=%d\n", lambda, total_bytes, budget, min_vmaf, min_idx, deprio_n > "/dev/stderr"
       for (idx in best_qp) printf "%s %s %s\n", idx, best_qp[idx], best_vmaf[idx]
     }
   ' "$samples_flat")" || { rm -f "$samples_flat" "$durations_flat"; return 1; }
