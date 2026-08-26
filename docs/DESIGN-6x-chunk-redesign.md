@@ -680,12 +680,21 @@ Two-pronged plan:
   text over a static/simple background has a distinct visual signature)
   so a short final scene doesn't get misclassified.
 - **Opening titles**: chapter boundaries alone aren't reliable here
-  (cold-open length varies episode to episode). The actually-reliable
-  technique is cross-episode fingerprint matching -- the same approach
-  Plex/Jellyfin's "skip intro" features use: compare audio/video hashes
-  across a few episodes of the same show to find the repeated segment.
-  More work than the credits heuristic; can ship after it as a separate
-  increment.
+  (cold-open length varies episode to episode -- explicit user example,
+  2026-08-26: Star Trek Lower Decks often runs ~2-3min of real story,
+  THEN the intro, THEN back to story, so any fixed-position or
+  fixed-duration heuristic misclassifies real content). Per explicit
+  user direction, don't reinvent this: use cross-episode audio
+  fingerprinting, the same core technique Jellyfin's "Intro Skipper"
+  plugin and Plex's built-in intro detection are both built on
+  (Chromaprint/AcoustID) -- comparing audio across a handful of episodes
+  of the same show finds the repeated segment regardless of where it
+  falls in any single episode, which is exactly what handles the
+  Lower Decks case correctly (fixed-position heuristics can't).
+  Confirmed available on this machine already: `/usr/bin/fpcalc`
+  (Chromaprint CLI) and a Python `chromaprint` binding, both present
+  without needing to install anything new. More work than the credits
+  heuristic; can ship after it as a separate increment.
 
 **Mechanism**: composes with the existing byte-budget allocator without
 touching its bisection core. Flagged shots get an importance weight
