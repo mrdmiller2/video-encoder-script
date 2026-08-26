@@ -4,6 +4,37 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.0M — 2026-08-26 (branch `6.x-chunk-redesign`)
+
+**Real bug fix: shot-clip extraction overshot its intended boundary by
+1.5–3x.** `_vmaf_score_shot()` in `modules/ves-per-shot-qp.sh` extracted
+each shot's isolated clip via `-ss "$start" -to "$end" -i "$src" -c copy`
+— pre-input seek combined with stream copy. Confirmed via two real
+repro shots (Star Trek Discovery S01E02) that this cannot cut mid-GOP
+and silently rounds the *end* boundary up to the next keyframe it can
+safely stop at, regardless of whether `-to` or `-t` is used or which
+side of `-i` it's placed on: a 1.176s/28-frame shot came back as
+74 frames, an 8.9s/212-frame shot came back as 296 frames. Every per-shot
+VMAF probe this affected was scored against a clip padded with extra,
+often unrelated trailing content, and — more consequentially — every
+shot's recorded byte cost (the direct input to the Phase 6.1 equal-slope
+budget allocator's λ bisection) was inflated by those extra frames.
+
+Fixed by seeking accurately *after* `-i` into a lossless `ffv1`
+re-encode instead of a stream copy — verified frame-exact against
+ground truth on both repro shots. Same lesson as the earlier windowed-
+VMAF false-positive fix: `-c copy` cannot be trusted for boundary-precise
+clip extraction. Deployed fleet-wide (Sting, TITOJ, LAYTOYAJ,
+AI-PROCESSOR, Plex, MJACKSON) with checksum verification. All per-shot
+search data collected before this fix — Reacher, the anime titles, and
+Discovery's first pass — was built on inflated per-shot byte figures and
+should be treated as approximate, not authoritative, until re-run.
+
+See `docs/DESIGN-6x-chunk-redesign.md` for the full Phase 6.1 real-world
+validation results (Reacher/Discovery byte-budget tests) and the new
+Phase 6.2 scoping (deprioritizing intro/credits segments to widen the
+effective budget for main content).
+
 ## v6.0.0A — 2026-08-24 (branch `6.x-chunk-redesign`)
 
 **Fork point for the chunk-based redesign.** Per explicit user direction:

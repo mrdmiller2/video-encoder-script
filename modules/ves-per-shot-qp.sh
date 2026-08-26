@@ -103,8 +103,22 @@ _vmaf_score_shot() {
   discover_svtav1encapp || return 1
   work="$(mktemp -d "${RAMDISK_JOB_DIR:-${TMPDIR:-/tmp}}/ves-shotqp-XXXXXX")" || return 1
   clip="$work/shot.mkv"
-  run_ffmpeg_validation -y -v error -ss "$start" -to "$end" -i "$src" \
-    -map 0:v:0 -c copy "$clip" 2>/dev/null || { rm -rf "$work"; return 1; }
+  # Real bug found 2026-08-25 (Star Trek Discovery per-shot search): pre-input
+  # -ss/-to (or -t) combined with -c copy cannot cut mid-GOP, so it rounds the
+  # END boundary UP to the next keyframe it can safely stop at -- confirmed
+  # to overshoot by 1.5-3x the intended shot length on two separate real
+  # shots (28->74 frames, 212->296 frames), regardless of whether -to/-t is
+  # used or whether it's placed as an input or output option. That silently
+  # fed extra, unrelated trailing content into every shot's VMAF probe and
+  # inflated its recorded byte cost (the equal-slope allocator's own λ
+  # bisection input) all session. Fix: accurate seek AFTER -i (forces a
+  # real decode, not a keyframe-snapped copy) into a LOSSLESS re-encode
+  # (ffv1) -- verified frame-exact against ground truth on both repro
+  # shots. Same "-c copy can't be trusted for boundary-precise clips"
+  # lesson as the earlier windowed-VMAF false-positive fix; costs a little
+  # CPU for a short clip, but -c copy has no correct fix here.
+  run_ffmpeg_validation -y -v error -i "$src" -ss "$start" -to "$end" \
+    -map 0:v:0 -c:v ffv1 -level 3 "$clip" 2>/dev/null || { rm -rf "$work"; return 1; }
   [ -s "$clip" ] || { rm -rf "$work"; return 1; }
   enc_timeout="$(_shot_ffmpeg_timeout "$(awk -v s="$start" -v e="$end" 'BEGIN{d=e-s; if(d<0)d=0; print d}')")"
   case "$codec" in
@@ -661,6 +675,18 @@ assemble_qpfile_via_equal_slope() {
   samples_flat="$(mktemp)" || return 1
   durations_flat="$(mktemp)" || { rm -f "$samples_flat"; return 1; }
   local -A shot_start=() shot_end=()
+  # Shots whose search produced no real samples at all (a total search
+  # failure that fell back to a fixed QP -- see shot_search_claimed()) --
+  # there is no rate-distortion curve to optimize over, so these are kept
+  # OUT of the lambda bisection entirely (excluded from both the weighted-
+  # mean numerator and its duration denominator) and merged back in
+  # afterward using their own already-recorded fallback QP. Found live
+  # 2026-08-25: leaving such a shot out of durations_flat but still in
+  # dur[] via awk's "for (idx in dur)" silently treated its VMAF as 0 in
+  # the weighted mean (awk's uninitialized-array-read default), badly
+  # understating the true achievable mean and making the bisection
+  # converge somewhere meaningless.
+  local -a no_sample_idx=()
 
   for f in "$mdir"/shot-*.meta; do
     [ -e "$f" ] || continue
@@ -668,11 +694,14 @@ assemble_qpfile_via_equal_slope() {
     start_ts="$(awk -F= '/^start_ts=/{print $2; exit}' "$f")"
     end_ts="$(awk -F= '/^end_ts=/{print $2; exit}' "$f")"
     shot_start[$idx]="$start_ts"; shot_end[$idx]="$end_ts"
-    printf '%s %s %s\n' "$idx" "$start_ts" "$end_ts" >>"$durations_flat"
     local status_file samples_line
     status_file="$mdir/shot-$(printf '%03d' "$idx").status"
     samples_line="$(awk -F= '/^samples=/{print substr($0,index($0,"=")+1); exit}' "$status_file")"
-    [ -n "$samples_line" ] || continue
+    if [ -z "$samples_line" ]; then
+      no_sample_idx+=("$idx")
+      continue
+    fi
+    printf '%s %s %s\n' "$idx" "$start_ts" "$end_ts" >>"$durations_flat"
     local IFS=,; local -a parts=($samples_line); unset IFS
     local p
     for p in "${parts[@]}"; do
@@ -726,6 +755,16 @@ assemble_qpfile_via_equal_slope() {
     shot_qps[$idx]="${shot_start[$idx]}:${shot_end[$idx]}:$qp"
   done <<<"$qp_lines"
 
+  # Merge back in the shots excluded from the lambda bisection above --
+  # their own already-recorded fallback QP, unchanged (nothing to optimize
+  # without real samples).
+  local ni
+  for ni in "${no_sample_idx[@]}"; do
+    local fallback_qp
+    fallback_qp="$(awk -F= '/^qp=/{print substr($0,index($0,"=")+1); exit}' "$mdir/shot-$(printf '%03d' "$ni").status")"
+    shot_qps[$ni]="${shot_start[$ni]}:${shot_end[$ni]}:$fallback_qp"
+  done
+
   dur="$(video_duration "$src")" || return 1
   fps_rate="$("${FFPROBE_CMD[@]}" -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 -- "$src" 2>/dev/null)"
   fps_num="${fps_rate%/*}"; fps_den="${fps_rate#*/}"
@@ -734,4 +773,137 @@ assemble_qpfile_via_equal_slope() {
 
   _write_shot_qps_to_qpfile shot_qps "$total_frames" "$fps" "$qpfile_out"
   log "Assembled qpfile via equal-slope allocation: ${#shot_qps[@]} shots, $qpfile_out ($total_frames frames)"
+}
+
+# Same equal-slope mechanism as assemble_qpfile_via_equal_slope() above,
+# but bisecting lambda against a TOTAL BYTE BUDGET instead of a target mean
+# VMAF. Found live 2026-08-25 (real user pushback, both anime and Reacher
+# test episodes): a mean-VMAF target that isn't reachable by any shot
+# combination in the isolated search data forces the bisection to its
+# floor -- lambda->0, i.e. "spend maximum on every shot" -- which never
+# exercises the actual redistribution the allocator exists for (taking
+# bits from shots that don't need them, giving them to shots that do). A
+# byte budget doesn't have that failure mode: it's always achievable (the
+# search range's own min/max bytes bound it), so the bisection is
+# guaranteed to find a real, non-degenerate lambda that genuinely
+# discriminates between easy and hard shots. This is also the more
+# faithful match to Netflix's own actual formulation (a fixed bit budget,
+# not a target quality average -- see Phase 6.1 in docs/DESIGN-6x-chunk-
+# redesign.md) and directly answers the real question this allocator is
+# for: given about the same bits standard already spends, can they be
+# redistributed for a better result (higher floor on hard shots) instead
+# of a higher average?
+assemble_qpfile_via_equal_slope_budget() {
+  local src="$1" qpfile_out="$2" byte_budget="$3"
+  local mdir f idx start_ts end_ts dur fps_rate fps_num fps_den fps total_frames
+  local -a shot_qps=()
+  mdir="$(shot_manifest_dir "$src")"
+  shot_manifest_all_resolved "$src" || return 1
+
+  local samples_flat durations_flat
+  samples_flat="$(mktemp)" || return 1
+  durations_flat="$(mktemp)" || { rm -f "$samples_flat"; return 1; }
+  local -A shot_start=() shot_end=()
+  local -a no_sample_idx=()
+
+  for f in "$mdir"/shot-*.meta; do
+    [ -e "$f" ] || continue
+    idx="$(awk -F= '/^index=/{print $2; exit}' "$f")"
+    start_ts="$(awk -F= '/^start_ts=/{print $2; exit}' "$f")"
+    end_ts="$(awk -F= '/^end_ts=/{print $2; exit}' "$f")"
+    shot_start[$idx]="$start_ts"; shot_end[$idx]="$end_ts"
+    local status_file samples_line
+    status_file="$mdir/shot-$(printf '%03d' "$idx").status"
+    samples_line="$(awk -F= '/^samples=/{print substr($0,index($0,"=")+1); exit}' "$status_file")"
+    if [ -z "$samples_line" ]; then
+      no_sample_idx+=("$idx")
+      continue
+    fi
+    printf '%s %s %s\n' "$idx" "$start_ts" "$end_ts" >>"$durations_flat"
+    local IFS=,; local -a parts=($samples_line); unset IFS
+    local p
+    for p in "${parts[@]}"; do
+      [ -n "$p" ] || continue
+      local IFS=:; local -a triple=($p); unset IFS
+      [ "${#triple[@]}" -eq 3 ] || continue
+      printf '%s %s %s %s\n' "$idx" "${triple[0]}" "${triple[1]}" "${triple[2]}" >>"$samples_flat"
+    done
+  done
+
+  local qp_lines
+  qp_lines="$(awk -v budget="$byte_budget" -v durations_file="$durations_flat" '
+    BEGIN {
+      while ((getline line < durations_file) > 0) {
+        split(line, a, " ")
+        dur[a[1]] = 1
+      }
+      close(durations_file)
+    }
+    { n++; sidx[n]=$1; sqp[n]=$2; svmaf[n]=$3; sbytes[n]=$4 }
+    END {
+      if (n == 0) { exit 1 }
+      # lambda range must bracket the true crossover: lo picks max-quality
+      # (most bytes) everywhere, hi picks min-quality (fewest bytes)
+      # everywhere -- unlike the VMAF-target version, a byte budget is
+      # always achievable somewhere in [lo,hi] since actual spend is
+      # monotonically decreasing in lambda.
+      lo = 1e-12; hi = 1.0
+      for (iter = 0; iter < 60; iter++) {
+        lambda = exp((log(lo) + log(hi)) / 2)
+        for (idx in dur) has_best[idx] = 0
+        for (i = 1; i <= n; i++) {
+          idx = sidx[i]
+          obj = svmaf[i] - lambda * sbytes[i]
+          if (!has_best[idx] || obj > best_obj[idx]) {
+            has_best[idx] = 1; best_obj[idx] = obj
+            best_qp[idx] = sqp[i]; best_vmaf[idx] = svmaf[i]; best_bytes[idx] = sbytes[i]
+          }
+        }
+        total_bytes = 0; wsum = 0; wdur = 0
+        for (idx in dur) { total_bytes += best_bytes[idx] }
+        if (total_bytes > budget) { lo = lambda } else { hi = lambda }
+      }
+      # Final pass at the converged lambda for reporting.
+      lambda = exp((log(lo) + log(hi)) / 2)
+      for (idx in dur) has_best[idx] = 0
+      for (i = 1; i <= n; i++) {
+        idx = sidx[i]
+        obj = svmaf[i] - lambda * sbytes[i]
+        if (!has_best[idx] || obj > best_obj[idx]) {
+          has_best[idx] = 1; best_obj[idx] = obj
+          best_qp[idx] = sqp[i]; best_vmaf[idx] = svmaf[i]; best_bytes[idx] = sbytes[i]
+        }
+      }
+      total_bytes = 0; min_vmaf = 999; min_idx = ""
+      for (idx in best_vmaf) {
+        total_bytes += best_bytes[idx]
+        if (best_vmaf[idx] < min_vmaf) { min_vmaf = best_vmaf[idx]; min_idx = idx }
+      }
+      printf "LAMBDA=%.10g TOTAL_BYTES=%d BUDGET=%d MIN_SHOT_VMAF=%.2f (shot %s)\n", lambda, total_bytes, budget, min_vmaf, min_idx > "/dev/stderr"
+      for (idx in best_qp) printf "%s %s %s\n", idx, best_qp[idx], best_vmaf[idx]
+    }
+  ' "$samples_flat")" || { rm -f "$samples_flat" "$durations_flat"; return 1; }
+  rm -f "$samples_flat" "$durations_flat"
+
+  local line
+  while IFS=' ' read -r idx qp vmaf; do
+    [ -n "$idx" ] || continue
+    shot_qps[$idx]="${shot_start[$idx]}:${shot_end[$idx]}:$qp"
+  done <<<"$qp_lines"
+
+  local ni
+  for ni in "${no_sample_idx[@]}"; do
+    local fallback_qp
+    fallback_qp="$(awk -F= '/^qp=/{print substr($0,index($0,"=")+1); exit}' "$mdir/shot-$(printf '%03d' "$ni").status")"
+    shot_qps[$ni]="${shot_start[$ni]}:${shot_end[$ni]}:$fallback_qp"
+  done
+
+  dur="$(video_duration "$src")" || return 1
+  fps_rate="$("${FFPROBE_CMD[@]}" -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 -- "$src" 2>/dev/null)"
+  fps_num="${fps_rate%/*}"; fps_den="${fps_rate#*/}"
+  fps="$(awk -v n="$fps_num" -v d="$fps_den" 'BEGIN{printf "%.6f", n/d}')"
+  total_frames="$(awk -v d="$dur" -v f="$fps" 'BEGIN{printf "%d", d*f + 1}')"
+
+  _write_shot_qps_to_qpfile shot_qps "$total_frames" "$fps" "$qpfile_out"
+  log "Assembled qpfile via equal-slope budget allocation: ${#shot_qps[@]} shots, $qpfile_out ($total_frames frames)"
 }

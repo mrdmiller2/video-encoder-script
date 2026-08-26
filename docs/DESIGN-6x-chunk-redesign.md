@@ -592,3 +592,116 @@ other direction:
   gap" test originally intended. Implementation of this allocator should
   wait for that run's real numbers before deciding how much is still
   needed.
+
+**Update 2026-08-25/26 -- built, and the target-VMAF framing above was
+wrong.** `assemble_qpfile_via_equal_slope()` (bisect λ against a target
+duration-weighted mean VMAF, as designed above) was implemented and
+tested for real on anime and Reacher. Real finding, driven by direct user
+pushback ("why do we need max quality everywhere... the point of the
+dynamic cp is that scenes that do not benefit from higher bits are
+reduced.. and those that need higher bits get them"): a target-VMAF
+bisection is fundamentally the wrong lever. Isolated per-shot data's own
+naive ceiling is often unreachable OR already exceeded by the real
+standard encode, and either case collapses the bisection to its floor
+(λ->0, "max quality everywhere") -- a trivial, non-differentiated result
+that never exercises real redistribution.
+
+**Fix, shipped same window**: `assemble_qpfile_via_equal_slope_budget()`
+bisects λ against a total **byte budget** instead (Netflix's own actual
+published formulation, not the quality-floor adaptation this doc
+originally proposed) -- a budget within [min-bytes-everywhere,
+max-bytes-everywhere] is always achievable, so the bisection can never
+degenerate to a floor/ceiling no-op. Real results, both real full
+encodes measured via `measure_final_vmaf_sequential()` (not estimates):
+
+| Title | Budget | Real VMAF | vs. standard | Size vs. standard |
+|---|---|---|---|---|
+| Reacher S01E01 | 100% | 94.25 | +0.05 | -0.95% |
+| Reacher S01E01 | 95% | 93.92 | -0.28 | **-7.4%** |
+| Reacher S01E01 | 90% | 93.31 | -0.89 | -14.9% |
+| ST Discovery S01E02 | 100% | 90.56 | -0.30 | -3.2% |
+| ST Discovery S01E02 | 95% | 90.11 | -0.75 | -9.8% |
+
+User's own visual review (2026-08-26) confirmed 95% looks good on
+Reacher; 90% showed "notable distortion" -- matching the VMAF delta
+being real, not just a measurement artifact. **95% budget is the
+validated sweet spot for live-action**, not 100% or 90%.
+
+Note Discovery's 100%-budget result is a real quality *cost* (-0.30
+VMAF), unlike Reacher's 100%-budget result (+0.05, a wash-to-slight-win)
+-- the allocator is not a guaranteed win at parity for every title; it
+depends on the shape of that title's own per-shot marginal-value curves.
+Discovery is loaded with VMAF-hostile flashy/VFX content (one shot's own
+best-achievable isolated VMAF was 9.41 even at max quality -- a
+shimmering energy-effect texture VMAF scores harshly regardless of
+encode quality, confirmed via direct visual spot-check, not a bug), and
+on this content mix the redistribution net cost slightly more than it
+saved even at equal spend.
+
+**Real bug found and fixed the same session (v6.0.0M)**: shot-clip
+extraction in `_vmaf_score_shot()` used `-ss/-to` as *input* options
+combined with `-c copy` -- confirmed to overshoot the intended shot end
+by 1.5-3x (28->74 frames and 212->296 frames on two real repro shots,
+Star Trek Discovery), because stream-copy cannot cut mid-GOP and rounds
+the end boundary up to the next keyframe it can safely stop at,
+regardless of whether `-to` or `-t` is used or where it's placed. This
+silently fed extra trailing (often unrelated) content into every shot's
+VMAF probe and inflated its recorded byte cost -- the exact number the
+budget allocator's own λ bisection depends on. Fixed via accurate seek
+*after* `-i` into a lossless `ffv1` re-encode (same "don't trust `-c
+copy` for boundary-precise clips" lesson as the earlier windowed-VMAF
+false-positive fix) -- verified frame-exact against ground truth.
+Deployed fleet-wide 2026-08-26; all per-shot search data collected
+*before* this fix (Reacher, the anime titles, and Discovery's first
+pass) was built on inflated per-shot byte figures and should be treated
+as approximate, not authoritative, until re-run.
+
+## Phase 6.2 (scoping, not yet built) -- deprioritize low-value segments (intros/credits)
+
+Explicit user direction 2026-08-26: the equal-slope budget allocator
+already redistributes bits by marginal VMAF value, but has no concept of
+*viewer* importance -- a shot's byte cost/VMAF curve says nothing about
+whether anyone actually watches it closely. Opening titles and end
+credits are the obvious case: viewers skip or half-watch them, so
+spending bits there at the same rate as main content is real waste that
+could instead widen the effective budget for everything else -- "we
+could potentially move to 90% and keep the quality high for the primary
+content" if low-value segments are deliberately starved first.
+
+**Detection, checked against real files 2026-08-26**: chapter markers on
+this library's files (Discovery, Reacher, one anime title) carry no
+semantic labels ("Chapter 01", not "Intro"/"Credits") but the boundaries
+themselves are real structural cut points (Reacher's chapter 2 starts at
+0:56 -- a plausible cold-open/titles cut; its last chapter starts at
+50:59 in a ~55min episode -- a plausible credits-length remainder).
+Two-pronged plan:
+- **Credits**: last chapter, gated by a plausible duration range (30s-5
+  min) plus a cheap low-motion/low-detail confirmation check (scrolling
+  text over a static/simple background has a distinct visual signature)
+  so a short final scene doesn't get misclassified.
+- **Opening titles**: chapter boundaries alone aren't reliable here
+  (cold-open length varies episode to episode). The actually-reliable
+  technique is cross-episode fingerprint matching -- the same approach
+  Plex/Jellyfin's "skip intro" features use: compare audio/video hashes
+  across a few episodes of the same show to find the repeated segment.
+  More work than the credits heuristic; can ship after it as a separate
+  increment.
+
+**Mechanism**: composes with the existing byte-budget allocator without
+touching its bisection core. Flagged shots get an importance weight
+`w < 1` (tunable, not yet chosen) applied inside the per-shot selection:
+`argmax(w * vmaf - λ*bytes)` instead of `argmax(vmaf - λ*bytes)` for
+those shots only. This systematically biases the allocator to accept
+lower quality on low-value shots for the same marginal byte cost,
+freeing bytes for `w=1.0` main content within the *same* total budget --
+directly enabling a lower overall budget target (e.g. 90% instead of
+95%) without the quality cost seen in the real 90% test above, since
+that cost was concentrated on main content the viewer actually watches,
+not on intros/credits.
+
+**Open questions, not yet resolved**: how `w` should be chosen (fixed
+constant vs. tunable per-profile); whether misdetection risk (a real
+scene wrongly flagged as credits) warrants a visual confirmation gate
+before trusting the heuristic in production; whether this should be
+default-on or opt-in given it's a real policy change (some viewers watch
+intros/credits and would notice). Not yet built -- scope only.
