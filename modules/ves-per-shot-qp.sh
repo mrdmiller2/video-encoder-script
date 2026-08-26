@@ -823,12 +823,94 @@ detect_credits_range() {
   dur="$(video_duration "$src")" || return 1
   local chap_starts
   chap_starts="$(run_ffprobe -v error -show_chapters -show_entries chapter=start_time -of csv=p=0 -- "$src" 2>/dev/null)"
-  [ -n "$chap_starts" ] || return 1
-  last_start="$(printf '%s\n' "$chap_starts" | tail -1 | cut -d, -f1)"
-  [[ "$last_start" =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 1
-  last_dur="$(awk -v d="$dur" -v s="$last_start" 'BEGIN{print d-s}')"
-  awk -v d="$last_dur" 'BEGIN{exit !(d>=30 && d<=300)}' || return 1
-  printf '%s %s\n' "$last_start" "$dur"
+  if [ -n "$chap_starts" ]; then
+    last_start="$(printf '%s\n' "$chap_starts" | tail -1 | cut -d, -f1)"
+    if [[ "$last_start" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+      last_dur="$(awk -v d="$dur" -v s="$last_start" 'BEGIN{print d-s}')"
+      if awk -v d="$last_dur" 'BEGIN{exit !(d>=30 && d<=300)}'; then
+        printf '%s %s\n' "$last_start" "$dur"
+        return 0
+      fi
+    fi
+  fi
+  detect_credits_range_by_complexity "$src" "$dur"
+}
+
+# Fallback for files with no chapters at all (real gap found 2026-08-26:
+# Star Trek Discovery has none) -- reuses the per-shot search's OWN
+# already-computed byte-cost data instead of a new video-analysis pass.
+# Credits (scrolling text over a plain/dark background) compress far more
+# cheaply than real content; a shot with unusually low bytes-per-second
+# near the end of the file is a strong signal. Validated against real
+# Discovery data: shot 450 (2355.5-2421.2s, 65.7s) came back at 8% of the
+# file's median bytes/sec, an isolated, obvious outlier -- and it does
+# NOT reach true EOF (a few short odd shots follow, likely a post-
+# credits bumper/logo), so this deliberately does not require the
+# low-cost run to touch the last frame, only to fall within the last
+# quarter of the runtime. Requires the shot manifest to already be fully
+# resolved (same precondition as the allocator itself).
+detect_credits_range_by_complexity() {
+  local src="$1" dur="${2:-}"
+  local mdir f idx start_ts end_ts status_file qp samples bytes_at_qp
+  [ -n "$dur" ] || dur="$(video_duration "$src")" || return 1
+  mdir="$(shot_manifest_dir "$src")"
+  shot_manifest_all_resolved "$src" || return 1
+
+  local flat; flat="$(mktemp)" || return 1
+  for f in "$mdir"/shot-*.meta; do
+    [ -e "$f" ] || continue
+    idx="$(awk -F= '/^index=/{print $2; exit}' "$f")"
+    start_ts="$(awk -F= '/^start_ts=/{print $2; exit}' "$f")"
+    end_ts="$(awk -F= '/^end_ts=/{print $2; exit}' "$f")"
+    status_file="$mdir/shot-$(printf '%03d' "$idx").status"
+    qp="$(awk -F= '/^qp=/{print substr($0,index($0,"=")+1); exit}' "$status_file")"
+    samples="$(awk -F= '/^samples=/{print substr($0,index($0,"=")+1); exit}' "$status_file")"
+    [ -n "$qp" ] && [ -n "$samples" ] || continue
+    bytes_at_qp=""
+    local IFS=,; local -a parts=($samples); unset IFS
+    local p
+    for p in "${parts[@]}"; do
+      local IFS=:; local -a triple=($p); unset IFS
+      [ "${#triple[@]}" -eq 3 ] || continue
+      [ "${triple[0]}" = "$qp" ] && { bytes_at_qp="${triple[2]}"; break; }
+    done
+    [ -n "$bytes_at_qp" ] || continue
+    printf '%s %s %s %s\n' "$idx" "$start_ts" "$end_ts" "$bytes_at_qp" >>"$flat"
+  done
+
+  # Median via external `sort -n` rather than awk's asort() -- confirmed
+  # 2026-08-26 this module is deployed to macOS fleet machines (MARLONJ)
+  # running BSD/one-true-awk, which has no asort() extension; this file
+  # must stay portable to every awk in the fleet, not just GNU awk.
+  local bps_sorted median
+  bps_sorted="$(awk '{ d = $3 - $2; if (d > 0) print $4 / d }' "$flat" | sort -n)"
+  if [ -z "$bps_sorted" ]; then rm -f "$flat"; return 1; fi
+  median="$(awk '{a[NR]=$1} END{ if (NR==0) exit 1; if (NR%2==1) print a[(NR+1)/2]; else print (a[NR/2]+a[NR/2+1])/2 }' <<<"$bps_sorted")"
+
+  local result
+  result="$(awk -v total_dur="$dur" -v median="$median" '
+    { n++; sidx[n]=$1; s[n]=$2; e[n]=$3; b[n]=$4
+      d = e[n] - s[n]; if (d > 0) bps[n] = b[n]/d }
+    END {
+      if (n == 0 || median == 0) exit 1
+      window_start = total_dur * 0.75
+      best = -1
+      for (i = 1; i <= n; i++) {
+        d = e[i] - s[i]
+        if (d <= 0 || s[i] < window_start) continue
+        ratio = bps[i] / median
+        if (ratio < 0.25 && d >= 20 && d <= 300) {
+          if (best == -1 || ratio < best_ratio) { best = i; best_ratio = ratio }
+        }
+      }
+      if (best == -1) exit 1
+      printf "%s %s\n", s[best], e[best]
+    }
+  ' "$flat")"
+  local rc=$?
+  rm -f "$flat"
+  [ $rc -eq 0 ] && [ -n "$result" ] || return 1
+  printf '%s\n' "$result"
 }
 
 assemble_qpfile_via_equal_slope_budget() {
