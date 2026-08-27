@@ -403,7 +403,25 @@ shot_split_create_manifest() {
   local mdir tmpdir dur target model n=0 prev="0.0" ts
   mdir="$(shot_manifest_dir "$src")"
   [ -f "$mdir/.complete" ] && return 0
-  mkdir -- "$mdir" 2>/dev/null || return 1
+  if ! mkdir -- "$mdir" 2>/dev/null; then
+    # Stale-build reclaim: mkdir is the atomic claim, but a builder that
+    # crashes or is killed mid-scan (this is a full-file scene-detect
+    # decode pass, can run well past 10min on a long episode) never
+    # writes .complete, leaving an empty mdir that silently blocks every
+    # future attempt forever. Found live 2026-08-27: a killed foreground
+    # run left exactly this state and permanently return-1'd this
+    # function for that title. Same 1800s ceiling as shot_claim_next()'s
+    # own staleness reclaim -- a manifest build still incomplete past
+    # that is almost certainly a dead builder, not slow-but-alive work.
+    local mdir_age
+    mdir_age=$(( $(date +%s) - $(stat -c%Y -- "$mdir" 2>/dev/null || stat -f%m -- "$mdir" 2>/dev/null || echo 0) ))
+    if [ -d "$mdir" ] && [ ! -f "$mdir/.complete" ] && [ "$mdir_age" -gt 1800 ]; then
+      rm -rf -- "$mdir" 2>/dev/null
+      mkdir -- "$mdir" 2>/dev/null || return 1
+    else
+      return 1
+    fi
+  fi
   chmod 0777 -- "$mdir" 2>/dev/null || true
   tmpdir="$(mktemp -d "${mdir}.build.XXXXXX")" || { rmdir -- "$mdir" 2>/dev/null; return 1; }
 

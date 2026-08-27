@@ -4,6 +4,26 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.0Q — 2026-08-27 (branch `6.x-chunk-redesign`)
+
+**Real bug fix: an interrupted shot-manifest build permanently blocked
+all future attempts for that title.** `shot_split_create_manifest()` in
+`modules/ves-per-shot-qp.sh` uses `mkdir` on the `.shots` directory as
+its atomic single-builder claim, then only ever clears the claim by
+writing a `.complete` marker at the very end. If the builder is killed
+mid-build — this function runs a full-file scene-detect decode pass,
+confirmed to take well over 10 minutes on a real ~29-minute episode —
+the `.shots` directory is left behind empty with no `.complete` marker,
+and every subsequent call hits `mkdir` `EEXIST` and silently `return`s 1
+forever. Found live 2026-08-27 during the American regional
+credits-detection survey: a foreground manifest-build for Normal People
+S01E01 was killed by a 10-minute command timeout, then the very next
+(backgrounded) attempt for the same file failed instantly with no error
+output. Fixed by adding the same staleness-reclaim shape
+`shot_claim_next()` already uses for per-shot locks: on `mkdir` failure,
+if the directory has no `.complete` marker and its mtime is more than
+1800s old, remove it and retry the claim once.
+
 ## v6.0.0M — 2026-08-26 (branch `6.x-chunk-redesign`)
 
 **Real bug fix: shot-clip extraction overshot its intended boundary by
