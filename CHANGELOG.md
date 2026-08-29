@@ -4,6 +4,35 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.0S — 2026-08-28 (branch `6.x-chunk-redesign`)
+
+**Performance fix: per-shot clip extraction decoded the whole file up to
+the shot every probe.** The v6.0.0M overshoot fix switched shot
+extraction in `_vmaf_score_shot()` to an accurate post-input seek
+(`ffmpeg -i "$src" -ss "$start" -to "$end" -c:v ffv1`). Correct, but with
+no pre-input seek ffmpeg demuxes from frame 0 to `$start` on every call —
+for a shot 20+ minutes into an episode that is ~1200 s of throwaway
+lossless decode, several times per shot. Found live as the dominant cost
+of the Raised by Wolves regional-survey search: ffmpeg pinned at 5+
+minutes on a single 2-second shot, fleet load average ~3× core count,
+the search barely advancing.
+
+Fixed with a **two-stage seek**: a fast pre-input `-ss` to the keyframe
+30 s (comfortably longer than any real GOP) before the target, then an
+accurate post-input `-ss` for exactly that 30 s, then `-t` for the exact
+duration. ffmpeg's post-input `-ss` is frame-accurate no matter where the
+preceding fast seek landed, as long as it landed at or before the target
+frame — which a nearest-preceding-keyframe seek guarantees — so the
+output is byte-identical to the v6.0.0M single-stage seek.
+
+Verified frame-exact against the old method on three real Raised by
+Wolves shots at increasing depth (21 s / 740 s / 2061 s into the file):
+identical frame counts, `psnr_avg=inf` (bit-identical), identical
+per-frame MD5s. Speedup scales with shot depth: **1× / 23× / 92×**
+respectively. Byte costs and VMAF scores are unchanged, so search data
+collected before and after this fix is directly comparable — no re-run
+needed (unlike v6.0.0M).
+
 ## v6.0.0R — 2026-08-28 (branch `6.x-chunk-redesign`)
 
 **Real bug fix: the chapterless credits-detection fallback

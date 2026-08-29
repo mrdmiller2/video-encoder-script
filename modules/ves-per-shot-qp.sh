@@ -103,21 +103,40 @@ _vmaf_score_shot() {
   discover_svtav1encapp || return 1
   work="$(mktemp -d "${RAMDISK_JOB_DIR:-${TMPDIR:-/tmp}}/ves-shotqp-XXXXXX")" || return 1
   clip="$work/shot.mkv"
-  # Real bug found 2026-08-25 (Star Trek Discovery per-shot search): pre-input
-  # -ss/-to (or -t) combined with -c copy cannot cut mid-GOP, so it rounds the
-  # END boundary UP to the next keyframe it can safely stop at -- confirmed
-  # to overshoot by 1.5-3x the intended shot length on two separate real
-  # shots (28->74 frames, 212->296 frames), regardless of whether -to/-t is
-  # used or whether it's placed as an input or output option. That silently
-  # fed extra, unrelated trailing content into every shot's VMAF probe and
-  # inflated its recorded byte cost (the equal-slope allocator's own λ
-  # bisection input) all session. Fix: accurate seek AFTER -i (forces a
-  # real decode, not a keyframe-snapped copy) into a LOSSLESS re-encode
-  # (ffv1) -- verified frame-exact against ground truth on both repro
-  # shots. Same "-c copy can't be trusted for boundary-precise clips"
-  # lesson as the earlier windowed-VMAF false-positive fix; costs a little
-  # CPU for a short clip, but -c copy has no correct fix here.
-  run_ffmpeg_validation -y -v error -i "$src" -ss "$start" -to "$end" \
+  # Extraction of a boundary-precise LOSSLESS clip. Two real constraints,
+  # each learned the hard way:
+  #
+  #  1) (2026-08-25, Star Trek Discovery per-shot search) pre-input
+  #     -ss/-to + `-c copy` cannot cut mid-GOP -- it snaps the END up to
+  #     the next keyframe, overshooting a short shot by 1.5-3x (28->74,
+  #     212->296 frames on two real shots), feeding junk trailing content
+  #     into every VMAF probe and inflating every recorded byte cost (the
+  #     equal-slope allocator's own lambda-bisection input). The cut must
+  #     be a real decode into an ffv1 re-encode, never a stream copy.
+  #
+  #  2) (2026-08-28, Raised by Wolves regional-survey search) a bare
+  #     post-input `-ss "$start"` with no pre-input seek makes ffmpeg
+  #     demux from frame 0 to $start every call -- for a shot ~20 min into
+  #     a ~40 min episode that is ~1200 s of throwaway lossless decode per
+  #     probe, several probes per shot. Seen live at 5+ min per 2 s shot,
+  #     fleet load average ~3x core count.
+  #
+  # Fix for (2), keeping (1): two-stage seek. Fast pre-input -ss to a
+  # keyframe a safe margin (30 s, comfortably longer than any real GOP)
+  # BEFORE the target, then an accurate post-input -ss for exactly that
+  # margin, then -t for the exact duration. ffmpeg's post-input -ss is
+  # frame-accurate regardless of where the preceding fast seek landed, as
+  # long as it landed at/before the target frame -- which a
+  # nearest-preceding-keyframe seek guarantees -- so the output is
+  # frame-identical to the single-stage accurate seek from (1)
+  # (re-verified frame-exact 2026-08-28). Use -t (duration), not -to
+  # (absolute ts): -to's meaning after a post-input -ss varies by ffmpeg
+  # version.
+  local _seek_margin=30 _fast_ss _acc_ss _clip_dur
+  _fast_ss="$(awk -v s="$start" -v m="$_seek_margin" 'BEGIN{ f=s-m; if(f<0)f=0; printf "%.6f", f }')"
+  _acc_ss="$(awk -v s="$start" -v f="$_fast_ss" 'BEGIN{ printf "%.6f", s-f }')"
+  _clip_dur="$(awk -v s="$start" -v e="$end" 'BEGIN{ d=e-s; if(d<0)d=0; printf "%.6f", d }')"
+  run_ffmpeg_validation -y -v error -ss "$_fast_ss" -i "$src" -ss "$_acc_ss" -t "$_clip_dur" \
     -map 0:v:0 -c:v ffv1 -level 3 "$clip" 2>/dev/null || { rm -rf "$work"; return 1; }
   [ -s "$clip" ] || { rm -rf "$work"; return 1; }
   enc_timeout="$(_shot_ffmpeg_timeout "$(awk -v s="$start" -v e="$end" 'BEGIN{d=e-s; if(d<0)d=0; print d}')")"
