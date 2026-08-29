@@ -858,15 +858,22 @@ detect_credits_range() {
 # Star Trek Discovery has none) -- reuses the per-shot search's OWN
 # already-computed byte-cost data instead of a new video-analysis pass.
 # Credits (scrolling text over a plain/dark background) compress far more
-# cheaply than real content; a shot with unusually low bytes-per-second
-# near the end of the file is a strong signal. Validated against real
-# Discovery data: shot 450 (2355.5-2421.2s, 65.7s) came back at 8% of the
-# file's median bytes/sec, an isolated, obvious outlier -- and it does
-# NOT reach true EOF (a few short odd shots follow, likely a post-
-# credits bumper/logo), so this deliberately does not require the
-# low-cost run to touch the last frame, only to fall within the last
-# quarter of the runtime. Requires the shot manifest to already be fully
-# resolved (same precondition as the allocator itself).
+# cheaply than real content; a CONTIGUOUS run of low bytes-per-second
+# shots ending near the file's end is a strong signal. Validated against
+# real Discovery data: shot 450 (2355.5-2421.2s, 65.7s) came back at 8%
+# of the file's median bytes/sec. The reported range is extended to true
+# EOF (mirroring the chapter path) even when a short bumper/logo follows
+# the crawl -- that tail is low-viewer-value too, so including it in the
+# deprioritized range is safe. Requires the shot manifest to already be
+# fully resolved (same precondition as the allocator itself).
+#
+# 2026-08-28 rework (v6.0.0R): the earlier version matched only the single
+# lowest-ratio shot in the last quarter and returned just that shot's own
+# span. That under-detected multi-shot credits sequences (WandaVision
+# S01E05) and missed shows whose tail never cleared a strict 0.25x bar
+# (Wild Cards S01E10) entirely. Now: baseline median is taken over the
+# file body only (pre-last-quarter), and detection walks a contiguous
+# trailing run of cheap shots, trying a strict then a looser ratio.
 detect_credits_range_by_complexity() {
   local src="$1" dur="${2:-}"
   local mdir f idx start_ts end_ts status_file qp samples bytes_at_qp
@@ -896,33 +903,87 @@ detect_credits_range_by_complexity() {
     printf '%s %s %s %s\n' "$idx" "$start_ts" "$end_ts" "$bytes_at_qp" >>"$flat"
   done
 
+  # Baseline bytes/sec from the file's BODY only -- shots that start
+  # before the last quarter. A long credits sequence in the tail would
+  # otherwise drag the median down and mask itself (real: Wild Cards
+  # S01E10, whose tail never cleared the old strict 0.25x-of-all-shots
+  # bar and was missed entirely). The 0.75 split is positional, not
+  # value-based, so this is not circular. Falls back to an all-shots
+  # median for files too short to have a distinct body.
+  #
   # Median via external `sort -n` rather than awk's asort() -- confirmed
   # 2026-08-26 this module is deployed to macOS fleet machines (MARLONJ)
   # running BSD/one-true-awk, which has no asort() extension; this file
   # must stay portable to every awk in the fleet, not just GNU awk.
+  local window_start
+  window_start="$(awk -v d="$dur" 'BEGIN{ printf "%.3f", d * 0.75 }')"
   local bps_sorted median
-  bps_sorted="$(awk '{ d = $3 - $2; if (d > 0) print $4 / d }' "$flat" | sort -n)"
+  bps_sorted="$(awk -v ws="$window_start" '{ d = $3 - $2; if (d > 0 && $2 < ws) print $4 / d }' "$flat" | sort -n)"
+  if [ -z "$bps_sorted" ]; then
+    bps_sorted="$(awk '{ d = $3 - $2; if (d > 0) print $4 / d }' "$flat" | sort -n)"
+  fi
   if [ -z "$bps_sorted" ]; then rm -f "$flat"; return 1; fi
   median="$(awk '{a[NR]=$1} END{ if (NR==0) exit 1; if (NR%2==1) print a[(NR+1)/2]; else print (a[NR/2]+a[NR/2+1])/2 }' <<<"$bps_sorted")"
 
+  # Anchor on a CONTIGUOUS trailing run of cheap-to-compress shots, not a
+  # single outlier. The old code matched only the one lowest-ratio shot
+  # and returned just its own span, which (a) under-detected badly when
+  # the real credits span several shots of differing byte profiles
+  # (WandaVision S01E05: ~93s of trailing credits missed), and (b) missed
+  # entirely when no single shot cleared the strict bar. Walking a
+  # contiguous run that ends near EOF is a far stronger signal, so we can
+  # both extend the reported end to true EOF (mirroring the chapter path)
+  # and safely try a looser ratio on a second pass. A short trailing
+  # bumper/preview after the credits is skipped (up to ~90s from EOF).
   local result
-  result="$(awk -v total_dur="$dur" -v median="$median" '
-    { n++; sidx[n]=$1; s[n]=$2; e[n]=$3; b[n]=$4
-      d = e[n] - s[n]; if (d > 0) bps[n] = b[n]/d }
+  result="$(awk -v total_dur="$dur" -v median="$median" -v window_start="$window_start" '
+    { n++; s[n]=$2; e[n]=$3; b[n]=$4
+      d = e[n] - s[n]; bps[n] = (d > 0) ? b[n]/d : -1 }
     END {
-      if (n == 0 || median == 0) exit 1
-      window_start = total_dur * 0.75
-      best = -1
-      for (i = 1; i <= n; i++) {
-        d = e[i] - s[i]
-        if (d <= 0 || s[i] < window_start) continue
-        ratio = bps[i] / median
-        if (ratio < 0.25 && d >= 20 && d <= 300) {
-          if (best == -1 || ratio < best_ratio) { best = i; best_ratio = ratio }
+      if (n == 0 || median <= 0) exit 1
+      # order shot indices chronologically (glob is already sorted, but
+      # be defensive) -- n ~= a few hundred, O(n^2) is trivial here
+      for (i = 1; i <= n; i++) ord[i] = i
+      for (i = 1; i <= n; i++)
+        for (j = i + 1; j <= n; j++)
+          if (s[ord[j]] < s[ord[i]]) { t = ord[i]; ord[i] = ord[j]; ord[j] = t }
+
+      split("0.25 0.40", thr, " ")
+      for (ti = 1; ti <= 2; ti++) {
+        ratio_max = thr[ti] + 0
+        # try each trailing shot as the run end-anchor, closest-to-EOF
+        # first; stop looking once we are more than 90s short of EOF
+        for (a = n; a >= 1; a--) {
+          ka = ord[a]
+          if (total_dur - e[ka] > 90) break
+          if (bps[ka] < 0 || bps[ka] / median >= ratio_max) continue
+          run_start = a
+          gap_dur = 0; gap_cnt = 0
+          for (p = a - 1; p >= 1; p--) {
+            k = ord[p]
+            if ((e[k] - s[k]) <= 0) break
+            if (s[k] < window_start) break
+            if (bps[k] < 0) break
+            if (bps[k] / median >= ratio_max) {
+              # tolerate a brief expensive blip inside the crawl (a logo
+              # card / mid-credits sting) -- real: WandaVision S01E05
+              # shot 334 at 0.45x sits between two long ~0.2x runs
+              gap_dur += (e[k] - s[k]); gap_cnt++
+              if (gap_dur > 10 || gap_cnt > 2) break
+              continue
+            }
+            gap_dur = 0; gap_cnt = 0
+            run_start = p
+          }
+          rs = s[ord[run_start]]
+          run_dur = e[ord[a]] - rs
+          if (run_dur < 30) continue
+          if (run_dur > total_dur * 0.35) continue
+          printf "%s %s\n", rs, total_dur
+          exit 0
         }
       }
-      if (best == -1) exit 1
-      printf "%s %s\n", s[best], e[best]
+      exit 1
     }
   ' "$flat")"
   local rc=$?

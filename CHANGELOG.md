@@ -4,6 +4,55 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.0R — 2026-08-28 (branch `6.x-chunk-redesign`)
+
+**Real bug fix: the chapterless credits-detection fallback
+(`detect_credits_range_by_complexity()` in `modules/ves-per-shot-qp.sh`)
+under-detected multi-shot credits sequences and could miss them
+entirely.** The old logic scanned the last quarter of the file for the
+single shot with the lowest bytes-per-second ratio vs. the all-shots
+median, required it to clear a hard `< 0.25×` bar, and returned *only
+that one shot's own start/end*. Two real failures found in the American
+regional survey (2026-08-28):
+
+- **Under-detection — WandaVision S01E05.** The real end-credits crawl
+  runs shots 324–336 (2086.3 s → 2238.5 s / true EOF). Only shot 324
+  (a 59 s block at 0.037× median) matched; the reported range stopped at
+  2145.5 s, leaving ~93 s of real trailing credits at full budget
+  priority. Verified by frame-grab: scrolling crew crawl still on screen
+  well past the old reported end.
+- **Full miss — Wild Cards S01E10.** No single trailing shot ever dropped
+  below the `0.25×` bar, so the function returned "not detected" despite
+  real end credits / guild logos in the last ~65 s.
+
+Reworked to anchor on a **contiguous trailing run** of cheap-to-compress
+shots instead of one outlier:
+
+1. Baseline median is now taken over the file **body only** (shots
+   starting before the last quarter), so a long credits tail can't drag
+   the median down and mask itself.
+2. Detection walks backward from the shot whose end is closest to EOF
+   (skipping a trailing bumper/preview up to ~90 s), accumulating a
+   contiguous run of shots under the ratio bar, tolerating a brief
+   expensive blip inside the crawl (≤ 10 s / ≤ 2 shots — e.g. a
+   mid-credits logo card). A strict `0.25×` pass is tried first, then a
+   looser `0.40×` pass.
+3. The reported **end is extended to true EOF**, mirroring the chapter
+   path — a short post-credits bumper is low-viewer-value too, so
+   including it in the deprioritized range is safe.
+
+Results after the fix, against real resolved manifests: WandaVision
+S01E05 → `2086.3 2238.5` (correct, full crawl to EOF); Normal People
+S01E01 → `1673.2 1722.3` (unchanged, still correct); Discovery
+S01E01/S03E03/S05E02 unchanged. **Wild Cards S01E10 still returns "not
+detected"** — its credits sit inside expensive 20–120 s mega-shots (shot
+detection found no cuts, and the crawl is over textured/live-action
+footage, not a flat background), so the byte-cost signal genuinely isn't
+there. This is a known limitation of the byte-cost fallback, not a
+regression; it fails safe (nothing gets deprioritized). Catching that
+class needs a pixel-level text-crawl / black-frame signal — separate
+future work, same bucket as the Chromaprint intro-detection increment.
+
 ## v6.0.0Q — 2026-08-27 (branch `6.x-chunk-redesign`)
 
 **Real bug fix: an interrupted shot-manifest build permanently blocked
