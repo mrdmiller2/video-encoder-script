@@ -448,6 +448,24 @@ shot_split_create_manifest() {
   target="$(vmaf_target_for_source "$src")" || { rm -rf -- "$tmpdir"; rmdir -- "$mdir" 2>/dev/null; return 1; }
   model="$(vmaf_model_for_source "$src")"
 
+  # Guard: scene_detect_boundaries() must actually be available and must
+  # actually find cuts. Found live 2026-08-28: on a fleet host missing
+  # modules/ves-scene-detect.sh the function was simply "command not
+  # found", the process substitution below yielded nothing, and this
+  # function happily wrote a single whole-file "shot" + .complete and
+  # returned 0 -- a bogus manifest that every downstream consumer then
+  # trusted. A real episode has dozens-to-hundreds of cuts; a 1-shot
+  # result for anything longer than a couple of minutes is a detection
+  # failure, not a real answer.
+  if ! command -v scene_detect_boundaries >/dev/null 2>&1 && ! declare -F scene_detect_boundaries >/dev/null 2>&1; then
+    err "scene_detect_boundaries() unavailable (ves-scene-detect.sh not loaded?) -- cannot build manifest for $src"
+    rm -rf -- "$tmpdir"; rmdir -- "$mdir" 2>/dev/null; return 1
+  fi
+  local _boundaries _nb=0
+  _boundaries="$(scene_detect_boundaries "$src")" || {
+    err "scene_detect_boundaries() failed for $src"
+    rm -rf -- "$tmpdir"; rmdir -- "$mdir" 2>/dev/null; return 1
+  }
   while IFS= read -r ts; do
     [ -n "$ts" ] || continue
     cat >"${tmpdir}/shot-$(printf '%03d' "$n").meta" <<EOF
@@ -455,9 +473,18 @@ index=$n
 start_ts=$prev
 end_ts=$ts
 EOF
-    n=$((n + 1))
+    n=$((n + 1)); _nb=$((_nb + 1))
     prev="$ts"
-  done < <(scene_detect_boundaries "$src")
+  done <<EOF
+$_boundaries
+EOF
+  # No cuts found at all for a non-trivial runtime -> detection is broken
+  # (missing decoder, wrong ffmpeg, unreadable file). Refuse rather than
+  # emit a 1-shot manifest.
+  if [ "$_nb" -eq 0 ] && awk -v d="$dur" 'BEGIN{exit !(d+0 > 180)}'; then
+    err "scene_detect_boundaries() found 0 cuts in a ${dur}s file -- refusing bogus 1-shot manifest for $src"
+    rm -rf -- "$tmpdir"; rmdir -- "$mdir" 2>/dev/null; return 1
+  fi
   # Final shot runs from the last detected cut to the real end of the file.
   cat >"${tmpdir}/shot-$(printf '%03d' "$n").meta" <<EOF
 index=$n

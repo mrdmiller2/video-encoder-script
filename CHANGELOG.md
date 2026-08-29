@@ -4,6 +4,34 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.0U — 2026-08-28 (branch `6.x-chunk-redesign`)
+
+**Real bug fix: a scene-detection failure silently produced a bogus
+one-shot manifest.** `shot_split_create_manifest()` reads
+`scene_detect_boundaries()` via `done < <(scene_detect_boundaries "$src")`.
+If that function is unavailable — found live 2026-08-28 on a fleet host
+(TITOJ) whose `modules/` was missing `ves-scene-detect.sh`, so it was
+literally `command not found` — the process substitution yields nothing,
+the loop body never runs, and the function goes straight to writing the
+single "final shot" (0 → duration), `manifest.meta`, and `.complete`,
+then returns 0. Every downstream consumer (the QP-search fleet, the
+allocator, credits detection) then trusts a manifest that says the whole
+episode is one shot.
+
+Guards added before `.complete` is written:
+- `scene_detect_boundaries` must be a defined function / available
+  command, else refuse.
+- its invocation must succeed (`|| return 1`), and its output is captured
+  once and counted.
+- **zero cuts found in a file longer than 180 s is treated as a detection
+  failure** (missing decoder, wrong ffmpeg, unreadable input) — refuse
+  rather than emit a 1-shot manifest. A genuinely uncut short clip under
+  3 minutes still passes.
+
+Also this session: fleet `modules/` sets re-synced from the repo with
+`rsync --delete` — every host now carries the identical full 36-file
+module set (several were drifted; TITOJ was missing a file).
+
 ## v6.0.0T — 2026-08-28 (branch `6.x-chunk-redesign`)
 
 **Real bug fix: a per-shot search failure was recorded as a normal
