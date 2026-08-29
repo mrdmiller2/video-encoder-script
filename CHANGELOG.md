@@ -4,6 +4,47 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.0T — 2026-08-28 (branch `6.x-chunk-redesign`)
+
+**Real bug fix: a per-shot search failure was recorded as a normal
+result and then made credits detection silently miss the credits.** When
+`resolve_per_shot_qp()` returns nothing, `shot_search_claimed()` blind-
+falls-back to a fixed QP and writes `status=resolved` with empty
+`vmaf=`/`samples=`. Nothing downstream could tell that apart from a real
+result. `detect_credits_range_by_complexity()` filters shots on
+`[ -n "$samples" ]`, so a failed-search shot simply vanished from its
+input — and a *gap* in the shot sequence breaks the contiguous
+trailing-run walk.
+
+Found live 2026-08-28 closing out the Raised by Wolves S01E01 regional
+survey: the episode has a textbook ~100 s black-background end-credits
+crawl (verified by frame grab), but `detect_credits_range` returned
+nothing. Shot 454 — the single 90 s credits block — had failed its QP
+search on AI-PROCESSOR (a 90 s clip's ~13 GB uncompressed y4m overflowed
+that host's RAMDISK), so it carried `qp=26 vmaf= samples=`. The tail-run
+walk hit the gap where 454 should be and bailed, leaving only ~16 s of
+trailing logo shots — under the 30 s floor. Re-resolving 454 on MJACKSON
+(63 GB tmpfs) gave `qp=25 vmaf=94.01`, byte ratio 0.19 — obviously
+credits.
+
+Fixes:
+- `shot_search_claimed()` now writes `search_failed=1` in the status when
+  it blind-fell-back, so the allocator and detection can tell a real
+  result from a placeholder. Still `status=resolved` (a failed shot must
+  not permanently block `shot_manifest_all_resolved`).
+- `detect_credits_range_by_complexity()` now feeds sample-less shots into
+  its analysis as `NA` byte markers instead of dropping them. In the
+  backward run-walk a **long** `NA` shot (≥ 45 s — no scene cut that long
+  is almost always the crawl itself) is folded into the run; a **short**
+  one is a bridgeable unknown on the same budget as an expensive blip.
+  Body-median calc skips `NA` rows.
+
+Known non-fix: the underlying per-shot search still fails on long shots
+on RAM-constrained hosts. Detection now tolerates it and the
+`search_failed=1` marker makes it visible; a proper fix (score a
+representative sub-window for shots over ~60 s, or requeue to a beefier
+host) is deferred until a leg actually shows widespread failures.
+
 ## v6.0.0S — 2026-08-28 (branch `6.x-chunk-redesign`)
 
 **Performance fix: per-shot clip extraction decoded the whole file up to

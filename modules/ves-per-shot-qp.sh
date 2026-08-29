@@ -598,7 +598,7 @@ shot_search_claimed() {
   model="$(awk -F= '/^model=/{print substr($0,index($0,"=")+1); exit}' "$mdir/manifest.meta")"
 
   result="$(resolve_per_shot_qp "$src" "$start_ts" "$end_ts" "$codec" "$target" "$model" "$profile")"
-  local samples=""
+  local samples="" search_failed=0
   if [ -n "$result" ]; then
     # 3 whitespace-separated fields (qp, vmaf, samples) -- read, not the
     # old first/last-field shortcut, since the samples field itself would
@@ -608,6 +608,7 @@ shot_search_claimed() {
   else
     qp="$(fixed_crf_for "$codec" "$profile" false)"
     vmaf=""
+    search_failed=1
     warn "Shot search failed for shot $idx ($start_ts-$end_ts) on $(hostname 2>/dev/null) -- falling back to fixed qp=$qp"
   fi
 
@@ -618,6 +619,11 @@ shot_search_claimed() {
     printf 'qp=%s\n' "$qp"
     printf 'vmaf=%s\n' "$vmaf"
     printf 'samples=%s\n' "$samples"
+    # 1 when resolve_per_shot_qp() returned nothing and we blind-fell-back
+    # to a fixed QP -- the shot has no real rate/VMAF data. Kept as a
+    # resolved status (don't block the pipeline) but marked so the
+    # allocator and credits detection can tell it apart from a real result.
+    printf 'search_failed=%s\n' "$search_failed"
     printf 'searched_host=%s\n' "$(hostname 2>/dev/null || echo unknown)"
     printf 'searched_utc=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   } >"$tmp"
@@ -909,17 +915,26 @@ detect_credits_range_by_complexity() {
     status_file="$mdir/shot-$(printf '%03d' "$idx").status"
     qp="$(awk -F= '/^qp=/{print substr($0,index($0,"=")+1); exit}' "$status_file")"
     samples="$(awk -F= '/^samples=/{print substr($0,index($0,"=")+1); exit}' "$status_file")"
-    [ -n "$qp" ] && [ -n "$samples" ] || continue
     bytes_at_qp=""
-    local IFS=,; local -a parts=($samples); unset IFS
-    local p
-    for p in "${parts[@]}"; do
-      local IFS=:; local -a triple=($p); unset IFS
-      [ "${#triple[@]}" -eq 3 ] || continue
-      [ "${triple[0]}" = "$qp" ] && { bytes_at_qp="${triple[2]}"; break; }
-    done
-    [ -n "$bytes_at_qp" ] || continue
-    printf '%s %s %s %s\n' "$idx" "$start_ts" "$end_ts" "$bytes_at_qp" >>"$flat"
+    if [ -n "$qp" ] && [ -n "$samples" ]; then
+      local IFS=,; local -a parts=($samples); unset IFS
+      local p
+      for p in "${parts[@]}"; do
+        local IFS=:; local -a triple=($p); unset IFS
+        [ "${#triple[@]}" -eq 3 ] || continue
+        [ "${triple[0]}" = "$qp" ] && { bytes_at_qp="${triple[2]}"; break; }
+      done
+    fi
+    # A shot with no usable byte sample -- the per-shot search failed on it
+    # and shot_search_claimed() fell back to a fixed QP (status=resolved but
+    # samples= empty; real case 2026-08-28: RbW S01E01 shot 454, a 90s
+    # credits block whose search OOM'd a weak fleet host's RAMDISK). Emit it
+    # with an "NA" byte marker rather than dropping it: a gap in the shot
+    # sequence used to break the trailing-run walk right where the credits
+    # live. Downstream (awk) treats a long NA shot near EOF as almost
+    # certainly the credits crawl (no scene cut for 45s+), a short one as a
+    # bridgeable unknown.
+    printf '%s %s %s %s\n' "$idx" "$start_ts" "$end_ts" "${bytes_at_qp:-NA}" >>"$flat"
   done
 
   # Baseline bytes/sec from the file's BODY only -- shots that start
@@ -937,9 +952,9 @@ detect_credits_range_by_complexity() {
   local window_start
   window_start="$(awk -v d="$dur" 'BEGIN{ printf "%.3f", d * 0.75 }')"
   local bps_sorted median
-  bps_sorted="$(awk -v ws="$window_start" '{ d = $3 - $2; if (d > 0 && $2 < ws) print $4 / d }' "$flat" | sort -n)"
+  bps_sorted="$(awk -v ws="$window_start" '$4 != "NA" { d = $3 - $2; if (d > 0 && $2 < ws) print $4 / d }' "$flat" | sort -n)"
   if [ -z "$bps_sorted" ]; then
-    bps_sorted="$(awk '{ d = $3 - $2; if (d > 0) print $4 / d }' "$flat" | sort -n)"
+    bps_sorted="$(awk '$4 != "NA" { d = $3 - $2; if (d > 0) print $4 / d }' "$flat" | sort -n)"
   fi
   if [ -z "$bps_sorted" ]; then rm -f "$flat"; return 1; fi
   median="$(awk '{a[NR]=$1} END{ if (NR==0) exit 1; if (NR%2==1) print a[(NR+1)/2]; else print (a[NR/2]+a[NR/2+1])/2 }' <<<"$bps_sorted")"
@@ -956,8 +971,10 @@ detect_credits_range_by_complexity() {
   # bumper/preview after the credits is skipped (up to ~90s from EOF).
   local result
   result="$(awk -v total_dur="$dur" -v median="$median" -v window_start="$window_start" '
-    { n++; s[n]=$2; e[n]=$3; b[n]=$4
-      d = e[n] - s[n]; bps[n] = (d > 0) ? b[n]/d : -1 }
+    { n++; s[n]=$2; e[n]=$3
+      d = e[n] - s[n]
+      if ($4 == "NA") { bps[n] = -2 }          # search failed for this shot
+      else            { bps[n] = (d > 0) ? $4/d : -1 } }
     END {
       if (n == 0 || median <= 0) exit 1
       # order shot indices chronologically (glob is already sorted, but
@@ -982,6 +999,16 @@ detect_credits_range_by_complexity() {
             k = ord[p]
             if ((e[k] - s[k]) <= 0) break
             if (s[k] < window_start) break
+            if (bps[k] == -2) {
+              # search failed for this shot -- no byte data. A long one
+              # (>=45s, i.e. no scene cut for 45s+) is almost certainly the
+              # credits crawl itself: fold it into the run. A short one is a
+              # bridgeable unknown, same budget as an expensive blip.
+              if ((e[k] - s[k]) >= 45) { gap_dur = 0; gap_cnt = 0; run_start = p; continue }
+              gap_dur += (e[k] - s[k]); gap_cnt++
+              if (gap_dur > 10 || gap_cnt > 2) break
+              continue
+            }
             if (bps[k] < 0) break
             if (bps[k] / median >= ratio_max) {
               # tolerate a brief expensive blip inside the crawl (a logo
