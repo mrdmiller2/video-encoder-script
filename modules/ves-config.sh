@@ -6,7 +6,7 @@
 # MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
 # bug fix) -- see its own comment.
 
-VERSION="6.0.0U"
+VERSION="6.0.0V"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
 # as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
@@ -506,6 +506,90 @@ VMAF_SAMPLE_SECS="${CONVERT_VMAF_SAMPLE_SECS:-20}"
 VMAF_ALIGN_SEARCH_FRAMES="${CONVERT_VMAF_ALIGN_SEARCH_FRAMES:-3}"
 VMAF_SEARCH_MIN_CRF=16
 VMAF_SEARCH_MAX_CRF=46
+
+# --- Phase 6 per-shot QP search + dynamic (equal-slope) byte allocator ------
+# These are SEPARATE from the whole-file VMAF_SEARCH_*_CRF above so widening
+# the per-shot search cannot move production whole-file CRF behaviour.
+#
+# Goal order (unchanged): 1) don't drastically drop output quality
+#                         2) reduce size    (3) speed, last)
+#
+# (B) content-adaptive window. Base bounds are wider than the whole-file
+# search — a wider ceiling lets genuinely-cheap shots (static dialogue,
+# black, simple pans) reach the QP where they *just* meet target so the
+# allocator can bank those bytes; a slightly lower floor protects truly hard
+# shots. When a shot's search still hits a bound, the search EXTENDS past it
+# (see resolve_per_shot_qp) so the allocator always sees a real
+# rate-distortion curve, never one clipped at the window edge.
+PER_SHOT_QP_MIN="${PER_SHOT_QP_MIN:-14}"
+PER_SHOT_QP_MAX="${PER_SHOT_QP_MAX:-50}"
+PER_SHOT_QP_EXTEND_MARGIN="${PER_SHOT_QP_EXTEND_MARGIN:-3.0}"   # VMAF pts above target that trigger a cheap-end extension
+PER_SHOT_QP_EXTEND_STEP="${PER_SHOT_QP_EXTEND_STEP:-4}"          # QP step per extension probe
+PER_SHOT_QP_EXTEND_CEIL="${PER_SHOT_QP_EXTEND_CEIL:-55}"        # hard cap: never probe above (blocking/banding visible even on flat content past here)
+PER_SHOT_QP_EXTEND_FLOOR="${PER_SHOT_QP_EXTEND_FLOOR:-10}"      # hard floor: bits below here buy no perceptual gain + SVT RC gets flaky
+PER_SHOT_QP_EXTEND_PROBES="${PER_SHOT_QP_EXTEND_PROBES:-2}"     # max extension probes per side
+#
+# (C) smooth position weight for the equal-slope allocator. The allocator
+# values head/tail VMAF slightly less, so under a tight byte budget it takes
+# the quality hit in the first HEAD_FRAC / last TAIL_FRAC of the file first.
+# NOT credits detection (that heuristic is retired — chapterless library +
+# credits over live-action defeat any byte-signature approach); this is just
+# the statistical prior that recaps/intros/credits/denouement carry less
+# viewer value, applied as a soft weight so the allocator still decides from
+# real RD data. Set ALLOC_POS_WEIGHT_MIN=1.0 to disable.
+ALLOC_POS_WEIGHT_HEAD_FRAC="${ALLOC_POS_WEIGHT_HEAD_FRAC:-0.05}"
+ALLOC_POS_WEIGHT_TAIL_FRAC="${ALLOC_POS_WEIGHT_TAIL_FRAC:-0.12}"
+ALLOC_POS_WEIGHT_MIN="${ALLOC_POS_WEIGHT_MIN:-0.85}"
+#
+# (#1) per-shot VMAF FLOOR for the equal-slope allocator. The equal-slope
+# objective maximises the (weighted) MEAN vmaf for the byte budget and will
+# let an expensive (steep-RD) shot fall well below target if the bytes raise
+# the mean more elsewhere — the Discovery S01E02 baseline hit MIN_SHOT_VMAF
+# 66.9 at a ~90 mean. The viewer notices the worst shot, not the mean. Any
+# shot the bisection puts below (per-shot target − ALLOC_MIN_SHOT_VMAF_DROP)
+# is pinned to its highest-VMAF sample and the budget is re-solved over the
+# rest, up to ALLOC_MIN_SHOT_PIN_ROUNDS times. Position-weighted head/tail
+# shots are exempt (they are meant to absorb loss). 0 disables.
+ALLOC_MIN_SHOT_VMAF_DROP="${ALLOC_MIN_SHOT_VMAF_DROP:-6.0}"
+ALLOC_MIN_SHOT_PIN_ROUNDS="${ALLOC_MIN_SHOT_PIN_ROUNDS:-4}"
+#
+# (#3) crossover refinement in resolve_per_shot_qp(). VMAF-vs-QP is not
+# monotone-smooth — GOP/RC decisions give ±0.3–0.5 wiggle — so the bounded
+# search's winner is occasionally beaten by an adjacent QP that is BOTH
+# higher-VMAF AND fewer-bytes. After the search converges, probe ±N QP around
+# the winner: ≤2 extra short encodes that catch the inversion and hand the
+# allocator a denser curve exactly where its lambda lands. 0 disables.
+PER_SHOT_QP_CROSSOVER_PROBES="${PER_SHOT_QP_CROSSOVER_PROBES:-1}"
+#
+# (#2, GATED OFF) content-adaptive per-shot VMAF target. When true, the
+# per-shot target shifts by up to ±PER_SHOT_ADAPTIVE_TARGET_SPAN from a cheap
+# motion/luma read of the shot: high motion → lower target (the eye can't
+# resolve the detail, and it's cheaper); dark + low motion → higher target
+# (prevents visible banding). Flat 94 over-protects the forgiving content and
+# under-protects the demanding content. Off by default — turn on for the
+# Discovery A/B first, then decide.
+PER_SHOT_ADAPTIVE_TARGET="${PER_SHOT_ADAPTIVE_TARGET:-false}"
+PER_SHOT_ADAPTIVE_TARGET_SPAN="${PER_SHOT_ADAPTIVE_TARGET_SPAN:-2.0}"
+#
+# (#4/#5, GATED OFF, vintage/classic/vtv only) per-title "does this old title
+# actually benefit from enhancement" check. NOT every old title should get
+# film-grain synthesis (#5) or heavier sub-shot AQ/lookahead (#4) — a clean
+# telecined studio print gains nothing from synthetic grain and can be
+# softened by it; a genuinely grain-heavy print gains a lot. When true, ves
+# runs a short sample A/B (default profile params vs enhanced) during the
+# profile decision and only adopts the enhanced params for THAT title if the
+# sample wins on size at equal-or-better VMAF. Scope is limited to the
+# vintage / classic / vtv profiles; anime/movie/mtv are untouched.
+PER_TITLE_OLD_ENHANCE_CHECK="${PER_TITLE_OLD_ENHANCE_CHECK:-false}"
+PER_TITLE_OLD_ENHANCE_PROFILES="${PER_TITLE_OLD_ENHANCE_PROFILES:-vintage classic vtv}"
+# Sample length (s) for that A/B, and the VMAF the enhanced variant must stay
+# within of the default variant to be adopted (it must ALSO be smaller).
+PER_TITLE_OLD_ENHANCE_SAMPLE_SECS="${PER_TITLE_OLD_ENHANCE_SAMPLE_SECS:-45}"
+PER_TITLE_OLD_ENHANCE_VMAF_TOL="${PER_TITLE_OLD_ENHANCE_VMAF_TOL:-0.5}"
+# Set by decide_old_title_enhancement(); consumed by profile_svt_params().
+# Reset to empty at the start of every title so it never leaks across files.
+SVT_PARAMS_OVERRIDE=""
+SVT_PARAMS_OVERRIDE_PROFILE=""
 VMAF_DISABLED=false                               # --no-vmaf
 PREFER_HW_ENCODE=false                            # --prefer-hw (speed over size)
 # Fixed CRFs used when VMAF search is unavailable/disabled, and always for HDR:

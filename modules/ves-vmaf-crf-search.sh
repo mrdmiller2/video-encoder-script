@@ -509,6 +509,17 @@ profile_svt_params() {
     vtv) params="$SVT_PARAMS_VTV" ;;
     *) return 1 ;;
   esac
+  # (#4/#5) per-title enhancement override -- set only by
+  # decide_old_title_enhancement() when a vintage/classic/vtv title's own
+  # sample A/B showed synthetic grain / heavier sub-shot AQ actually wins
+  # (size down at VMAF >= default - 0.5). Scoped to the exact profile it was
+  # measured for, cleared at each title's entry. Zero effect when unset --
+  # same shared-by-search-and-final-encode injection point as the tile/thread
+  # override below, so the CRF/QP search stays calibrated to what the final
+  # encode actually uses.
+  if [ -n "${SVT_PARAMS_OVERRIDE:-}" ] && [ "${SVT_PARAMS_OVERRIDE_PROFILE:-}" = "$1" ]; then
+    params="$SVT_PARAMS_OVERRIDE"
+  fi
   if ! svtav1_supports_sharpness; then
     params="$(printf '%s' "$params" | sed -E 's/:sharpness=[0-9]+//')"
   fi

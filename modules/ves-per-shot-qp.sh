@@ -225,6 +225,35 @@ resolve_per_shot_qp() {
   local qp above below gap
   LAST_SHOT_SEARCH_SAMPLES=()
 
+  # --- (#2, GATED) content-adaptive per-shot target -------------------------
+  # One cheap ffmpeg read of the shot (no encode): mean luma + inter-frame
+  # difference energy. High motion -> lower target (the eye can't resolve the
+  # detail and it is cheaper); dark + low motion -> higher target (banding
+  # shows at 94 on smooth gradients). Clamped to base +/- 3. Off unless
+  # PER_SHOT_ADAPTIVE_TARGET=true.
+  if [ "${PER_SHOT_ADAPTIVE_TARGET:-false}" = "true" ]; then
+    local _base_t="$target" _span="${PER_SHOT_ADAPTIVE_TARGET_SPAN:-2.0}"
+    local _fss _ass _dur _yavg _motion
+    _fss="$(awk -v s="$start" 'BEGIN{f=s-30; if(f<0)f=0; printf "%.6f", f}')"
+    _ass="$(awk -v s="$start" -v f="$_fss" 'BEGIN{printf "%.6f", s-f}')"
+    _dur="$(awk -v s="$start" -v e="$end" 'BEGIN{d=e-s; if(d<0)d=0; printf "%.6f", d}')"
+    _yavg="$("${FFMPEG_CMD[@]}" -v error -nostats -ss "$_fss" -i "$src" -ss "$_ass" -t "$_dur" \
+      -map 0:v:0 -vf "signalstats,metadata=print:file=-" -f null - 2>/dev/null \
+      | awk -F= '/lavfi\.signalstats\.YAVG/{s+=$2;n++} END{if(n)printf "%.1f", s/n; else print "128"}')"
+    _motion="$("${FFMPEG_CMD[@]}" -v error -nostats -ss "$_fss" -i "$src" -ss "$_ass" -t "$_dur" \
+      -map 0:v:0 -vf "tblend=all_mode=difference,signalstats,metadata=print:file=-" -f null - 2>/dev/null \
+      | awk -F= '/lavfi\.signalstats\.YAVG/{s+=$2;n++} END{if(n)printf "%.2f", s/n; else print "0"}')"
+    target="$(awk -v t="$_base_t" -v sp="$_span" -v y="${_yavg:-128}" -v m="${_motion:-0}" 'BEGIN{
+      adj=0
+      if (m+0 >= 6.0)            adj = -sp          # busy motion
+      else if (y+0 <= 55 && m+0 <= 2.0) adj = sp    # dark + static -> banding risk
+      nt = t + adj
+      if (nt > t+3) nt = t+3; if (nt < t-3) nt = t-3
+      printf "%.1f", nt
+    }')"
+    log_err "  per-shot adaptive-target shot=${start}-${end} yavg=${_yavg} motion=${_motion} base=${_base_t} -> target=${target}"
+  fi
+
   _probe_qp() {
     local q="$1" r
     [ -n "${score[$q]:-}" ] && return 0
@@ -264,20 +293,82 @@ resolve_per_shot_qp() {
   # between 30 and 46 could beat 30 -- real, deliberate thoroughness, not
   # wasted work. Keep interpolation (faster path to the same guaranteed-
   # optimal answer); don't accept "good enough" in its place.
-  local anchors="$VMAF_SEARCH_MIN_CRF 30 $VMAF_SEARCH_MAX_CRF"
+  # Per-shot search bounds are independent of the whole-file VMAF_SEARCH_*_CRF
+  # (see ves-config.sh, section B) so the wider range here can't move
+  # production whole-file behaviour.
+  local qp_lo="$PER_SHOT_QP_MIN" qp_hi="$PER_SHOT_QP_MAX"
+  local anchors="$qp_lo 30 $qp_hi"
   for qp in $anchors; do _probe_qp "$qp" || return 1; done
   for i in 1 2 3; do
     above=""; below=""
     for qp in $(printf '%s\n' "${!score[@]}" | sort -n); do
       if awk -v s="${score[$qp]}" -v t="$target" 'BEGIN{exit !(s>=t)}'; then above="$qp"; else below="$qp"; break; fi
     done
-    if [ -z "$above" ]; then _probe_qp "$VMAF_SEARCH_MIN_CRF" || break; continue; fi
-    if [ -z "$below" ]; then _probe_qp "$VMAF_SEARCH_MAX_CRF" || break; continue; fi
+    if [ -z "$above" ]; then _probe_qp "$qp_lo" || break; continue; fi
+    if [ -z "$below" ]; then _probe_qp "$qp_hi" || break; continue; fi
     gap=$(( below - above )); [ "$gap" -le 1 ] && break
     local next_qp
     next_qp="$(_interp_qp "$above" "${score[$above]}" "$below" "${score[$below]}" "$target")"
     _probe_qp "$next_qp" || break
   done
+
+  # --- (B) content-adaptive window extension --------------------------------
+  # The search above is clipped to [qp_lo, qp_hi]. If a shot bottomed out at
+  # a bound, probe PAST it so the allocator gets a real rate-distortion curve
+  # (never one clipped at the window edge) -- this is what lets genuinely
+  # cheap shots bank bytes and genuinely hard shots be protected, with no
+  # per-position logic (the survey showed position != viewer-value).
+  local _hi_qp="" _hi_v="" _q _p
+  for qp in $(printf '%s\n' "${!score[@]}" | sort -n); do
+    awk -v s="${score[$qp]}" -v t="$target" 'BEGIN{exit !(s>=t)}' && { _hi_qp="$qp"; _hi_v="${score[$qp]}"; }
+  done
+  if [ -n "$_hi_qp" ] && [ "$_hi_qp" -ge "$qp_hi" ] \
+     && awk -v v="$_hi_v" -v t="$target" -v m="$PER_SHOT_QP_EXTEND_MARGIN" 'BEGIN{exit !(v >= t + m)}'; then
+    # cheap end: still target+MARGIN or better at the ceiling -> keep going up
+    # (fewer bits) as long as target still holds
+    _q="$qp_hi"
+    for _p in $(seq 1 "$PER_SHOT_QP_EXTEND_PROBES"); do
+      _q=$(( _q + PER_SHOT_QP_EXTEND_STEP ))
+      [ "$_q" -le "$PER_SHOT_QP_EXTEND_CEIL" ] || break
+      _probe_qp "$_q" || break
+      awk -v s="${score[$_q]:-0}" -v t="$target" 'BEGIN{exit !(s>=t)}' || break
+    done
+  elif [ -z "$_hi_qp" ]; then
+    # hard end: nothing met target -> probe below the floor to map the
+    # quality ceiling (gives the allocator an expensive-end RD sample)
+    _q="$qp_lo"
+    for _p in $(seq 1 "$PER_SHOT_QP_EXTEND_PROBES"); do
+      _q=$(( _q - PER_SHOT_QP_EXTEND_STEP ))
+      [ "$_q" -ge "$PER_SHOT_QP_EXTEND_FLOOR" ] || break
+      _probe_qp "$_q" || break
+      awk -v s="${score[$_q]:-0}" -v t="$target" 'BEGIN{exit !(s>=t)}' && break
+    done
+  fi
+
+  # --- (#3) crossover refinement -------------------------------------------
+  # VMAF-vs-QP is not monotone-smooth; probe +/-N QP around the current
+  # highest-QP-meeting-target so a real RD inversion (an adjacent QP that is
+  # both higher-VMAF and fewer-bytes) is caught and the allocator gets a
+  # denser curve where its lambda lands.
+  if [ "${PER_SHOT_QP_CROSSOVER_PROBES:-0}" -gt 0 ]; then
+    local _center="" _ccv="" _d _c
+    for qp in $(printf '%s\n' "${!score[@]}" | sort -n); do
+      awk -v s="${score[$qp]}" -v t="$target" 'BEGIN{exit !(s>=t)}' && _center="$qp"
+    done
+    if [ -z "$_center" ]; then
+      for qp in $(printf '%s\n' "${!score[@]}" | sort -n); do
+        if [ -z "$_ccv" ] || awk -v s="${score[$qp]}" -v c="$_ccv" 'BEGIN{exit !(s>c)}'; then
+          _center="$qp"; _ccv="${score[$qp]}"
+        fi
+      done
+    fi
+    if [ -n "$_center" ]; then
+      for _d in $(seq 1 "$PER_SHOT_QP_CROSSOVER_PROBES"); do
+        _c=$(( _center - _d )); [ "$_c" -ge "$PER_SHOT_QP_EXTEND_FLOOR" ] && _probe_qp "$_c" 2>/dev/null || true
+        _c=$(( _center + _d )); [ "$_c" -le "$PER_SHOT_QP_EXTEND_CEIL" ] && _probe_qp "$_c" 2>/dev/null || true
+      done
+    fi
+  fi
 
   local best="" bv="" closest="" cv=""
   for qp in $(printf '%s\n' "${!score[@]}" | sort -n); do
@@ -903,166 +994,17 @@ detect_credits_range() {
       fi
     fi
   fi
-  detect_credits_range_by_complexity "$src" "$dur"
-}
-
-# Fallback for files with no chapters at all (real gap found 2026-08-26:
-# Star Trek Discovery has none) -- reuses the per-shot search's OWN
-# already-computed byte-cost data instead of a new video-analysis pass.
-# Credits (scrolling text over a plain/dark background) compress far more
-# cheaply than real content; a CONTIGUOUS run of low bytes-per-second
-# shots ending near the file's end is a strong signal. Validated against
-# real Discovery data: shot 450 (2355.5-2421.2s, 65.7s) came back at 8%
-# of the file's median bytes/sec. The reported range is extended to true
-# EOF (mirroring the chapter path) even when a short bumper/logo follows
-# the crawl -- that tail is low-viewer-value too, so including it in the
-# deprioritized range is safe. Requires the shot manifest to already be
-# fully resolved (same precondition as the allocator itself).
-#
-# 2026-08-28 rework (v6.0.0R): the earlier version matched only the single
-# lowest-ratio shot in the last quarter and returned just that shot's own
-# span. That under-detected multi-shot credits sequences (WandaVision
-# S01E05) and missed shows whose tail never cleared a strict 0.25x bar
-# (Wild Cards S01E10) entirely. Now: baseline median is taken over the
-# file body only (pre-last-quarter), and detection walks a contiguous
-# trailing run of cheap shots, trying a strict then a looser ratio.
-detect_credits_range_by_complexity() {
-  local src="$1" dur="${2:-}"
-  local mdir f idx start_ts end_ts status_file qp samples bytes_at_qp
-  [ -n "$dur" ] || dur="$(video_duration "$src")" || return 1
-  mdir="$(shot_manifest_dir "$src")"
-  shot_manifest_all_resolved "$src" || return 1
-
-  local flat; flat="$(mktemp)" || return 1
-  for f in "$mdir"/shot-*.meta; do
-    [ -e "$f" ] || continue
-    idx="$(awk -F= '/^index=/{print $2; exit}' "$f")"
-    start_ts="$(awk -F= '/^start_ts=/{print $2; exit}' "$f")"
-    end_ts="$(awk -F= '/^end_ts=/{print $2; exit}' "$f")"
-    status_file="$mdir/shot-$(printf '%03d' "$idx").status"
-    qp="$(awk -F= '/^qp=/{print substr($0,index($0,"=")+1); exit}' "$status_file")"
-    samples="$(awk -F= '/^samples=/{print substr($0,index($0,"=")+1); exit}' "$status_file")"
-    bytes_at_qp=""
-    if [ -n "$qp" ] && [ -n "$samples" ]; then
-      local IFS=,; local -a parts=($samples); unset IFS
-      local p
-      for p in "${parts[@]}"; do
-        local IFS=:; local -a triple=($p); unset IFS
-        [ "${#triple[@]}" -eq 3 ] || continue
-        [ "${triple[0]}" = "$qp" ] && { bytes_at_qp="${triple[2]}"; break; }
-      done
-    fi
-    # A shot with no usable byte sample -- the per-shot search failed on it
-    # and shot_search_claimed() fell back to a fixed QP (status=resolved but
-    # samples= empty; real case 2026-08-28: RbW S01E01 shot 454, a 90s
-    # credits block whose search OOM'd a weak fleet host's RAMDISK). Emit it
-    # with an "NA" byte marker rather than dropping it: a gap in the shot
-    # sequence used to break the trailing-run walk right where the credits
-    # live. Downstream (awk) treats a long NA shot near EOF as almost
-    # certainly the credits crawl (no scene cut for 45s+), a short one as a
-    # bridgeable unknown.
-    printf '%s %s %s %s\n' "$idx" "$start_ts" "$end_ts" "${bytes_at_qp:-NA}" >>"$flat"
-  done
-
-  # Baseline bytes/sec from the file's BODY only -- shots that start
-  # before the last quarter. A long credits sequence in the tail would
-  # otherwise drag the median down and mask itself (real: Wild Cards
-  # S01E10, whose tail never cleared the old strict 0.25x-of-all-shots
-  # bar and was missed entirely). The 0.75 split is positional, not
-  # value-based, so this is not circular. Falls back to an all-shots
-  # median for files too short to have a distinct body.
-  #
-  # Median via external `sort -n` rather than awk's asort() -- confirmed
-  # 2026-08-26 this module is deployed to macOS fleet machines (MARLONJ)
-  # running BSD/one-true-awk, which has no asort() extension; this file
-  # must stay portable to every awk in the fleet, not just GNU awk.
-  local window_start
-  window_start="$(awk -v d="$dur" 'BEGIN{ printf "%.3f", d * 0.75 }')"
-  local bps_sorted median
-  bps_sorted="$(awk -v ws="$window_start" '$4 != "NA" { d = $3 - $2; if (d > 0 && $2 < ws) print $4 / d }' "$flat" | sort -n)"
-  if [ -z "$bps_sorted" ]; then
-    bps_sorted="$(awk '$4 != "NA" { d = $3 - $2; if (d > 0) print $4 / d }' "$flat" | sort -n)"
-  fi
-  if [ -z "$bps_sorted" ]; then rm -f "$flat"; return 1; fi
-  median="$(awk '{a[NR]=$1} END{ if (NR==0) exit 1; if (NR%2==1) print a[(NR+1)/2]; else print (a[NR/2]+a[NR/2+1])/2 }' <<<"$bps_sorted")"
-
-  # Anchor on a CONTIGUOUS trailing run of cheap-to-compress shots, not a
-  # single outlier. The old code matched only the one lowest-ratio shot
-  # and returned just its own span, which (a) under-detected badly when
-  # the real credits span several shots of differing byte profiles
-  # (WandaVision S01E05: ~93s of trailing credits missed), and (b) missed
-  # entirely when no single shot cleared the strict bar. Walking a
-  # contiguous run that ends near EOF is a far stronger signal, so we can
-  # both extend the reported end to true EOF (mirroring the chapter path)
-  # and safely try a looser ratio on a second pass. A short trailing
-  # bumper/preview after the credits is skipped (up to ~90s from EOF).
-  local result
-  result="$(awk -v total_dur="$dur" -v median="$median" -v window_start="$window_start" '
-    { n++; s[n]=$2; e[n]=$3
-      d = e[n] - s[n]
-      if ($4 == "NA") { bps[n] = -2 }          # search failed for this shot
-      else            { bps[n] = (d > 0) ? $4/d : -1 } }
-    END {
-      if (n == 0 || median <= 0) exit 1
-      # order shot indices chronologically (glob is already sorted, but
-      # be defensive) -- n ~= a few hundred, O(n^2) is trivial here
-      for (i = 1; i <= n; i++) ord[i] = i
-      for (i = 1; i <= n; i++)
-        for (j = i + 1; j <= n; j++)
-          if (s[ord[j]] < s[ord[i]]) { t = ord[i]; ord[i] = ord[j]; ord[j] = t }
-
-      split("0.25 0.40", thr, " ")
-      for (ti = 1; ti <= 2; ti++) {
-        ratio_max = thr[ti] + 0
-        # try each trailing shot as the run end-anchor, closest-to-EOF
-        # first; stop looking once we are more than 90s short of EOF
-        for (a = n; a >= 1; a--) {
-          ka = ord[a]
-          if (total_dur - e[ka] > 90) break
-          if (bps[ka] < 0 || bps[ka] / median >= ratio_max) continue
-          run_start = a
-          gap_dur = 0; gap_cnt = 0
-          for (p = a - 1; p >= 1; p--) {
-            k = ord[p]
-            if ((e[k] - s[k]) <= 0) break
-            if (s[k] < window_start) break
-            if (bps[k] == -2) {
-              # search failed for this shot -- no byte data. A long one
-              # (>=45s, i.e. no scene cut for 45s+) is almost certainly the
-              # credits crawl itself: fold it into the run. A short one is a
-              # bridgeable unknown, same budget as an expensive blip.
-              if ((e[k] - s[k]) >= 45) { gap_dur = 0; gap_cnt = 0; run_start = p; continue }
-              gap_dur += (e[k] - s[k]); gap_cnt++
-              if (gap_dur > 10 || gap_cnt > 2) break
-              continue
-            }
-            if (bps[k] < 0) break
-            if (bps[k] / median >= ratio_max) {
-              # tolerate a brief expensive blip inside the crawl (a logo
-              # card / mid-credits sting) -- real: WandaVision S01E05
-              # shot 334 at 0.45x sits between two long ~0.2x runs
-              gap_dur += (e[k] - s[k]); gap_cnt++
-              if (gap_dur > 10 || gap_cnt > 2) break
-              continue
-            }
-            gap_dur = 0; gap_cnt = 0
-            run_start = p
-          }
-          rs = s[ord[run_start]]
-          run_dur = e[ord[a]] - rs
-          if (run_dur < 30) continue
-          if (run_dur > total_dur * 0.35) continue
-          printf "%s %s\n", rs, total_dur
-          exit 0
-        }
-      }
-      exit 1
-    }
-  ' "$flat")"
-  local rc=$?
-  rm -f "$flat"
-  [ $rc -eq 0 ] && [ -n "$result" ] || return 1
-  printf '%s\n' "$result"
+  # No byte-cost fallback: retired 2026-08-30 after the American + Discovery +
+  # British/Japanese survey (~30 titles, exactly one chaptered file) showed
+  # (a) the library is effectively chapterless so this path almost never
+  # fires, and (b) credits that roll over live-action / animation carry no
+  # low-byte signature at all -- 4 of 5 J-drama titles missed with a
+  # perfectly clean per-shot search (0 failed shots). There is no reliable
+  # byte-only credits signal. The equal-slope allocator's smooth position
+  # weight (ves-config.sh section C) now carries the "head/tail is lower
+  # viewer value" prior instead, letting the allocator decide from real RD
+  # data rather than a guessed range. Chapter-marker detection above stays.
+  return 1
 }
 
 assemble_qpfile_via_equal_slope_budget() {
@@ -1072,6 +1014,13 @@ assemble_qpfile_via_equal_slope_budget() {
   local -a shot_qps=()
   mdir="$(shot_manifest_dir "$src")"
   shot_manifest_all_resolved "$src" || return 1
+
+  # (#1) per-shot VMAF floor: no shot below (target - drop). target is the
+  # same per-source figure the per-shot search aimed at.
+  local _pst_target _floor_drop _pin_rounds
+  _pst_target="$(vmaf_target_for_source "$src" 2>/dev/null)" || _pst_target=94
+  _floor_drop="${ALLOC_MIN_SHOT_VMAF_DROP:-0}"
+  _pin_rounds="${ALLOC_MIN_SHOT_PIN_ROUNDS:-4}"
 
   local samples_flat durations_flat
   samples_flat="$(mktemp)" || return 1
@@ -1105,70 +1054,117 @@ assemble_qpfile_via_equal_slope_budget() {
 
   local qp_lines
   qp_lines="$(awk -v budget="$byte_budget" -v durations_file="$durations_flat" \
-    -v deprio_start="$deprio_start" -v deprio_end="$deprio_end" -v deprio_weight="$deprio_weight" '
+    -v deprio_start="$deprio_start" -v deprio_end="$deprio_end" -v deprio_weight="$deprio_weight" \
+    -v head_frac="$ALLOC_POS_WEIGHT_HEAD_FRAC" -v tail_frac="$ALLOC_POS_WEIGHT_TAIL_FRAC" \
+    -v wmin="$ALLOC_POS_WEIGHT_MIN" \
+    -v target="$_pst_target" -v floor_drop="$_floor_drop" -v pin_rounds="$_pin_rounds" '
+    # (C) smooth position weight: wmin at the very edges of the file, linearly
+    # up to 1.0 by head_frac / tail_frac. The allocator objective is
+    #   weight[idx]*vmaf - lambda*bytes
+    # so a weight < 1.0 makes the low-QP (more-bytes, higher-vmaf) samples
+    # less attractive there -> allocator picks a higher QP -> fewer bytes in
+    # the head/tail under a tight budget, while still choosing from real RD
+    # data. wmin=1.0 disables it.
+    function pos_weight(p,   w) {
+      if (head_frac > 0 && p < head_frac)
+        return wmin + (1.0 - wmin) * (p / head_frac)
+      if (tail_frac > 0 && p > 1.0 - tail_frac)
+        return wmin + (1.0 - wmin) * ((1.0 - p) / tail_frac)
+      return 1.0
+    }
     BEGIN {
+      # Explicit deprio range (deprio_start/end) still honoured as an override
+      # for callers that pass one; otherwise the smooth position weight applies.
       have_deprio = (deprio_start != "" && deprio_end != "")
+      max_e = 0
       while ((getline line < durations_file) > 0) {
         split(line, a, " ")
         dur[a[1]] = 1
         shot_s[a[1]] = a[2]; shot_e[a[1]] = a[3]
-        # Phase 6.2: a shot whose midpoint falls inside the detected
-        # low-viewer-value range (credits/intro) gets its VMAF term
-        # discounted in the objective below, biasing the allocator to
-        # accept lower quality there for the same marginal bytes --
-        # freeing budget for weight[idx]==1.0 main content within the
-        # SAME total spend, without touching the bisection core.
-        mid = (a[2] + a[3]) / 2
-        if (have_deprio && mid >= deprio_start && mid <= deprio_end) {
-          weight[a[1]] = deprio_weight
-        } else {
-          weight[a[1]] = 1.0
-        }
+        if (a[3] + 0 > max_e) max_e = a[3] + 0
       }
       close(durations_file)
-    }
-    { n++; sidx[n]=$1; sqp[n]=$2; svmaf[n]=$3; sbytes[n]=$4 }
-    END {
-      if (n == 0) { exit 1 }
-      # lambda range must bracket the true crossover: lo picks max-quality
-      # (most bytes) everywhere, hi picks min-quality (fewest bytes)
-      # everywhere -- unlike the VMAF-target version, a byte budget is
-      # always achievable somewhere in [lo,hi] since actual spend is
-      # monotonically decreasing in lambda.
-      lo = 1e-12; hi = 1.0
-      for (iter = 0; iter < 60; iter++) {
-        lambda = exp((log(lo) + log(hi)) / 2)
-        for (idx in dur) has_best[idx] = 0
-        for (i = 1; i <= n; i++) {
-          idx = sidx[i]
-          obj = weight[idx] * svmaf[i] - lambda * sbytes[i]
-          if (!has_best[idx] || obj > best_obj[idx]) {
-            has_best[idx] = 1; best_obj[idx] = obj
-            best_qp[idx] = sqp[i]; best_vmaf[idx] = svmaf[i]; best_bytes[idx] = sbytes[i]
-          }
+      total_dur = (max_e > 0) ? max_e : 1
+      for (idx in dur) {
+        mid = (shot_s[idx] + shot_e[idx]) / 2
+        if (have_deprio) {
+          weight[idx] = (mid >= deprio_start && mid <= deprio_end) ? deprio_weight : 1.0
+        } else {
+          weight[idx] = pos_weight(mid / total_dur)
         }
-        total_bytes = 0; wsum = 0; wdur = 0
-        for (idx in dur) { total_bytes += best_bytes[idx] }
-        if (total_bytes > budget) { lo = lambda } else { hi = lambda }
       }
-      # Final pass at the converged lambda for reporting.
-      lambda = exp((log(lo) + log(hi)) / 2)
+    }
+    {
+      n++; sidx[n]=$1; sqp[n]=$2; svmaf[n]=$3; sbytes[n]=$4
+      # per-shot highest-VMAF sample -- the pick a (#1) pinned shot is forced to
+      if (!($1 in maxv_v) || $3+0 > maxv_v[$1]) {
+        maxv_v[$1]=$3+0; maxv_qp[$1]=$2; maxv_b[$1]=$4+0
+      }
+    }
+    # one equal-slope pick per shot at a given lambda, honouring pinned[]
+    function select_picks(lambda,   i, idx, obj) {
       for (idx in dur) has_best[idx] = 0
       for (i = 1; i <= n; i++) {
         idx = sidx[i]
+        if (idx in pinned) {
+          if (!has_best[idx]) {
+            has_best[idx]=1
+            best_qp[idx]=maxv_qp[idx]; best_vmaf[idx]=maxv_v[idx]; best_bytes[idx]=maxv_b[idx]
+          }
+          continue
+        }
         obj = weight[idx] * svmaf[i] - lambda * sbytes[i]
         if (!has_best[idx] || obj > best_obj[idx]) {
-          has_best[idx] = 1; best_obj[idx] = obj
-          best_qp[idx] = sqp[i]; best_vmaf[idx] = svmaf[i]; best_bytes[idx] = sbytes[i]
+          has_best[idx]=1; best_obj[idx]=obj
+          best_qp[idx]=sqp[i]; best_vmaf[idx]=svmaf[i]; best_bytes[idx]=sbytes[i]
         }
       }
-      total_bytes = 0; min_vmaf = 999; min_idx = ""; deprio_n = 0
+    }
+    END {
+      if (n == 0) { exit 1 }
+      floor_v = (floor_drop + 0 > 0) ? (target + 0 - floor_drop) : -1
+
+      # (#1) outer loop: solve the equal-slope byte budget, then pin any shot
+      # the solve dropped below the VMAF floor to its best sample and re-solve
+      # the budget over the rest. Position-weighted head/tail shots are exempt
+      # (they exist to absorb loss). Pinning can only tighten lambda on the
+      # remaining shots, so it converges in a few rounds; if the budget is so
+      # tight even all-pinned overspends, we stop and just report it.
+      pin_added_total = 0
+      for (round = 0; round <= (pin_rounds + 0); round++) {
+        lo = 1e-12; hi = 1.0
+        for (iter = 0; iter < 60; iter++) {
+          lambda = exp((log(lo) + log(hi)) / 2)
+          select_picks(lambda)
+          total_bytes = 0
+          for (idx in dur) total_bytes += best_bytes[idx]
+          if (total_bytes > budget) lo = lambda; else hi = lambda
+        }
+        lambda = exp((log(lo) + log(hi)) / 2)
+        select_picks(lambda)
+        if (floor_v < 0) break
+        new_pins = 0
+        for (idx in dur) {
+          if ((idx in pinned)) continue
+          if (weight[idx] < 0.999) continue
+          if (best_vmaf[idx] < floor_v && maxv_v[idx] > best_vmaf[idx] + 0.01) {
+            pinned[idx] = 1; new_pins++; pin_added_total++
+          }
+        }
+        if (new_pins == 0) break
+      }
+
+      total_bytes = 0; min_vmaf = 999; min_idx = ""; min_body_vmaf = 999; min_body_idx = ""; weighted_n = 0
       for (idx in best_vmaf) {
         total_bytes += best_bytes[idx]
         if (best_vmaf[idx] < min_vmaf) { min_vmaf = best_vmaf[idx]; min_idx = idx }
-        if (weight[idx] < 1.0) deprio_n++
+        if (weight[idx] < 0.999) {
+          weighted_n++
+        } else if (best_vmaf[idx] < min_body_vmaf) {
+          min_body_vmaf = best_vmaf[idx]; min_body_idx = idx
+        }
       }
-      printf "LAMBDA=%.10g TOTAL_BYTES=%d BUDGET=%d MIN_SHOT_VMAF=%.2f (shot %s) DEPRIORITIZED_SHOTS=%d\n", lambda, total_bytes, budget, min_vmaf, min_idx, deprio_n > "/dev/stderr"
+      printf "LAMBDA=%.10g TOTAL_BYTES=%d BUDGET=%d MIN_SHOT_VMAF=%.2f (shot %s) MIN_BODY_VMAF=%.2f (shot %s) POS_WEIGHTED_SHOTS=%d FLOOR_PINNED=%d (floor %.1f)\n", lambda, total_bytes, budget, min_vmaf, min_idx, min_body_vmaf, min_body_idx, weighted_n, pin_added_total, floor_v > "/dev/stderr"
       for (idx in best_qp) printf "%s %s %s\n", idx, best_qp[idx], best_vmaf[idx]
     }
   ' "$samples_flat")" || { rm -f "$samples_flat" "$durations_flat"; return 1; }

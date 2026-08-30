@@ -315,6 +315,18 @@ ffmpeg_encode() {
 
   profile="$(profile_for_source "$src")" || return $?
 
+  # (#4/#5) per-title enhancement A/B (grain synthesis / heavier sub-shot AQ)
+  # for vintage/classic/vtv only, gated by PER_TITLE_OLD_ENHANCE_CHECK. Sets
+  # SVT_PARAMS_OVERRIDE for this title if the sample proves it wins on size
+  # at no meaningful VMAF loss; a no-op (and instant) otherwise. Runs in the
+  # main shell here so the override reaches both the CRF search and the final
+  # encode via profile_svt_params. AV1 only -- x265 params are separate.
+  if [ "$codec" = av1 ]; then
+    decide_old_title_enhancement "$src" "$profile" || true
+  else
+    SVT_PARAMS_OVERRIDE=""; SVT_PARAMS_OVERRIDE_PROFILE=""
+  fi
+
   # Vintage-profile real deinterlace (QTGMC), confidently-detected genuine
   # interlace only -- never telecine/progressive/ambiguous, and never
   # outside the two vintage profiles (see modules/ves-qtgmc.sh header +

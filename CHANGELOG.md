@@ -4,6 +4,97 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.0V — 2026-08-30 (branch `6.x-chunk-redesign`)
+
+**Dynamic (equal-slope) allocator — B+C, and credits detection retired.**
+
+The Phase 6.2 regional credits-detection survey (American 5 + Discovery 5 +
+British/Japanese 15, ~30 titles) reached its conclusion: **there is no
+reliable way to detect a "credits range" from bytes.** The library is
+effectively chapterless (one chaptered file in the whole survey), and
+credits that roll over live-action or animation carry no low-byte signature
+— 4 of 5 J-drama titles missed with a perfectly clean per-shot search (0
+failed shots on Kodoku no Gurume and Kakegurui). The right answer is to
+stop special-casing and let the equal-slope allocator do what it already
+does: allocate bits by scene-change/motion complexity.
+
+- **Removed `detect_credits_range_by_complexity()`** and its call from
+  `detect_credits_range()` (which keeps only the chapter-marker path —
+  reliable when present, just rare here). The v6.0.0R rework, the v6.0.0T
+  `search_failed`/NA-tolerance path, and the whole byte-cost heuristic
+  existed to prop up this dead branch.
+
+- **(B) content-adaptive per-shot QP window.** New `PER_SHOT_QP_MIN/MAX`
+  (14/50), independent of the whole-file `VMAF_SEARCH_*_CRF` (16/46) so the
+  wider per-shot range can't move production whole-file behaviour. When a
+  shot's bounded search still pins to a bound, `resolve_per_shot_qp()` now
+  **extends past it** — up to `PER_SHOT_QP_EXTEND_PROBES` more probes toward
+  `PER_SHOT_QP_EXTEND_CEIL` (55) when a cheap shot is still ≥ target +
+  `PER_SHOT_QP_EXTEND_MARGIN` at the ceiling, or toward
+  `PER_SHOT_QP_EXTEND_FLOOR` (10) when nothing met target. The allocator now
+  always gets a real rate-distortion curve, never one clipped at the window
+  edge — which is what lets genuinely cheap shots bank bytes (size) and
+  genuinely hard shots be protected (quality), with **no per-position
+  logic** (the survey proved position ≠ viewer value).
+
+- **(C) smooth position weight in `assemble_qpfile_via_equal_slope_budget()`.**
+  Replaces the retired credits-deprio with a soft weight: `ALLOC_POS_WEIGHT_MIN`
+  (0.85) at the very edges of the file, linearly to 1.0 by
+  `ALLOC_POS_WEIGHT_HEAD_FRAC` (5%) / `ALLOC_POS_WEIGHT_TAIL_FRAC` (12%).
+  The allocator objective `weight·vmaf − lambda·bytes` then makes it take
+  the quality hit in the head/tail first under a tight budget — the
+  statistical "recaps/intros/credits/denouement are lower viewer value"
+  prior, applied as a nudge, with the allocator still choosing from real RD
+  data. `ALLOC_POS_WEIGHT_MIN=1.0` disables it. An explicit `deprio_start/end`
+  arg (only the archived discovery experiment passes one) still overrides.
+  Allocator stderr now also reports `MIN_BODY_VMAF` (worst non-weighted
+  shot) alongside `MIN_SHOT_VMAF`.
+
+**Quality/size levers on top of B+C** (goal order: quality > size > speed):
+
+- **(#1) per-shot VMAF FLOOR in the equal-slope allocator.** The equal-slope
+  objective maximises the *weighted mean* VMAF for the budget and will let an
+  expensive (steep-RD) shot fall far below target if the bytes raise the mean
+  more elsewhere — the Discovery S01E02 baseline hit `MIN_SHOT_VMAF=66.9` at a
+  ~90 mean. The viewer notices the worst shot, not the mean. Any shot the
+  bisection puts below `target − ALLOC_MIN_SHOT_VMAF_DROP` (default 6) is
+  **pinned** to its highest-VMAF sample and the budget is re-solved over the
+  rest, up to `ALLOC_MIN_SHOT_PIN_ROUNDS` (4) times. Position-weighted head/tail
+  shots are exempt (they're meant to absorb loss). Pure allocator change, no
+  extra encodes. New stderr fields: `MIN_BODY_VMAF`, `FLOOR_PINNED`. 0 disables.
+
+- **(#3) crossover refinement in `resolve_per_shot_qp()`.** VMAF-vs-QP is not
+  monotone-smooth (GOP/RC give ±0.3–0.5 wiggle), so the bounded search's winner
+  is occasionally beaten by an adjacent QP that is *both* higher-VMAF and
+  fewer-bytes. After the search converges, probe ±`PER_SHOT_QP_CROSSOVER_PROBES`
+  (default 1) QP around the winner — ≤2 short encodes that catch the inversion
+  and hand the allocator a denser curve where its lambda lands.
+
+- **(#2, GATED OFF) content-adaptive per-shot VMAF target.**
+  `PER_SHOT_ADAPTIVE_TARGET=true` → one cheap ffmpeg read of the shot (mean luma
+  via `signalstats`, motion via `tblend=difference,signalstats`) shifts the
+  per-shot target by up to ±`PER_SHOT_ADAPTIVE_TARGET_SPAN` (2): busy motion →
+  lower (the eye can't resolve it, and it's cheaper); dark + static → higher
+  (banding shows at 94 on smooth gradients). Clamped to base ±3. Off — turn on
+  for the Discovery A/B.
+
+- **(#4/#5, GATED OFF, vintage/classic/vtv only) per-title enhancement check.**
+  New module `ves-old-enhance.sh`. `PER_TITLE_OLD_ENHANCE_CHECK=true` →
+  `decide_old_title_enhancement()` runs a ~45 s sample A/B (default profile
+  params vs an *enhanced* variant: film-grain `+4` / add synthesis, +1
+  variance-boost-strength, wider variance-octile, force `enable-tf=1`) and only
+  adopts the enhanced params **for that one title** if the sample is smaller at
+  VMAF within `PER_TITLE_OLD_ENHANCE_VMAF_TOL` (0.5) of default — because "old"
+  is not one thing: a scanned 16/35 mm print gains a lot from grain synthesis,
+  a clean telecined studio print gains nothing and can be softened by it.
+  Adopted params flow via a new `SVT_PARAMS_OVERRIDE` hook in
+  `profile_svt_params()` (shared by CRF/QP search and final encode), reset per
+  title. Wired into `ffmpeg_encode()` for `codec=av1` only.
+
+Goal order unchanged: (1) don't drastically drop output quality, (2) reduce
+size, (3) speed last. #1/#3 active by default; #2/#4/#5 gated off pending the
+Discovery S01E02 A/B. NOT yet fleet-deployed.
+
 ## v6.0.0U — 2026-08-28 (branch `6.x-chunk-redesign`)
 
 **Real bug fix: a scene-detection failure silently produced a bogus
