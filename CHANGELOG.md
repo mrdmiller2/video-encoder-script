@@ -4,6 +4,21 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.0W — 2026-08-30 (branch `6.x-chunk-redesign`)
+
+**`set -u` safety for the ves-hwdetect.sh lazy-probe caches.** The five
+version/capability accessors (`svtav1_supports_sharpness`,
+`current_svtav1_major_minor`, `current_x265_major_minor`,
+`current_tools_fingerprint`, `current_tool_versions_tag_suffix`) each guard
+their one-time probe with `if [ -z "$VAR" ]`, but the variable had no
+top-level default anywhere (dropped in the original monolith→module split —
+"pure move, no logic changes"). Production `convert.sh` doesn't run with
+`nounset` so it was latent, but any harness that sources the modules under
+`set -u` (e.g. the v6.0.0V Discovery allocator A/B) aborts on the first probe
+with `FF_SVTAV1_SUPPORTS_SHARPNESS: unbound variable`. Added the five empty
+defaults next to `NVENC_AV1_TUNE` in `ves-config.sh`. Pure default, zero
+behaviour change; verified both with and without `set -u`.
+
 ## v6.0.0V — 2026-08-30 (branch `6.x-chunk-redesign`)
 
 **Dynamic (equal-slope) allocator — B+C, and credits detection retired.**

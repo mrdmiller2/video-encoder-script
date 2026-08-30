@@ -6,7 +6,7 @@
 # MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
 # bug fix) -- see its own comment.
 
-VERSION="6.0.0V"
+VERSION="6.0.0W"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
 # as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
@@ -730,6 +730,21 @@ X265_PARAMS_MTV="$X265_PARAMS_MOVIES"
 X265_PARAMS_VTV='log-level=error:keyint=240:min-keyint=24:bframes=8:b-adapt=2:ref=5:rc-lookahead=50:aq-mode=3:no-sao=1:psy-rd=1.5:psy-rdoq=1.0'
 
 NVENC_AV1_TUNE=hq
+
+# ves-hwdetect.sh lazy-probe caches. Each is filled on first call of its
+# accessor (svtav1_supports_sharpness / current_svtav1_major_minor /
+# current_x265_major_minor / current_tools_fingerprint /
+# current_tool_versions_tag_suffix) via `if [ -z "$VAR" ]`. Declared empty
+# here so that guard is safe under `set -u` (a caller that runs the modules
+# with nounset -- e.g. an ad-hoc validation harness -- otherwise aborts on
+# the first probe with "unbound variable"; production convert.sh does not
+# set -u so this was latent). Pure default, no behaviour change.
+FF_SVTAV1_SUPPORTS_SHARPNESS=""
+CURRENT_SVTAV1_MAJOR_MINOR=""
+CURRENT_X265_MAJOR_MINOR=""
+TOOLS_FINGERPRINT=""
+TOOL_VERSIONS_TAG_SUFFIX=""
+
 AUDIO_DRC=2.0
 AUDIO_GAIN=1.0
 JOB_ROOT=""
