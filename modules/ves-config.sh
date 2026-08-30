@@ -6,7 +6,7 @@
 # MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
 # bug fix) -- see its own comment.
 
-VERSION="6.0.0W"
+VERSION="6.0.0X"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
 # as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
@@ -552,6 +552,17 @@ ALLOC_POS_WEIGHT_MIN="${ALLOC_POS_WEIGHT_MIN:-0.85}"
 # shots are exempt (they are meant to absorb loss). 0 disables.
 ALLOC_MIN_SHOT_VMAF_DROP="${ALLOC_MIN_SHOT_VMAF_DROP:-6.0}"
 ALLOC_MIN_SHOT_PIN_ROUNDS="${ALLOC_MIN_SHOT_PIN_ROUNDS:-4}"
+#
+# Per-shot sample bytes UNDER-predict the continuous full-file encode of the
+# same qpfile: the search encodes each shot as an isolated cold clip; the real
+# encode has cross-shot temporal prediction + whole-stream AQ statistics.
+# Measured actual/estimate = 1.07-1.14 on Discovery S01E02 (higher when the
+# #1 floor pins more hard shots to low QP). `assemble_qpfile_via_equal_slope_budget`
+# therefore prefers a FRACTION budget (x*baseline; k cancels in the ratio).
+# ALLOC_BYTES_CALIBRATION_K only applies when an ABSOLUTE byte target is given:
+# the target is divided by K before the lambda solve so the final encode lands
+# near it. Recalibrate per codec/preset if it drifts; 1.0 = off (raw target).
+ALLOC_BYTES_CALIBRATION_K="${ALLOC_BYTES_CALIBRATION_K:-1.13}"
 #
 # (#3) crossover refinement in resolve_per_shot_qp(). VMAF-vs-QP is not
 # monotone-smooth — GOP/RC decisions give ±0.3–0.5 wiggle — so the bounded

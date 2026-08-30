@@ -1022,6 +1022,41 @@ assemble_qpfile_via_equal_slope_budget() {
   _floor_drop="${ALLOC_MIN_SHOT_VMAF_DROP:-0}"
   _pin_rounds="${ALLOC_MIN_SHOT_PIN_ROUNDS:-4}"
 
+  # --- budget interpretation --------------------------------------------------
+  # The per-shot search encodes each shot as an ISOLATED clip (cold keyframe,
+  # no cross-shot temporal prediction, per-clip AQ statistics). The continuous
+  # full-file encode of the SAME qpfile comes out systematically LARGER --
+  # measured k = actual/estimated = 1.07-1.14 on Discovery S01E02 (higher when
+  # #1 pins more hard shots to low QP). So an ABSOLUTE byte target handed to
+  # the lambda bisection (which only sees sample bytes) produces a file ~13%
+  # over target. Two ways to give a meaningful budget:
+  #
+  #   * a FRACTION (0 < x <= 4): budget = x * baseline, where baseline is the
+  #     sample-byte sum of the pure per-shot-target qpfile (the same estimator,
+  #     so k cancels in the ratio -- actual(frac)/actual(1.0) ~= frac). This
+  #     is the robust default and matches the archived budget90/95 runs.
+  #   * an ABSOLUTE byte count (> 4): divided by ALLOC_BYTES_CALIBRATION_K
+  #     before the solve so the *final encode* lands near the target.
+  local _cal_k _budget_mode="absolute"
+  _cal_k="${ALLOC_BYTES_CALIBRATION_K:-1.0}"
+  if awk -v b="$byte_budget" 'BEGIN{exit !(b+0 > 0 && b+0 <= 4)}'; then
+    _budget_mode="fraction"
+    local _baseline
+    _baseline="$(for st in "$mdir"/shot-*.status; do
+      awk -F= '/^samples=/{
+        line=substr($0,index($0,"=")+1); nf=split(line,a,","); best=-1; bb=0
+        for(i=1;i<=nf;i++){ n=split(a[i],t,":"); if(n==3 && t[2]+0 >= '"$_pst_target"' && t[1]+0 > best){best=t[1]+0; bb=t[3]+0} }
+        if(best<0){ for(i=1;i<=nf;i++){ n=split(a[i],t,":"); if(n==3){bv=(bv==""?t[2]+0:bv); if(t[2]+0>=bv){bv=t[2]+0; bb=t[3]+0}} } }
+        print bb
+      }' "$st"
+    done | awk '{s+=$1} END{printf "%.0f", s}')"
+    byte_budget="$(awk -v f="$byte_budget" -v base="$_baseline" 'BEGIN{printf "%.0f", f*base}')"
+    log_err "  equal-slope budget: fraction mode -> baseline=${_baseline} B, budget=${byte_budget} B"
+  else
+    byte_budget="$(awk -v b="$byte_budget" -v k="$_cal_k" 'BEGIN{printf "%.0f", b / (k>0?k:1)}')"
+    log_err "  equal-slope budget: absolute mode, /K=${_cal_k} -> internal budget=${byte_budget} B"
+  fi
+
   local samples_flat durations_flat
   samples_flat="$(mktemp)" || return 1
   durations_flat="$(mktemp)" || { rm -f "$samples_flat"; return 1; }

@@ -4,6 +4,44 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.0X — 2026-08-30 (branch `6.x-chunk-redesign`)
+
+**Equal-slope allocator byte-budget calibration — fix the systematic
+under-prediction of the full-file encode.**
+
+The per-shot search encodes every shot as an **isolated clip**: a cold
+keyframe, no cross-shot temporal prediction, per-clip AQ statistics. The
+continuous full-file encode of the *same* qpfile therefore comes out
+systematically **larger** than the sum of the search's sample bytes.
+Measured `k = actual / estimated` on Discovery S01E02:
+
+| variant | est bytes | actual bytes | k |
+|---|---|---|---|
+| B (std budget, floor on)   | 363,516,219 | 411,035,871 | 1.131 |
+| C (b95 budget, floor on)   | 346,207,684 | 393,297,355 | 1.136 |
+| D (b95 budget, floor off)  | 347,953,239 | 370,817,329 | 1.066 |
+| E (b95, no pos-weight)     | 345,548,919 | 393,436,371 | 1.139 |
+| pure per-shot-target (A)   | 511,179,581 | 598,106,347 | 1.170 |
+
+Before this fix, an **absolute** byte target handed to the lambda bisection
+(which only ever sees sample bytes) produced a final file ~7–14 % over
+target — budgets were being allocated against a number that did not
+correspond to the thing being measured.
+
+`assemble_qpfile_via_equal_slope_budget()` now interprets its budget arg:
+
+- **fraction** (`0 < x ≤ 4`): `budget = x · baseline`, where `baseline` is
+  the sample-byte sum of the pure per-shot-target qpfile — the *same*
+  estimator, so `k` cancels in the ratio and `actual(x) / actual(1.0) ≈ x`.
+  This is the robust form and is what the archived budget90/95 runs meant.
+- **absolute** (`> 4`): divided by `ALLOC_BYTES_CALIBRATION_K`
+  (new config, default `1.13`) before the solve, so the *final encode*
+  lands near the requested byte count.
+
+New config: `ALLOC_BYTES_CALIBRATION_K` in `ves-config.sh`. No behaviour
+change for callers that were already passing a fraction; absolute callers
+now hit their target instead of overshooting.
+
 ## v6.0.0W — 2026-08-30 (branch `6.x-chunk-redesign`)
 
 **`set -u` safety for the ves-hwdetect.sh lazy-probe caches.** The five
