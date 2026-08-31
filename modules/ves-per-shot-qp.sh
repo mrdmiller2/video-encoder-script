@@ -702,9 +702,27 @@ shot_release_claim() {
 # holding 10 shots, every other worker had already exited, search wedged at
 # 215/225 with nothing alive to run the reclaim). Gives up only after
 # max_idle_secs of no claimable work with shots still outstanding.
+# Sweep this host's per-shot / VMAF scratch that no live process is touching.
+# _vmaf_score_shot already rm -rf's its own tmpdir on every normal and error
+# exit -- this only mops up `kill -9` / OOM orphans between shots so a long
+# run can't accrete multi-GB ffv1/y4m junk in tmpfs (2026-08-28 wave). The
+# system-level fleet-scratch-reaper is the backstop; this keeps it tidy in
+# the common case without waiting for the 10-min timer.
+_shot_scratch_sweep() {
+  local base="${RAMDISK_JOB_DIR:-${TMPDIR:-/tmp}}" d
+  for d in "$base"/ves-shotqp-* "$base"/ves-crf-* "$base"/ves-vmaf-* "$base"/ves-oldenh-*; do
+    [ -e "$d" ] || continue
+    # anything under it modified in the last 20 min -> still in use
+    [ -n "$(find "$d" -mmin -20 -print -quit 2>/dev/null)" ] && continue
+    command -v fuser >/dev/null 2>&1 && fuser -s -- "$d" 2>/dev/null && continue
+    rm -rf -- "$d" 2>/dev/null && echo "shot-search: swept stale scratch $d"
+  done
+}
+
 shot_search_worker_loop() {
   local src="$1" max_shots="${2:-99999}" max_idle_secs="${3:-2700}"
   local count=0 idle=0 idx retry_wait="${SHOT_SEARCH_RETRY_WAIT:-60}"
+  _shot_scratch_sweep
   while [ "$count" -lt "$max_shots" ]; do
     idx="$(shot_claim_next "$src")"
     if [ -n "$idx" ]; then
@@ -712,6 +730,7 @@ shot_search_worker_loop() {
       echo "claimed shot $idx"
       shot_search_claimed "$src" "$idx"
       echo "resolved shot $idx"
+      _shot_scratch_sweep
       count=$((count + 1))
       continue
     fi

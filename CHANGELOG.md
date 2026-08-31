@@ -4,6 +4,33 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.0Z — 2026-08-31 (branch `6.x-chunk-redesign`)
+
+**Fleet scratch cleanup — stop `kill -9` orphans from filling tmpfs.** The
+per-shot search and CRF/VMAF sampling write multi-GB ffv1/y4m/encode scratch
+under `${RAMDISK_JOB_DIR:-${TMPDIR:-/tmp}}`. Every normal and error exit path
+already `rm -rf`s it, but a `kill -9`'d worker (supervisor pkill, OOM-kill,
+power loss) leaves it behind — and enough of those fill a host's tmpfs, after
+which *every* extraction fails silently with "Disk quota exceeded" (the
+fleet-wide `search_failed` wave, 2026-08-28).
+
+- New `_shot_scratch_sweep()` in `ves-per-shot-qp.sh`, called by
+  `shot_search_worker_loop()` on entry and after every resolved shot: removes
+  `ves-shotqp-*` / `ves-crf-*` / `ves-vmaf-*` / `ves-oldenh-*` trees that are
+  quiescent (nothing modified in 20 min) and hold no open handle (`fuser`).
+- New **`fleet-scratch-reaper`** systemd service + timer (10-min cadence,
+  `Nice=10`, `IOSchedulingClass=idle`) on every Linux fleet node — the
+  system-level backstop for orphans no in-process trap can catch. Age window
+  45 min normally, 120 min while VES work is running, 5 min when a watched
+  filesystem (`/tmp` `/var/tmp` `/`) is already over 85 %. Deployed to
+  JJACKSON/TITOJ/LAYTOYAJ/AI-PROCESSOR/Plex/MJACKSON; folded into
+  `orchestration/ops/staged/_node-remediate.sh` for future provisioning.
+
+Output finalisation (`finalize_staged_encode_output`) was already correct —
+copy to a private temp on the share, size-verify, atomic `mv`, then delete
+the local staged copy; on any copy/mv failure the local copy is kept for
+manual recovery.
+
 ## v6.0.0Y — 2026-08-30 (branch `6.x-chunk-redesign`)
 
 **Distributed shot-search: a dropped fleet node no longer wedges the whole
