@@ -501,6 +501,18 @@ shot_lock_path() {
   printf '%s/%s.shot%s' "$dir" "$title" "$idx"
 }
 
+# Epoch mtime of a path (file or dir), or empty. Tries both stat dialects
+# regardless of $PLATFORM (fleet workers frequently run with PLATFORM=unknown)
+# then a python3 fallback. Used for stale-lock age in shot_claim_next().
+_shot_path_mtime() {
+  local p="$1"
+  [ -e "$p" ] || return 1
+  stat -c '%Y' -- "$p" 2>/dev/null && return 0
+  stat -f '%m' -- "$p" 2>/dev/null && return 0
+  python3 -c 'import os,sys; print(int(os.stat(sys.argv[1]).st_mtime))' "$p" 2>/dev/null && return 0
+  return 1
+}
+
 # Runs scene_detect_boundaries() ONCE (the expensive full-decode pass) and
 # writes one shot-NNN.meta file per shot (start_ts/end_ts) plus
 # manifest.meta (codec/profile/target/model, resolved once so every
@@ -643,14 +655,24 @@ EOF
     fi
     local owner_meta age mtime now
     owner_meta="${lockdir}/owner.meta"
-    mtime="$(mkv_structure_stat_key "$owner_meta" 2>/dev/null)" || true
-    mtime="${mtime##*|}"
+    # Lock age from owner.meta's mtime, falling back to the lockdir's own
+    # mtime -- the claiming mkdir sets it and nothing rewrites it during a
+    # search, so it's a faithful claim-time marker even when owner.meta is
+    # missing or unreadable (a dead worker that never got to write it, or an
+    # NFS idmap that hides it). Only skip the staleness check if BOTH are
+    # unavailable, which means the lock is already gone.
+    mtime="$(_shot_path_mtime "$owner_meta")"
+    [ -n "$mtime" ] || mtime="$(_shot_path_mtime "$lockdir")"
     now="$(date +%s)"
-    age=$(( now - ${mtime:-$now} ))
-    if [ "$age" -gt "${SHOT_SEARCH_STALE_SECS:-1800}" ]; then
-      reclaim_name="${lockdir}.reclaim.${this_host}.$$.$RANDOM"
+    if [ -n "$mtime" ]; then age=$(( now - mtime )); else age=0; fi
+    if [ -n "$mtime" ] && [ "$age" -gt "${SHOT_SEARCH_STALE_SECS:-1800}" ]; then
+      # Steal it: rename aside (needs only parent-dir write -- works across
+      # this NFS's root-squash idmap, where rm of a foreign-owned owner.meta
+      # gets EPERM), then re-create. A renamed orphan that rm can't remove is
+      # harmless -- it no longer matches the *.lock glob.
+      reclaim_name="${lockdir}.stale.${this_host}.$$.$RANDOM"
       if mv -- "$lockdir" "$reclaim_name" 2>/dev/null; then
-        rm -rf -- "$reclaim_name" 2>/dev/null
+        rm -rf -- "$reclaim_name" 2>/dev/null || true
         if mkdir -- "$lockdir" 2>/dev/null; then
           cat >"${lockdir}/owner.meta" <<EOF
 host=$this_host
@@ -669,6 +691,43 @@ EOF
 shot_release_claim() {
   local src="$1" idx="$2"
   rm -rf -- "$(shot_lock_path "$src" "$idx").lock" 2>/dev/null || true
+}
+
+# One fleet worker: claim -> search -> release, looping until the manifest is
+# fully resolved or genuinely stuck. Key difference from a naive
+# `while idx=$(claim); do ...; done`: an empty claim does NOT end the worker
+# while shots are still unresolved -- it sleeps and retries. A worker must
+# stay alive past SHOT_SEARCH_STALE_SECS so it can reclaim a lock stranded by
+# a peer that dropped mid-search (seen 2026-08-30: JJACKSON fell offline
+# holding 10 shots, every other worker had already exited, search wedged at
+# 215/225 with nothing alive to run the reclaim). Gives up only after
+# max_idle_secs of no claimable work with shots still outstanding.
+shot_search_worker_loop() {
+  local src="$1" max_shots="${2:-99999}" max_idle_secs="${3:-2700}"
+  local count=0 idle=0 idx retry_wait="${SHOT_SEARCH_RETRY_WAIT:-60}"
+  while [ "$count" -lt "$max_shots" ]; do
+    idx="$(shot_claim_next "$src")"
+    if [ -n "$idx" ]; then
+      idle=0
+      echo "claimed shot $idx"
+      shot_search_claimed "$src" "$idx"
+      echo "resolved shot $idx"
+      count=$((count + 1))
+      continue
+    fi
+    if shot_manifest_all_resolved "$src"; then
+      echo "shot-search: manifest fully resolved"
+      break
+    fi
+    idle=$((idle + retry_wait))
+    if [ "$idle" -ge "$max_idle_secs" ]; then
+      warn "shot-search: ${max_idle_secs}s idle with shots still unresolved -- giving up on $(hostname 2>/dev/null || echo '?')"
+      break
+    fi
+    echo "shot-search: nothing claimable, ${idle}s/${max_idle_secs}s idle -- retry in ${retry_wait}s"
+    sleep "$retry_wait"
+  done
+  echo "shot-search worker done: processed $count shots"
 }
 
 # Runs resolve_per_shot_qp() for one already-claimed shot and records the

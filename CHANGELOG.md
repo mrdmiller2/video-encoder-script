@@ -4,6 +4,41 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.0Y — 2026-08-30 (branch `6.x-chunk-redesign`)
+
+**Distributed shot-search: a dropped fleet node no longer wedges the whole
+search.** Seen live during the D-validation survey — one node fell offline
+mid-search holding ~10 shots; every other worker had already run out of
+claimable work and exited; the search stalled at 215/225 with nothing alive
+anywhere to reclaim the stranded locks. Two independent faults:
+
+1. **Workers exited on the first empty `shot_claim_next`** while shots were
+   still unresolved. The stale-lock reclaim only runs *inside*
+   `shot_claim_next`, i.e. only inside a live worker — so once every worker
+   quits, no reclaim can ever happen. New `shot_search_worker_loop()` retries
+   on an empty claim (sleep `SHOT_SEARCH_RETRY_WAIT`, default 60s) and only
+   gives up after `max_idle_secs` (default 2700s) with shots still
+   outstanding — long enough to outlast the 1800s staleness ceiling and
+   reclaim a dead peer's lock. `worker_loop_discovery_multi.sh` and the
+   (future) production loop both call it; a fallback inline loop with the
+   same retry behaviour covers older module snapshots.
+
+2. **Lock age came only from `owner.meta`'s mtime via
+   `mkv_structure_stat_key`.** If that returned nothing usable the age
+   computed as 0 → never `> SHOT_SEARCH_STALE_SECS` → the lock was
+   immortal. Now `_shot_path_mtime()` tries both `stat` dialects regardless
+   of `$PLATFORM` (fleet workers routinely run `PLATFORM=unknown`) then a
+   python3 fallback, and `shot_claim_next()` falls back to the **lockdir's
+   own mtime** (set by the claiming `mkdir`, never rewritten during a search)
+   when `owner.meta` is missing/unreadable. The reclaim itself no longer
+   depends on `rm -rf` of the renamed orphan succeeding — on this NFS's
+   root-squash idmap, `rm` of a foreign-owned `owner.meta` gets EPERM but the
+   `mv` (parent-dir write only) works, and a leftover `*.stale.*` orphan no
+   longer matches the `*.lock` glob.
+
+Manual recovery for a search already wedged this way: `mv "<title>.shotNN.lock"
+aside` (not `rm`), then relaunch workers.
+
 ## v6.0.0X — 2026-08-30 (branch `6.x-chunk-redesign`)
 
 **Equal-slope allocator byte-budget calibration — fix the systematic
