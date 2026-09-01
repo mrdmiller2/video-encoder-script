@@ -505,10 +505,15 @@ function Get-VesVmafScoreShot {
         [Parameter(Mandatory)][string]$Profile,
         [Parameter(Mandatory)][string]$FfmpegPath,
         [Parameter(Mandatory)][string]$FfprobePath,
-        [Parameter(Mandatory)][string]$SvtAv1EncAppPath
+        [string]$SvtAv1EncAppPath
     )
     if ($Codec -ne 'av1') { return $null }
-    if (-not (Test-Path -LiteralPath $SvtAv1EncAppPath)) { return $null }
+    # SvtAv1EncApp is optional: several Windows fleet hosts (PRINCE) have no
+    # standalone binary and encode via ffmpeg's libsvtav1. For the per-shot
+    # SEARCH every qpfile is UNIFORM (one QP for the whole shot), which is
+    # identical to `-svtav1-params qp=N` -- no per-frame qpfile needed here.
+    # (The stage-2 allocator's per-frame qpfile will need the real thing.)
+    $useSvtBin = $SvtAv1EncAppPath -and (Test-Path -LiteralPath $SvtAv1EncAppPath)
 
     $svtp = Get-VesProfileSvtParams -Profile $Profile -FfmpegPath $FfmpegPath
     if (-not $svtp) { return $null }
@@ -552,25 +557,38 @@ function Get-VesVmafScoreShot {
             return $null
         }
 
-        $qpfile = Join-Path $work "uniform-$Qp.qp"
-        $qpLines = for ($i = 0; $i -lt $nframes; $i++) { "$Qp" }
-        $qpLines | Set-Content -LiteralPath $qpfile -Encoding ascii
-
-        $out = Join-Path $work "shot-enc-$Qp.ivf"
-        $svtArgs = @(
-            '-i', $y4m, '--use-q-file', '1', '--qpfile', $qpfile,
-            '--svtav1-params', "${svtp}:rc=0", '-b', $out
-        )
-        $svtRun = Invoke-VesWithTimeoutRetry -FilePath $SvtAv1EncAppPath -ArgumentList $svtArgs `
-            -TimeoutSeconds $encTimeout -MaxRetries 1
-        if ($svtRun.TimedOut -or $svtRun.ExitCode -ne 0) { return $null }
+        if ($useSvtBin) {
+            $qpfile = Join-Path $work "uniform-$Qp.qp"
+            $qpLines = for ($i = 0; $i -lt $nframes; $i++) { "$Qp" }
+            $qpLines | Set-Content -LiteralPath $qpfile -Encoding ascii
+            $out = Join-Path $work "shot-enc-$Qp.ivf"
+            $svtRun = Invoke-VesWithTimeoutRetry -FilePath $SvtAv1EncAppPath -ArgumentList @(
+                '-i', $y4m, '--use-q-file', '1', '--qpfile', $qpfile,
+                '--svtav1-params', "${svtp}:rc=0", '-b', $out
+            ) -TimeoutSeconds $encTimeout -MaxRetries 1
+            if ($svtRun.TimedOut -or $svtRun.ExitCode -ne 0) { return $null }
+        } else {
+            # ffmpeg libsvtav1, uniform QP == qp-file of one value
+            $out = Join-Path $work "shot-enc-$Qp.mkv"
+            $ffEnc = Invoke-VesWithTimeoutRetry -FilePath $FfmpegPath -ArgumentList @(
+                '-y', '-v', 'error', '-i', $y4m, '-map', '0:v:0',
+                '-c:v', 'libsvtav1', '-preset', '5',
+                '-svtav1-params', "${svtp}:rc=0:qp=$Qp",
+                '-pix_fmt', 'yuv420p10le', $out
+            ) -TimeoutSeconds $encTimeout -MaxRetries 1
+            if ($ffEnc.TimedOut -or $ffEnc.ExitCode -ne 0) { return $null }
+        }
         if (-not (Test-Path -LiteralPath $out) -or (Get-Item -LiteralPath $out).Length -le 0) { return $null }
 
-        $outMkv = Join-Path $work "shot-enc-$Qp.mkv"
-        $mux = Invoke-VesWithTimeoutRetry -FilePath $FfmpegPath -ArgumentList @(
-            '-y', '-v', 'error', '-i', $out, '-c', 'copy', $outMkv
-        ) -TimeoutSeconds $encTimeout -MaxRetries 1
-        if ($mux.TimedOut -or $mux.ExitCode -ne 0) { return $null }
+        if ($useSvtBin) {
+            $outMkv = Join-Path $work "shot-enc-$Qp.mkv"
+            $mux = Invoke-VesWithTimeoutRetry -FilePath $FfmpegPath -ArgumentList @(
+                '-y', '-v', 'error', '-i', $out, '-c', 'copy', $outMkv
+            ) -TimeoutSeconds $encTimeout -MaxRetries 1
+            if ($mux.TimedOut -or $mux.ExitCode -ne 0) { return $null }
+        } else {
+            $outMkv = $out
+        }
 
         # Grain-ON: grain_decode_flag intentionally empty (v6.0.1A).
         $vlog = "$out.vmaf.json"
