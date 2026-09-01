@@ -188,8 +188,10 @@ function Get-VesVideoHeight {
     }
     $stdoutTask.Wait()
     $out = $stdoutTask.Result
-    $h = 0
-    [int]::TryParse($out.Trim(), [ref]$h) | Out-Null
+    # first run of digits only -- some MKVs' ffprobe output carries a trailing
+    # comma ("1608,"), which int-parses to 0 (bash _source_is_uhd fix 2026-09-01).
+    $m = [regex]::Match(($out -split "`n")[0], '\d+')
+    $h = 0; if ($m.Success) { [int]::TryParse($m.Value, [ref]$h) | Out-Null }
     return $h
 }
 
@@ -203,7 +205,10 @@ function Get-VesVideoWidth {
     $p = [System.Diagnostics.Process]::Start($psi)
     $t = $p.StandardOutput.ReadToEndAsync()
     if (-not $p.WaitForExit($TimeoutSeconds * 1000)) { try { $p.Kill($true) } catch {}; $p.WaitForExit(); return 0 }
-    $t.Wait(); $w = 0; [int]::TryParse($t.Result.Trim(), [ref]$w) | Out-Null; return $w
+    $t.Wait()
+    $m = [regex]::Match(($t.Result -split "`n")[0], '\d+')
+    $w = 0; if ($m.Success) { [int]::TryParse($m.Value, [ref]$w) | Out-Null }
+    return $w
 }
 
 function Test-VesSourceIsUhd {

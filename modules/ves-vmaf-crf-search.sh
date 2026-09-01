@@ -1217,8 +1217,13 @@ av1_source_reencode_sample_decision() {
 # OR height>=1600.
 _source_is_uhd() {
   local w h
-  w="$("${FFPROBE_CMD[@]}" -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 -- "$1" 2>/dev/null)"
-  h="$(video_height "$1")"
+  # Use video_width/video_height (default=nokey, clean) not a raw csv=p=0
+  # probe: found 2026-09-01 on The Bad Guys (2022) -- an MKV whose ffprobe
+  # csv output carries a trailing comma ("3840,"), so `[ "3840," -ge 3456 ]`
+  # threw "integer expression expected" and the 3840x1608 4K master fell
+  # through to the 1080p neg model. Strip to digits as belt-and-suspenders.
+  w="$(video_width "$1" 2>/dev/null | tr -cd '0-9')"
+  h="$(video_height "$1" 2>/dev/null | tr -cd '0-9')"
   [ "${w:-0}" -ge 3456 ] || [ "${h:-0}" -ge 1600 ]
 }
 
