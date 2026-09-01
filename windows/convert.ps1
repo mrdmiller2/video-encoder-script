@@ -47,6 +47,7 @@ param(
     [string]$ToolsRoot = 'D:\VES-ELVIS\tools',
     [string]$FfmpegPath,
     [string]$FfprobePath,
+    [string]$SvtAv1EncAppPath,
     [string]$AbAv1Path,
     [string]$MkvalidatorPath,
     [string]$HandBrakeCliPath,
@@ -83,7 +84,8 @@ foreach ($m in @(
         'VesRamDisk', 'VesOrphanReaper', 'VesShardedScan',
         'VesSubtitleFilter', 'VesProfileDecision', 'VesVmafCrfSearch', 'VesTwoStageEncode',
         'VesTelegram', 'VesOrganize', 'VesPipelineScan', 'VesHandBrake', 'VesDiscSource',
-        'VesLegacyFallback', 'VesHwDetect', 'VesSourceTraits', 'VesQtgmc', 'VesChunkCoordinator'
+        'VesLegacyFallback', 'VesHwDetect', 'VesSourceTraits', 'VesQtgmc', 'VesChunkCoordinator',
+        'VesSceneDetect', 'VesPerShotQp'
     )) {
     Import-Module (Join-Path $ModuleDir "modules\$m.psm1") -Force
 }
@@ -126,9 +128,34 @@ if ($SingleFileMode) {
 if (-not $JobRoot) { $JobRoot = $SearchPath }
 if (-not $FfmpegPath) { $FfmpegPath = Join-Path $ToolsRoot 'bin\ffmpeg.exe' }
 if (-not $FfprobePath) { $FfprobePath = Join-Path $ToolsRoot 'bin\ffprobe.exe' }
+if (-not $SvtAv1EncAppPath) {
+    $svtCandidate = Join-Path $ToolsRoot 'bin\SvtAv1EncApp.exe'
+    if (Test-Path -LiteralPath $svtCandidate) {
+        $SvtAv1EncAppPath = $svtCandidate
+    } elseif (Get-Command SvtAv1EncApp.exe -ErrorAction SilentlyContinue) {
+        $SvtAv1EncAppPath = (Get-Command SvtAv1EncApp.exe).Source
+    } elseif (Get-Command SvtAv1EncApp -ErrorAction SilentlyContinue) {
+        $SvtAv1EncAppPath = (Get-Command SvtAv1EncApp).Source
+    }
+}
 if (-not $AbAv1Path) { $AbAv1Path = Join-Path $ToolsRoot 'ab-av1.exe' }
 if (-not $MkvalidatorPath) { $MkvalidatorPath = Join-Path $ToolsRoot 'mkvalidator.exe' }
 if (-not $DiscScratchDir) { $DiscScratchDir = Join-Path $LocalStagingDir 'disc-extract-scratch' }
+
+# Per-shot QP / scene-detect / shot-search defaults -- match modules/ves-config.sh.
+# Only set when unset so a host/env override still wins. Values may change;
+# keys + defaults are what this stage establishes.
+if (-not $env:SCENE_DETECT_THRESHOLD) { $env:SCENE_DETECT_THRESHOLD = '0.3' }
+if (-not $env:SHOT_SEARCH_STALE_SECS) { $env:SHOT_SEARCH_STALE_SECS = '25200' }
+if (-not $env:SHOT_SEARCH_RETRY_WAIT) { $env:SHOT_SEARCH_RETRY_WAIT = '60' }
+if (-not $env:PER_SHOT_QP_MIN) { $env:PER_SHOT_QP_MIN = '14' }
+if (-not $env:PER_SHOT_QP_MAX) { $env:PER_SHOT_QP_MAX = '50' }
+if (-not $env:PER_SHOT_QP_EXTEND_MARGIN) { $env:PER_SHOT_QP_EXTEND_MARGIN = '3.0' }
+if (-not $env:PER_SHOT_QP_EXTEND_STEP) { $env:PER_SHOT_QP_EXTEND_STEP = '4' }
+if (-not $env:PER_SHOT_QP_EXTEND_CEIL) { $env:PER_SHOT_QP_EXTEND_CEIL = '55' }
+if (-not $env:PER_SHOT_QP_EXTEND_FLOOR) { $env:PER_SHOT_QP_EXTEND_FLOOR = '10' }
+if (-not $env:PER_SHOT_QP_EXTEND_PROBES) { $env:PER_SHOT_QP_EXTEND_PROBES = '2' }
+if (-not $env:PER_SHOT_QP_CROSSOVER_PROBES) { $env:PER_SHOT_QP_CROSSOVER_PROBES = '1' }
 
 foreach ($tool in @($FfmpegPath, $FfprobePath, $AbAv1Path)) {
     if (-not (Test-Path $tool)) {

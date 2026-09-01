@@ -4,6 +4,44 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.1D — 2026-08-31 (branch `6.x-chunk-redesign`)
+
+**Windows fork — stage 1 catch-up toward v6.x parity** (bash unchanged; the
+shared VERSION bumps in lockstep per fleet policy). The Windows port had been
+stuck at v5.1.1T; this brings over the parts of the 6.x per-shot / scene-detect
+work that are *concrete* (the allocator, still being calibrated by the live
+D-validation survey, is deliberately held for stage 2).
+
+- **New `windows/modules/VesSceneDetect.psm1`** ← `ves-scene-detect.sh` —
+  `Get-VesSceneBoundaries` (ffmpeg `select=gt(scene,THRESHOLD)`+showinfo).
+- **New `windows/modules/VesPerShotQp.psm1`** ← the stable half of
+  `ves-per-shot-qp.sh` (v6.0.1C): manifest dir/lock helpers, `New-VesShotManifest`,
+  `Enter-/Exit-VesShotClaim` (VesSharedMutex atomic-FILE claim, not `mkdir` —
+  same SMB-broken-ACL reason as VesChunkCoordinator), stale-lock reclaim with
+  the dual-mtime fallback, `Invoke-VesShotSearchWorkerLoop` (idle ceiling
+  defaults to STALE + 3×retry, the v6.0.1B fix), `Clear-VesShotScratch`
+  (dead-worker-only), `Resolve-VesPerShotQp` (the QP search — anchors, interp
+  with the v6.0.1B `break`, window extension, v6.0.1C crossover split),
+  `Get-VesVmafScoreShot` (v6.0.1A grain-ON). Allocator functions stubbed with
+  a stage-2 note.
+- **`VesVmafCrfSearch.psm1`** — stale grain-strip comments updated to the
+  grain-ON policy (the PS internal search never actually stripped grain);
+  added `Get-VesFinalVmaf -Sequential` with `fps=<source rate>` on both
+  inputs for chunk finalization (matches bash `measure_final_vmaf_sequential`
+  + the broken-DTS fps normalisation).
+- **New `windows/modules/VesChunkVerify.psm1`** ← `ves-chunk-verify.sh` —
+  decode verification, mkvmerge concat, structural/duration validation,
+  sequential-VMAF gate, promotion, cleanup.
+- **`convert.ps1`** — imports the two new modules; `-SvtAv1EncAppPath` param
+  + resolution; `PER_SHOT_QP_*` / `SCENE_DETECT_*` / `SHOT_SEARCH_*` env
+  defaults matching `ves-config.sh`.
+
+Parse-verified (`Import-Module` clean on all five). **NOT yet run on a real
+Windows host** — needs live SMB-ACL / SvtAv1EncApp verification on PRINCE.
+Follow-ups: port `Get-VesVmafTargetForSource` (search currently takes
+`-Target` from the caller); confirm PRINCE's ffmpeg has libsvtav1 + libvmaf
++ scdet; stage 2 = the allocator + fraction table after the survey locks.
+
 ## v6.0.1C — 2026-08-31 (branch `6.x-chunk-redesign`)
 
 **Remaining Medium/Low items from the Codex + Cursor review.**

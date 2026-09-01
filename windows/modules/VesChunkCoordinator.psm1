@@ -273,8 +273,8 @@ function Exit-VesChunkClaim {
 function Set-VesChunkStatus {
     <#
     .SYNOPSIS
-    Records a chunk's outcome. $Status is one of: encoded | verify-failed
-    | verified. $Extra (optional) is additional free-form key=value lines
+    Records a chunk's outcome. $Status is one of: encoded | encode-failed
+    | verified | needs-requeue. $Extra (optional) is additional free-form key=value lines
     -- see the bash module's own comment on why this is deliberately not
     a fixed schema (Layer 2's per-shot QP selection needs fields this
     function's current callers don't know about yet).

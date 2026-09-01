@@ -7,9 +7,10 @@
 # clips, its own libvmaf scoring via _vmaf_score_one). The bash version
 # uses ab-av1 for almost everything and only falls back to the internal
 # search for AV1 grain-synthesizing profiles (anime/vintage), because
-# ab-av1's own VMAF scoring can't disable synthesized grain before
-# scoring (confirmed against ab-av1 GitHub issue #139, open/unfixed as
-# of 0.11.4/0.11.5 -- checked, still applies). This port covers the
+# those profiles need the project's own candidate scoring policy. As of
+# v6.0.1A that policy deliberately scores grain-ON playback against the
+# grainy source (not the former grain-stripped decode), so ab-av1 is still
+# not used for those profiles until the internal search is ported. This port covers the
 # ab-av1 path, which is the common case; the grain-synthesis case is
 # handled by failing closed to the fixed-CRF fallback with an explicit
 # warning (never a silently-uncorrected-for-grain VMAF score), tracked
@@ -297,7 +298,8 @@ function Resolve-VesCrfForEncode {
     HDR/VMAF-disabled/no-libvmaf/dry-run fixed-CRF bypasses, then the
     ab-av1 search (falling back to FixedCrf, with an explicit warning,
     when ab-av1 can't be used for a grain-synthesizing AV1 profile --
-    the internal search that would normally handle that case isn't
+    the internal search that would normally handle that grain-ON playback
+    comparison isn't
     ported yet).
     #>
     param(
@@ -381,7 +383,7 @@ function Resolve-VesCrfForEncode {
         $result = Invoke-VesVmafCrfSearchAbAv1 -Source $Source -Codec $Codec -Target $VmafTarget -Model $model `
             -AbAv1Path $AbAv1Path -EncoderArgs $searchEncoderArgs -VideoFilter $VideoFilter
     } elseif (-not $canUseAbAv1 -and $grainSynthesis -and $Codec -eq 'av1') {
-        Write-Warning "Profile '$Profile' uses AV1 grain synthesis -- ab-av1's VMAF scoring can't account for it (upstream limitation), and the internal grain-aware search isn't ported yet -- using fixed CRF $FixedCrf instead of a potentially-wrong VMAF-searched value"
+        Write-Warning "Profile '$Profile' uses AV1 grain synthesis -- the project's grain-ON internal VMAF search is not ported yet -- using fixed CRF $FixedCrf instead of a potentially-wrong VMAF-searched value"
     }
 
     if ($null -eq $result) {
@@ -417,7 +419,8 @@ function Get-VesFinalVmaf {
         [int]$Samples = 3,
         [int]$SampleSeconds = 20,
         [int]$TimeoutSeconds = 180,
-        [int]$AlignSearchFrames = 3
+        [int]$AlignSearchFrames = 3,
+        [switch]$Sequential
     )
     if (-not (Test-Path -LiteralPath $Source) -or -not (Test-Path -LiteralPath $Output)) { return $null }
 
@@ -536,6 +539,31 @@ function Get-VesFinalVmaf {
     $frameDur = 0.0
     if ($fpsFilter -match '^fps=(\d+)/(\d+),$') {
         $frameDur = [double]$Matches[2] / [double]$Matches[1]
+    }
+
+    if ($Sequential) {
+        $vlogDir = [System.IO.Path]::GetTempPath()
+        $vlogName = "ves-vmaf-seq-$([guid]::NewGuid().ToString('N')).json"
+        $vlog = Join-Path $vlogDir $vlogName
+        # Chunk-finalize VMAF must avoid independent -ss seeks on
+        # multi-segment concatenated output. Keep this as a start-to-finish
+        # decode, but normalize both inputs to the source rate when known so
+        # broken-DTS/timing sources feed libvmaf equal-length frame streams.
+        $lavfi = "[0:v]${fpsFilter}format=yuv420p10le[d];[1:v]${fpsFilter}${scaleFilter}format=yuv420p10le[r];[d][r]libvmaf=model=$model`:n_threads=$nThreads`:log_fmt=json:log_path=$vlogName"
+        $ffArgs = @('-y', '-v', 'error', '-i', $Output, '-i', $Source, '-lavfi', $lavfi, '-f', 'null', '-')
+        $run = Invoke-VesProbeFfmpegRun -FfmpegPath $FfmpegPath -Args $ffArgs -TimeoutSeconds $TimeoutSeconds -WorkingDirectory $vlogDir
+        if (-not $run.Ok -or -not (Test-Path -LiteralPath $vlog)) {
+            Remove-Item -LiteralPath $vlog -Force -ErrorAction SilentlyContinue
+            return $null
+        }
+        try {
+            $json = Get-Content -LiteralPath $vlog -Raw | ConvertFrom-Json
+            return [math]::Round([double]$json.pooled_metrics.vmaf.mean, 2)
+        } catch {
+            return $null
+        } finally {
+            Remove-Item -LiteralPath $vlog -Force -ErrorAction SilentlyContinue
+        }
     }
 
     $measureOnce = {
