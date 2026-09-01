@@ -4,6 +4,16 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.1E — 2026-08-31 (branch `6.x-chunk-redesign`)
+
+**UHD detection missed ultrawide 4K.** `vmaf_model_for_source` /
+`vmaf_target_for_source` gated on `height > 1600`. A 2.40:1 4K master is
+3840x1600 (or 3840x1608) -- height *exactly* 1600, so The Dark Tower got the
+1080p `vmaf_v0.6.1neg` model + target 94 on native 3840px frames; the CRF
+search could not converge (VMAF ~81 even at CRF 16, predicted 11.7 GB).
+New `_source_is_uhd()` gates on `width >= 3456` (covers 3840 + DCI 4096, well
+clear of 2560px 1440p) OR `height >= 1600` -> 4K model + target 95.
+
 ## v6.0.1D — 2026-08-31 (branch `6.x-chunk-redesign`)
 
 **Windows fork — stage 1 catch-up toward v6.x parity** (bash unchanged; the

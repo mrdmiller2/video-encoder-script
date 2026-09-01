@@ -1209,10 +1209,21 @@ av1_source_reencode_sample_decision() {
   return 0
 }
 
-vmaf_model_for_source() {
-  local h
+# UHD detection for the VMAF model/target. Height alone misses ultrawide 4K
+# (2.40:1 masters are 3840x1600 / 3840x1608 -- height exactly 1600, which
+# `-gt 1600` skipped, so The Dark Tower got the 1080p neg model on native
+# 3840px frames and the CRF search couldn't converge, VMAF ~81 at CRF 16).
+# Gate on width>=3456 (covers 3840 and DCI 4096, well above 2560px 1440p)
+# OR height>=1600.
+_source_is_uhd() {
+  local w h
+  w="$("${FFPROBE_CMD[@]}" -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 -- "$1" 2>/dev/null)"
   h="$(video_height "$1")"
-  if [ "${h:-0}" -gt 1600 ]; then
+  [ "${w:-0}" -ge 3456 ] || [ "${h:-0}" -ge 1600 ]
+}
+
+vmaf_model_for_source() {
+  if _source_is_uhd "$1"; then
     printf 'version=vmaf_4k_v0.6.1'
   else
     printf 'version=vmaf_v0.6.1neg'
@@ -1221,9 +1232,8 @@ vmaf_model_for_source() {
 
 vmaf_target_for_source() {
   local src="$1"
-  local h profile
-  h="$(video_height "$src")"
-  if [ "${h:-0}" -gt 1600 ]; then printf '%s' "$VMAF_TARGET_4K"; return; fi
+  local profile
+  if _source_is_uhd "$src"; then printf '%s' "$VMAF_TARGET_4K"; return; fi
   profile="$(profile_for_source "$src")" || return $?
   case "$profile" in
     wanime) printf '%s' "$VMAF_TARGET_WANIME" ;; anime) printf '%s' "$VMAF_TARGET_ANIME" ;;
