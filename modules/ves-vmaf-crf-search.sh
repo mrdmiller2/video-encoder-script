@@ -1275,9 +1275,11 @@ _vmaf_score_one() {  # clip crf codec model profile target_height
       svtp="$(profile_svt_params "$profile")"
       run_ffmpeg_validation -y -v error -i "$clip" "${encode_filter[@]}" -c:v libsvtav1 -preset "$SVT_PRESET_SEARCH" -crf "$crf" \
         -pix_fmt yuv420p10le -svtav1-params "$svtp" -an "$out" 2>/dev/null || return 1
-      if svtav1_profile_uses_grain_synthesis "$profile"; then
-        grain_decode_flag=(-export_side_data film_grain)
-      fi
+      # Score grain-ON (was grain-stripped via -export_side_data film_grain).
+      # Grain-off-vs-grainy-source penalises a difference undone at playback;
+      # grain-on-vs-grainy is the honest comparison. Suppressed grain-profile
+      # ceilings by 1-3 VMAF. Clips are frame-aligned by extraction + setpts.
+      : # grain_decode_flag intentionally left empty for grain profiles too
       ;;
     hevc)
       x265p="$(profile_x265_params "$profile")"

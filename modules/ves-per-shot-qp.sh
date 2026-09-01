@@ -156,7 +156,15 @@ _vmaf_score_shot() {
       [ -s "$out" ] || { rm -rf "$work"; return 1; }
       out_mkv="$work/shot-enc-$qp.mkv"
       run_ffmpeg_validation -y -v error -i "$out" -c copy "$out_mkv" 2>/dev/null || { rm -rf "$work"; return 1; }
-      svtav1_profile_uses_grain_synthesis "$profile" && grain_decode_flag=(-export_side_data film_grain)
+      # NOT grain-stripped (was: -export_side_data film_grain). Decoding the
+      # AV1 grain-free and comparing to the grainy source penalises a
+      # difference that does not exist in playback (the decoder re-synthesises
+      # grain), which suppressed the per-shot ceiling on grain profiles by
+      # 1-3 VMAF (Conan per-shot A 91.2 vs its low-CRF base 92.6). Score
+      # grain-on: synth-grain vs source-grain, which is the honest playback
+      # comparison. The matched extracted clips are already frame-aligned by
+      # the -ss extraction + the setpts=PTS-STARTPTS below.
+      : # grain_decode_flag intentionally left empty
       ;;
     *) rm -rf "$work"; return 1 ;;
   esac

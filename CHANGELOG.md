@@ -4,6 +4,32 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.1A — 2026-08-31 (branch `6.x-chunk-redesign`)
+
+**Per-shot QP / CRF search: score grain-ON, not grain-stripped.**
+`_vmaf_score_shot()` and `_vmaf_score_one()` decoded the candidate AV1 with
+`-export_side_data film_grain` (grain suppressed) and compared it to the
+**grainy source** for the grain-synthesis profiles (`vintage` `classic`
+`anime` `vtv`). That penalises a difference that does not exist in playback —
+the real decoder re-synthesises grain — so VMAF hammered the "missing" grain
+layer and the search picked QPs 1-3 VMAF lower than warranted. Live evidence
+from the D-validation survey: Conan's per-shot ceiling came out at VMAF 91.2
+while its own low-CRF `base` scored 92.6, i.e. the search targeting 94/shot
+landed at 91 pooled.
+
+Now both functions decode the AV1 normally (synthetic grain applied) and
+compare grainy-output vs grainy-source — the honest playback comparison.
+There is a small residual (synthetic grain ≠ source grain pixel-for-pixel,
+and VMAF isn't fully grain-invariant, ~1-3 pts) but that is real signal, not
+a measurement artefact of removing grain we immediately add back. The
+matched extracted clips are already frame-aligned by the `-ss` extraction +
+`setpts=PTS-STARTPTS`, so no fps normalisation is needed here (unlike the
+whole-file `score_mkv` path, which handles broken-DTS sources).
+
+Effect: grain-profile per-shot searches must be re-run — their samples were
+biased toward over-spending. `canime` / `wanim` (no grain synthesis) and the
+clean live-action / western-animation profiles are unaffected.
+
 ## v6.0.0Z — 2026-08-31 (branch `6.x-chunk-redesign`)
 
 **Fleet scratch cleanup — stop `kill -9` orphans from filling tmpfs.** The
