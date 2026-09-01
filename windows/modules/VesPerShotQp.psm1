@@ -591,13 +591,19 @@ function Get-VesVmafScoreShot {
         }
 
         # Grain-ON: grain_decode_flag intentionally empty (v6.0.1A).
-        $vlog = "$out.vmaf.json"
+        # log_path must be a BARE filename with the process CWD set to $work --
+        # a Windows drive-letter path (C:\...) breaks ffmpeg's `:`-delimited
+        # filter-option parser, and `C\:/...` colon-escaping also fails on
+        # current ffmpeg builds (VesVmafCrfSearch.psm1's 2026-08-05 fix,
+        # verified on PRINCE).
+        $vlogName = "shot-$Qp.vmaf.json"
+        $vlog = Join-Path $work $vlogName
         $nThreads = [Environment]::ProcessorCount
-        $lavfi = "[0:v]setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]setpts=PTS-STARTPTS,format=yuv420p10le[r];[d][r]libvmaf=model=${Model}:n_threads=${nThreads}:log_fmt=json:log_path=$vlog"
+        $lavfi = "[0:v]setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]setpts=PTS-STARTPTS,format=yuv420p10le[r];[d][r]libvmaf=model=${Model}:n_threads=${nThreads}:log_fmt=json:log_path=$vlogName"
         $vmafRun = Invoke-VesWithTimeoutRetry -FilePath $FfmpegPath -ArgumentList @(
             '-y', '-v', 'error', '-i', $outMkv, '-i', $clip,
             '-lavfi', $lavfi, '-f', 'null', '-'
-        ) -TimeoutSeconds $encTimeout -MaxRetries 1
+        ) -TimeoutSeconds $encTimeout -MaxRetries 1 -WorkingDirectory $work
         if ($vmafRun.TimedOut -or $vmafRun.ExitCode -ne 0) { return $null }
         if (-not (Test-Path -LiteralPath $vlog)) { return $null }
 

@@ -9,7 +9,11 @@ function Invoke-VesWithTimeoutRetry {
         [Parameter(Mandatory)][string]$FilePath,
         [Parameter(Mandatory)][string[]]$ArgumentList,
         [Parameter(Mandatory)][int]$TimeoutSeconds,
-        [int]$MaxRetries = 2
+        [int]$MaxRetries = 2,
+        # Set the child process CWD. Needed by callers that pass a bare
+        # filename to ffmpeg's libvmaf log_path= to dodge the Windows
+        # drive-letter-colon filter-parse bug (see VesVmafCrfSearch.psm1).
+        [string]$WorkingDirectory
     )
 
     # Two Windows-specific pitfalls found via direct testing on ELVIS
@@ -45,6 +49,7 @@ function Invoke-VesWithTimeoutRetry {
         $psi.RedirectStandardError = $true
         $psi.UseShellExecute = $false
         $psi.CreateNoWindow = $true
+        if ($WorkingDirectory) { $psi.WorkingDirectory = $WorkingDirectory }
 
         $proc = New-Object System.Diagnostics.Process
         $proc.StartInfo = $psi
