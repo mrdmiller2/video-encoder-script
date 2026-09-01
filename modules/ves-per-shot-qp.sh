@@ -149,7 +149,10 @@ _vmaf_score_shot() {
       nframes="$("${FFPROBE_CMD[@]}" -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of csv=p=0 "$clip" 2>/dev/null)"
       [[ "$nframes" =~ ^[0-9]+$ ]] && [ "$nframes" -gt 0 ] || { rm -rf "$work"; return 1; }
       qpfile="$work/uniform-$qp.qp"
-      yes "$qp" 2>/dev/null | head -n "$nframes" > "$qpfile"
+      # awk generator, not `yes | head`: under `set -o pipefail` (production
+      # convert.sh) the SIGPIPE that stops `yes` makes the pipeline non-zero,
+      # which aborts a bare `result="$(resolve_per_shot_qp ...)"` assignment.
+      awk -v q="$qp" -v n="$nframes" 'BEGIN{ while (n-- > 0) print q }' > "$qpfile"
       out="$work/shot-enc-$qp.ivf"
       _run_timeout_retry "$enc_timeout" "${SVTAV1ENCAPP_CMD[@]}" -i "$y4m" --use-q-file 1 --qpfile "$qpfile" \
         --svtav1-params "${svtp}:rc=0" -b "$out" 2>/dev/null || { rm -rf "$work"; return 1; }
@@ -312,8 +315,12 @@ resolve_per_shot_qp() {
     for qp in $(printf '%s\n' "${!score[@]}" | sort -n); do
       if awk -v s="${score[$qp]}" -v t="$target" 'BEGIN{exit !(s>=t)}'; then above="$qp"; else below="$qp"; break; fi
     done
-    if [ -z "$above" ]; then _probe_qp "$qp_lo" || break; continue; fi
-    if [ -z "$below" ]; then _probe_qp "$qp_hi" || break; continue; fi
+    # Nothing meets target even at qp_lo (or everything meets it even at
+    # qp_hi): the bound is already probed, so re-probing is a cache-hit no-op
+    # that just burns the remaining iterations. Stop -- the (B) window
+    # extension below probes past the bound to give the allocator a real
+    # rate-distortion curve.
+    if [ -z "$above" ] || [ -z "$below" ]; then break; fi
     gap=$(( below - above )); [ "$gap" -le 1 ] && break
     local next_qp
     next_qp="$(_interp_qp "$above" "${score[$above]}" "$below" "${score[$below]}" "$target")"
@@ -717,29 +724,50 @@ shot_release_claim() {
 # system-level fleet-scratch-reaper is the backstop; this keeps it tidy in
 # the common case without waiting for the 10-min timer.
 _shot_scratch_sweep() {
-  local base="${RAMDISK_JOB_DIR:-${TMPDIR:-/tmp}}" d
+  local base="${RAMDISK_JOB_DIR:-${TMPDIR:-/tmp}}" d age
+  # Only the SIGKILL-orphan case -- _vmaf_score_shot rm -rf's its own dir on
+  # every normal/error exit. A LIVE shot search legitimately runs for hours
+  # (grain / 4K / long takes) and its scratch can sit write-quiet during a
+  # long VMAF read, so a short mtime window would delete a sibling worker's
+  # in-flight scratch on a multi-worker host. Gate on the same staleness
+  # ceiling as a dead lock (SHOT_SEARCH_STALE_SECS): a scratch dir older than
+  # that with nothing recently touched is a dead worker's. The 10-min
+  # system fleet-scratch-reaper (with its own busy-detection) covers the
+  # in-between window.
+  local ceil="${SHOT_SEARCH_STALE_SECS:-25200}"
   for d in "$base"/ves-shotqp-* "$base"/ves-crf-* "$base"/ves-vmaf-* "$base"/ves-oldenh-*; do
     [ -e "$d" ] || continue
-    # anything under it modified in the last 20 min -> still in use
-    [ -n "$(find "$d" -mmin -20 -print -quit 2>/dev/null)" ] && continue
+    age="$(_shot_path_mtime "$d")"; [ -n "$age" ] || continue
+    [ "$(( $(date +%s) - age ))" -gt "$ceil" ] || continue
+    [ -n "$(find "$d" -mmin -60 -print -quit 2>/dev/null)" ] && continue
     command -v fuser >/dev/null 2>&1 && fuser -s -- "$d" 2>/dev/null && continue
-    rm -rf -- "$d" 2>/dev/null && echo "shot-search: swept stale scratch $d"
+    rm -rf -- "$d" 2>/dev/null && echo "shot-search: swept dead-worker scratch $d"
   done
 }
 
 shot_search_worker_loop() {
-  local src="$1" max_shots="${2:-99999}" max_idle_secs="${3:-2700}"
-  local count=0 idle=0 idx retry_wait="${SHOT_SEARCH_RETRY_WAIT:-60}"
+  local src="$1" max_shots="${2:-99999}"
+  # Idle ceiling MUST exceed SHOT_SEARCH_STALE_SECS (default 25200s / 7h) or a
+  # worker gives up long before a dead peer's lock becomes reclaimable, and
+  # the search wedges again (the v6.0.0Y failure). Default = stale ceiling +
+  # a couple retry intervals so at least one worker is guaranteed alive to
+  # perform the reclaim.
+  local retry_wait="${SHOT_SEARCH_RETRY_WAIT:-60}"
+  local max_idle_secs="${3:-$(( ${SHOT_SEARCH_STALE_SECS:-25200} + retry_wait * 3 ))}"
+  local count=0 idle=0 idx rc
   _shot_scratch_sweep
   while [ "$count" -lt "$max_shots" ]; do
     idx="$(shot_claim_next "$src")"
     if [ -n "$idx" ]; then
       idle=0
       echo "claimed shot $idx"
-      shot_search_claimed "$src" "$idx"
-      echo "resolved shot $idx"
+      shot_search_claimed "$src" "$idx"; rc=$?
+      if [ "$rc" -eq 0 ]; then
+        echo "resolved shot $idx"; count=$((count + 1))
+      else
+        warn "shot-search: shot $idx did not resolve (rc=$rc) -- will retry"
+      fi
       _shot_scratch_sweep
-      count=$((count + 1))
       continue
     fi
     if shot_manifest_all_resolved "$src"; then
@@ -944,19 +972,27 @@ assemble_qpfile_via_equal_slope() {
     local status_file samples_line
     status_file="$mdir/shot-$(printf '%03d' "$idx").status"
     samples_line="$(awk -F= '/^samples=/{print substr($0,index($0,"=")+1); exit}' "$status_file")"
-    if [ -z "$samples_line" ]; then
-      no_sample_idx+=("$idx")
-      continue
+    local _valid=0
+    : >"$samples_flat.tmp"
+    if [ -n "$samples_line" ]; then
+      local IFS=,; local -a parts=($samples_line); unset IFS
+      local p
+      for p in "${parts[@]}"; do
+        [ -n "$p" ] || continue
+        local IFS=:; local -a triple=($p); unset IFS
+        { [ "${#triple[@]}" -eq 3 ] && [[ "${triple[0]}${triple[1]}${triple[2]}" =~ [0-9] ]]; } || continue
+        printf '%s %s %s %s\n' "$idx" "${triple[0]}" "${triple[1]}" "${triple[2]}" >>"$samples_flat.tmp"
+        _valid=$((_valid + 1))
+      done
+    fi
+    # empty OR non-empty-but-unparseable -> fixed-QP fallback shot, not a
+    # hole in the qpfile (a shot in durations_flat with no sample rows gets
+    # no pick from the solve and would be dropped from the output).
+    if [ "$_valid" -eq 0 ]; then
+      no_sample_idx+=("$idx"); rm -f "$samples_flat.tmp"; continue
     fi
     printf '%s %s %s\n' "$idx" "$start_ts" "$end_ts" >>"$durations_flat"
-    local IFS=,; local -a parts=($samples_line); unset IFS
-    local p
-    for p in "${parts[@]}"; do
-      [ -n "$p" ] || continue
-      local IFS=:; local -a triple=($p); unset IFS
-      [ "${#triple[@]}" -eq 3 ] || continue
-      printf '%s %s %s %s\n' "$idx" "${triple[0]}" "${triple[1]}" "${triple[2]}" >>"$samples_flat"
-    done
+    cat "$samples_flat.tmp" >>"$samples_flat"; rm -f "$samples_flat.tmp"
   done
 
   local qp_lines
@@ -1105,6 +1141,8 @@ assemble_qpfile_via_equal_slope_budget() {
   # same per-source figure the per-shot search aimed at.
   local _pst_target _floor_drop _pin_rounds
   _pst_target="$(vmaf_target_for_source "$src" 2>/dev/null)" || _pst_target=94
+  # guard empty stdout (unknown profile / empty VMAF_TARGET_*), not just rc
+  [[ "$_pst_target" =~ ^[0-9]+(\.[0-9]+)?$ ]] || _pst_target=94
   _floor_drop="${ALLOC_MIN_SHOT_VMAF_DROP:-0}"
   _pin_rounds="${ALLOC_MIN_SHOT_PIN_ROUNDS:-4}"
 
@@ -1128,14 +1166,15 @@ assemble_qpfile_via_equal_slope_budget() {
   if awk -v b="$byte_budget" 'BEGIN{exit !(b+0 > 0 && b+0 <= 4)}'; then
     _budget_mode="fraction"
     local _baseline
+    local _pst_num; _pst_num="$(awk -v x="$_pst_target" 'BEGIN{printf "%.4f", x+0}')"
     _baseline="$(for st in "$mdir"/shot-*.status; do
-      awk -F= '/^samples=/{
-        line=substr($0,index($0,"=")+1); nf=split(line,a,","); best=-1; bb=0
-        for(i=1;i<=nf;i++){ n=split(a[i],t,":"); if(n==3 && t[2]+0 >= '"$_pst_target"' && t[1]+0 > best){best=t[1]+0; bb=t[3]+0} }
+      awk -F= -v pst="$_pst_num" '/^samples=/{
+        line=substr($0,index($0,"=")+1); nf=split(line,a,","); best=-1; bb=0; bv=""
+        for(i=1;i<=nf;i++){ n=split(a[i],t,":"); if(n==3 && t[2]+0 >= pst && t[1]+0 > best){best=t[1]+0; bb=t[3]+0} }
         if(best<0){ for(i=1;i<=nf;i++){ n=split(a[i],t,":"); if(n==3){bv=(bv==""?t[2]+0:bv); if(t[2]+0>=bv){bv=t[2]+0; bb=t[3]+0}} } }
         print bb
       }' "$st"
-    done | awk '{s+=$1} END{printf "%.0f", s}')"
+    done | awk '{s+=$1} END{printf "%.0f", s+0}')"
     byte_budget="$(awk -v f="$byte_budget" -v base="$_baseline" 'BEGIN{printf "%.0f", f*base}')"
     log_err "  equal-slope budget: fraction mode -> baseline=${_baseline} B, budget=${byte_budget} B"
   else
@@ -1158,20 +1197,40 @@ assemble_qpfile_via_equal_slope_budget() {
     local status_file samples_line
     status_file="$mdir/shot-$(printf '%03d' "$idx").status"
     samples_line="$(awk -F= '/^samples=/{print substr($0,index($0,"=")+1); exit}' "$status_file")"
-    if [ -z "$samples_line" ]; then
-      no_sample_idx+=("$idx")
-      continue
+    local _valid=0
+    : >"$samples_flat.tmp"
+    if [ -n "$samples_line" ]; then
+      local IFS=,; local -a parts=($samples_line); unset IFS
+      local p
+      for p in "${parts[@]}"; do
+        [ -n "$p" ] || continue
+        local IFS=:; local -a triple=($p); unset IFS
+        { [ "${#triple[@]}" -eq 3 ] && [[ "${triple[0]}${triple[1]}${triple[2]}" =~ [0-9] ]]; } || continue
+        printf '%s %s %s %s\n' "$idx" "${triple[0]}" "${triple[1]}" "${triple[2]}" >>"$samples_flat.tmp"
+        _valid=$((_valid + 1))
+      done
+    fi
+    # empty OR non-empty-but-unparseable -> fixed-QP fallback shot, not a
+    # hole in the qpfile (a shot in durations_flat with no sample rows gets
+    # no pick from the solve and would be dropped from the output).
+    if [ "$_valid" -eq 0 ]; then
+      no_sample_idx+=("$idx"); rm -f "$samples_flat.tmp"; continue
     fi
     printf '%s %s %s\n' "$idx" "$start_ts" "$end_ts" >>"$durations_flat"
-    local IFS=,; local -a parts=($samples_line); unset IFS
-    local p
-    for p in "${parts[@]}"; do
-      [ -n "$p" ] || continue
-      local IFS=:; local -a triple=($p); unset IFS
-      [ "${#triple[@]}" -eq 3 ] || continue
-      printf '%s %s %s %s\n' "$idx" "${triple[0]}" "${triple[1]}" "${triple[2]}" >>"$samples_flat"
-    done
+    cat "$samples_flat.tmp" >>"$samples_flat"; rm -f "$samples_flat.tmp"
   done
+
+  # Reserve budget for the fixed-QP fallback shots (search_failed / no
+  # sample): they are encoded but never enter the equal-slope solve, so the
+  # solve would allocate the FULL budget to the solvable shots and the final
+  # encode overruns. Reserve their proportional duration share.
+  local _n_total="$(ls "$mdir"/shot-*.meta 2>/dev/null | wc -l)"
+  local _n_fb="${#no_sample_idx[@]}"
+  if [ "$_n_fb" -gt 0 ] && [ "${_n_total:-0}" -gt "$_n_fb" ]; then
+    byte_budget="$(awk -v b="$byte_budget" -v nf="$_n_fb" -v nt="$_n_total" \
+      'BEGIN{printf "%.0f", b * (nt - nf) / nt}')"
+    log_err "  equal-slope budget: reserved for $_n_fb/$_n_total fallback shots -> solve budget=${byte_budget} B"
+  fi
 
   local qp_lines
   qp_lines="$(awk -v budget="$byte_budget" -v durations_file="$durations_flat" \
@@ -1285,11 +1344,22 @@ assemble_qpfile_via_equal_slope_budget() {
           min_body_vmaf = best_vmaf[idx]; min_body_idx = idx
         }
       }
-      printf "LAMBDA=%.10g TOTAL_BYTES=%d BUDGET=%d MIN_SHOT_VMAF=%.2f (shot %s) MIN_BODY_VMAF=%.2f (shot %s) POS_WEIGHTED_SHOTS=%d FLOOR_PINNED=%d (floor %.1f)\n", lambda, total_bytes, budget, min_vmaf, min_idx, min_body_vmaf, min_body_idx, weighted_n, pin_added_total, floor_v > "/dev/stderr"
+      over_pct = (budget > 0) ? (100.0 * (total_bytes - budget) / budget) : 0
+      printf "LAMBDA=%.10g TOTAL_BYTES=%d BUDGET=%d OVERSHOOT_PCT=%.1f MIN_SHOT_VMAF=%.2f (shot %s) MIN_BODY_VMAF=%.2f (shot %s) POS_WEIGHTED_SHOTS=%d FLOOR_PINNED=%d (floor %.1f)\n", lambda, total_bytes, budget, over_pct, min_vmaf, min_idx, min_body_vmaf, min_body_idx, weighted_n, pin_added_total, floor_v > "/dev/stderr"
       for (idx in best_qp) printf "%s %s %s\n", idx, best_qp[idx], best_vmaf[idx]
     }
-  ' "$samples_flat")" || { rm -f "$samples_flat" "$durations_flat"; return 1; }
-  rm -f "$samples_flat" "$durations_flat"
+  ' "$samples_flat" 2>"$samples_flat.rpt")" || { rm -f "$samples_flat" "$samples_flat.rpt" "$durations_flat"; return 1; }
+  cat "$samples_flat.rpt" >&2
+  # BUDGET_UNREACHABLE: the equal-slope solve + floor pins can overspend a
+  # very tight budget (all hard shots pinned to their best sample, nothing
+  # left to trade). The qpfile is still the best allocation under the floor
+  # constraint, just larger than requested -- warn loudly, don't fail.
+  local _ov
+  _ov="$(awk '/OVERSHOOT_PCT=/{for(i=1;i<=NF;i++) if($i ~ /^OVERSHOOT_PCT=/){sub(/OVERSHOOT_PCT=/,"",$i); print $i}}' "$samples_flat.rpt")"
+  if [ -n "$_ov" ] && awk -v o="$_ov" 'BEGIN{exit !(o+0 > 10)}'; then
+    log_err "  equal-slope budget: BUDGET_UNREACHABLE -- solve overshoots by ${_ov}% (floor pins + tight budget); qpfile is the constrained best, not the requested size"
+  fi
+  rm -f "$samples_flat" "$samples_flat.rpt" "$durations_flat"
 
   local line
   while IFS=' ' read -r idx qp vmaf; do

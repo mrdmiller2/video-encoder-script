@@ -4,6 +4,46 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.1B — 2026-08-31 (branch `6.x-chunk-redesign`)
+
+**Allocator / shot-search hardening from the Codex + Cursor review of
+v6.0.0V–6.0.1A** (advisory gate, `feedback_multi_tool_review_gate`). Both
+reviewers independently flagged the same top items.
+
+- **Worker idle ceiling < stale-lock ceiling (undermined v6.0.0Y).**
+  `SHOT_SEARCH_STALE_SECS` is 25200s (7h — legitimate for long/4K shots) but
+  `shot_search_worker_loop`'s `max_idle_secs` defaulted to 2700s, so every
+  worker gave up 6+ hours before a dead peer's lock could be reclaimed — the
+  exact wedge v6.0.0Y fixed. Default is now `SHOT_SEARCH_STALE_SECS + 3×retry`.
+- **`_shot_scratch_sweep` could delete a live sibling worker's scratch.**
+  20-min quiescence window vs multi-hour legitimate shot searches on
+  4-worker hosts. Now gated on the stale-lock ceiling + 60-min quiescence +
+  `fuser` — only a genuinely dead worker's scratch. The 10-min system
+  `fleet-scratch-reaper` (with its own busy-detection) covers the middle.
+- **`yes "$qp" | head` SIGPIPE aborts under `set -o pipefail`** (production
+  `convert.sh`). Replaced with an `awk` generator.
+- **FRACTION-mode baseline: `$_pst_target` spliced into awk source** →
+  empty/malformed value made an awk syntax error → budget 0 → min-quality
+  qpfile. Now `[[ =~ ^[0-9.]+$ ]] || =94` guard + passed via `-v`.
+- **Budget unreachable after floor pins was silent.** Emits
+  `OVERSHOOT_PCT=` in the report and a loud `BUDGET_UNREACHABLE` log when
+  >10%; qpfile is still the constrained best (not failed).
+- **`search_failed` fallback shots weren't reserved in the budget** → the
+  solve gave the full budget to the solvable shots and the encode overran.
+  Now reserves their proportional share.
+- **Non-empty-but-unparseable `samples=` → hole in the qpfile** (shot in
+  `durations_flat`, no sample rows, dropped from the solve output). Now
+  treated as a fixed-QP fallback shot like an empty line.
+- **Refinement loop no-op:** when nothing meets target at `qp_lo` (or
+  everything meets it at `qp_hi`) the loop re-probed an already-cached bound
+  and burned all 3 iterations. Now breaks and lets the (B) window extension
+  probe past the bound.
+- **Worker loop counted a failed `shot_search_claimed` as resolved.** Now
+  checks the return code.
+- **`_old_enhance_score` still grain-stripped** (missed by v6.0.1A) — the
+  old-title A/B gate scored on a different metric than the search/encode.
+  Fixed to grain-on.
+
 ## v6.0.1A — 2026-08-31 (branch `6.x-chunk-redesign`)
 
 **Per-shot QP / CRF search: score grain-ON, not grain-stripped.**

@@ -74,9 +74,10 @@ _old_enhance_score() {
     -svtav1-params "${svtp}" "$out" 2>/dev/null || { rm -rf "$work"; return 1; }
   [ -s "$out" ] || { rm -rf "$work"; return 1; }
   run_ffmpeg_validation -y -v error -i "$out" -c copy "$omkv" 2>/dev/null || { rm -rf "$work"; return 1; }
-  local gdf=()
-  printf '%s' "$svtp" | grep -q 'film-grain=[1-9]' && gdf=(-export_side_data film_grain)
-  run_ffmpeg_validation -y -v error "${gdf[@]}" -i "$omkv" -i "$clip" -lavfi \
+  # Score grain-ON, consistent with _vmaf_score_shot / _vmaf_score_one
+  # (v6.0.1A): grain-off-vs-grainy penalises grain we re-synthesise at
+  # playback and would make this A/B reject a genuinely better grain profile.
+  run_ffmpeg_validation -y -v error -i "$omkv" -i "$clip" -lavfi \
     "[0:v]setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]setpts=PTS-STARTPTS,format=yuv420p10le[r];[d][r]libvmaf=model=${model}:n_threads=$(nproc 2>/dev/null || echo 4):log_fmt=json:log_path=${vlog}" \
     -f null - 2>/dev/null || { rm -rf "$work"; return 1; }
   local v b
