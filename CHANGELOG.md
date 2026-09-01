@@ -4,6 +4,23 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.1C — 2026-08-31 (branch `6.x-chunk-redesign`)
+
+**Remaining Medium/Low items from the Codex + Cursor review.**
+
+- **Crossover probe: `[ range ] && _probe_qp || true` conflated
+  "out of range" with "probe failed"** — an encode failure looked like a
+  skip. Split: probe only when in range, a failed probe warns (non-fatal).
+- `SHOT_SEARCH_STALE_SECS` inline fallback default was `1800` in three
+  places, diverging from the config default `25200`. Aligned.
+- Stale comments citing "1800s" for the shot-claim staleness ceiling and
+  claiming the manifest-build ceiling "matches" it — corrected to name
+  `SHOT_SEARCH_STALE_SECS` and explain why the manifest build keeps 1800.
+- `_vmaf_score_one` header still documented the removed grain-strip —
+  updated to grain-ON (v6.0.1A).
+- `pin_rounds` loop bound `<= N` documented (round 0 = initial solve, then
+  N pin+re-solve passes).
+
 ## v6.0.1B — 2026-08-31 (branch `6.x-chunk-redesign`)
 
 **Allocator / shot-search hardening from the Codex + Cursor review of

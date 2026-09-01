@@ -1242,11 +1242,11 @@ fixed_crf_for() {
 # v5.0.29: encodes the probe with the SAME profile-specific svtav1-params /
 # x265-params the final encode will use (via svtav1_profile_extras), not just
 # base params -- otherwise the CRF chosen here doesn't reflect what film-grain
-# synthesis/variance-boost/etc actually cost in the real encode. For profiles
-# with real AV1 film-grain synthesis, also decodes the probe with
-# -export_side_data film_grain so libvmaf scores the true encoded quality
-# rather than being corrupted by pseudo-random, source-misaligned synthesized
-# grain (see svtav1_profile_uses_grain_synthesis).
+# synthesis/variance-boost/etc actually cost in the real encode. As of
+# v6.0.1A the probe is decoded grain-ON (grain applied) and compared to the
+# grainy source -- the honest playback comparison. It used to strip grain
+# (-export_side_data film_grain), but grain-off-vs-grainy penalises grain the
+# real decoder re-synthesises, which suppressed grain-profile CRFs 1-3 VMAF.
 _vmaf_score_one() {  # clip crf codec model profile target_height
   local clip="$1" crf="$2" codec="$3" model="$4"
   local profile="$5" target_height="${6:-0}"

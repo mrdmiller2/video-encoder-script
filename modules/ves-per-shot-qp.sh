@@ -379,8 +379,18 @@ resolve_per_shot_qp() {
     fi
     if [ -n "$_center" ]; then
       for _d in $(seq 1 "$PER_SHOT_QP_CROSSOVER_PROBES"); do
-        _c=$(( _center - _d )); [ "$_c" -ge "$PER_SHOT_QP_EXTEND_FLOOR" ] && _probe_qp "$_c" 2>/dev/null || true
-        _c=$(( _center + _d )); [ "$_c" -le "$PER_SHOT_QP_EXTEND_CEIL" ] && _probe_qp "$_c" 2>/dev/null || true
+        # `[ range ] && _probe_qp || true` conflated "out of range" with
+        # "probe failed" -- an encode failure looked like a skip. Split them:
+        # only probe when in range, and let a probe failure be non-fatal but
+        # visible.
+        _c=$(( _center - _d ))
+        if [ "$_c" -ge "$PER_SHOT_QP_EXTEND_FLOOR" ]; then
+          _probe_qp "$_c" || warn "per-shot crossover probe qp=$_c failed (non-fatal)"
+        fi
+        _c=$(( _center + _d ))
+        if [ "$_c" -le "$PER_SHOT_QP_EXTEND_CEIL" ]; then
+          _probe_qp "$_c" || warn "per-shot crossover probe qp=$_c failed (non-fatal)"
+        fi
       done
     fi
   fi
@@ -547,9 +557,10 @@ shot_split_create_manifest() {
     # writes .complete, leaving an empty mdir that silently blocks every
     # future attempt forever. Found live 2026-08-27: a killed foreground
     # run left exactly this state and permanently return-1'd this
-    # function for that title. Same 1800s ceiling as shot_claim_next()'s
-    # own staleness reclaim -- a manifest build still incomplete past
-    # that is almost certainly a dead builder, not slow-but-alive work.
+    # A manifest build (scene-detect decode only, no encoding) is far
+    # faster than a per-shot search, so it keeps the tighter 1800s ceiling
+    # rather than shot_claim_next()'s multi-hour SHOT_SEARCH_STALE_SECS --
+    # incomplete past 30min is almost certainly a dead builder.
     local mdir_age
     mdir_age=$(( $(date +%s) - $(stat -c%Y -- "$mdir" 2>/dev/null || stat -f%m -- "$mdir" 2>/dev/null || echo 0) ))
     if [ -d "$mdir" ] && [ ! -f "$mdir/.complete" ] && [ "$mdir_age" -gt 1800 ]; then
@@ -636,12 +647,13 @@ EOF
 # on stdout and returns 0, or returns 1 if none are available (caller
 # should move on, same contract as chunk_claim_next()). Identical
 # mkdir-lock + mv-based-stale-reclaim shape -- see chunk_claim_next()'s
-# own comments for why. Staleness ceiling is deliberately much shorter
-# than chunk-encode's 7200s: a shot's bounded QP search (a handful of
-# short sample encodes) should finish in minutes, confirmed live
-# 2026-08-24 (~3-9 min for a single shot including VMAF measurement), not
-# hours -- a search still "claimed" past 1800s is almost certainly a dead
-# worker, not slow-but-alive work.
+# own comments for why. Staleness ceiling = SHOT_SEARCH_STALE_SECS (default
+# 25200s / 7h, ves-config.sh): a single shot's bounded QP search is minutes
+# on short 1080p content but can genuinely run hours on 4K, heavy grain, or
+# a long uninterrupted take (many candidate encodes + full VMAF each), so
+# the ceiling is set well above the worst legitimate case -- past it, the
+# owner is almost certainly dead. shot_search_worker_loop's idle timeout is
+# kept above this so a live worker is always around to do the reclaim.
 shot_claim_next() {
   local src="$1" this_host
   local mdir f idx lockdir status_file reclaim_name
@@ -680,7 +692,7 @@ EOF
     [ -n "$mtime" ] || mtime="$(_shot_path_mtime "$lockdir")"
     now="$(date +%s)"
     if [ -n "$mtime" ]; then age=$(( now - mtime )); else age=0; fi
-    if [ -n "$mtime" ] && [ "$age" -gt "${SHOT_SEARCH_STALE_SECS:-1800}" ]; then
+    if [ -n "$mtime" ] && [ "$age" -gt "${SHOT_SEARCH_STALE_SECS:-25200}" ]; then
       # Steal it: rename aside (needs only parent-dir write -- works across
       # this NFS's root-squash idmap, where rm of a foreign-owned owner.meta
       # gets EPERM), then re-create. A renamed orphan that rm can't remove is
@@ -1310,6 +1322,8 @@ assemble_qpfile_via_equal_slope_budget() {
       # (they exist to absorb loss). Pinning can only tighten lambda on the
       # remaining shots, so it converges in a few rounds; if the budget is so
       # tight even all-pinned overspends, we stop and just report it.
+      # round 0 is the initial solve; ALLOC_MIN_SHOT_PIN_ROUNDS is the number
+      # of *pin+re-solve* passes after that, hence <= (N+1 solves total).
       pin_added_total = 0
       for (round = 0; round <= (pin_rounds + 0); round++) {
         lo = 1e-12; hi = 1.0
