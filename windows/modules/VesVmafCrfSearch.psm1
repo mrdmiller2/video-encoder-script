@@ -193,20 +193,76 @@ function Get-VesVideoHeight {
     return $h
 }
 
+function Get-VesVideoWidth {
+    param([Parameter(Mandatory)][string]$Source, [Parameter(Mandatory)][string]$FfprobePath, [int]$TimeoutSeconds = 30)
+    $a = @('-v','error','-select_streams','v:0','-show_entries','stream=width','-of','default=noprint_wrappers=1:nokey=1',$Source)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $FfprobePath
+    foreach ($x in $a) { $psi.ArgumentList.Add($x) }
+    $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false
+    $p = [System.Diagnostics.Process]::Start($psi)
+    $t = $p.StandardOutput.ReadToEndAsync()
+    if (-not $p.WaitForExit($TimeoutSeconds * 1000)) { try { $p.Kill($true) } catch {}; $p.WaitForExit(); return 0 }
+    $t.Wait(); $w = 0; [int]::TryParse($t.Result.Trim(), [ref]$w) | Out-Null; return $w
+}
+
+function Test-VesSourceIsUhd {
+    <#
+    .SYNOPSIS
+    Port of bash _source_is_uhd() (v6.0.1E). Height alone misses 2.40:1 4K
+    masters (3840x1600 / 3840x1608 -- height exactly 1600). Gate on
+    width >= 3456 (covers 3840 + DCI 4096, clear of 2560px 1440p) OR height >= 1600.
+    #>
+    param([Parameter(Mandatory)][string]$Source, [Parameter(Mandatory)][string]$FfprobePath)
+    $w = Get-VesVideoWidth  -Source $Source -FfprobePath $FfprobePath
+    $h = Get-VesVideoHeight -Source $Source -FfprobePath $FfprobePath
+    return ($w -ge 3456 -or $h -ge 1600)
+}
+
 function Get-VesVmafModelForSource {
     <#
     .SYNOPSIS
-    Port of vmaf_model_for_source(). 4K sources use the 4K-tuned model.
+    Port of vmaf_model_for_source(). UHD sources use the 4K-tuned model.
     #>
     param(
         [Parameter(Mandatory)][string]$Source,
         [Parameter(Mandatory)][string]$FfprobePath
     )
-    $height = Get-VesVideoHeight -Source $Source -FfprobePath $FfprobePath
-    if ($height -gt 1600) {
+    if (Test-VesSourceIsUhd -Source $Source -FfprobePath $FfprobePath) {
         return 'version=vmaf_4k_v0.6.1'
     }
     return 'version=vmaf_v0.6.1neg'
+}
+
+function Get-VesVmafTargetForSource {
+    <#
+    .SYNOPSIS
+    Port of vmaf_target_for_source(). UHD -> $VMAF_TARGET_4K (95); else the
+    per-profile target. Windows had used a single caller-supplied -VmafTarget
+    (default 90); this brings the target values to bash parity. Env overrides:
+    CONVERT_VMAF_TARGET_<PROFILE> / CONVERT_VMAF_TARGET_4K.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$FfprobePath,
+        [string]$Profile
+    )
+    if (Test-VesSourceIsUhd -Source $Source -FfprobePath $FfprobePath) {
+        return [double]($env:CONVERT_VMAF_TARGET_4K    ? $env:CONVERT_VMAF_TARGET_4K    : 95.0)
+    }
+    if (-not $Profile) { $Profile = Get-VesDetectedProfileForPath -Path $Source }
+    $def = 94.0
+    switch ($Profile) {
+        'canime'  { return [double]($env:CONVERT_VMAF_TARGET_CANIME  ? $env:CONVERT_VMAF_TARGET_CANIME  : 95.0) }
+        'anime'   { return [double]($env:CONVERT_VMAF_TARGET_ANIME   ? $env:CONVERT_VMAF_TARGET_ANIME   : $def) }
+        'wanime'  { return [double]($env:CONVERT_VMAF_TARGET_WANIME  ? $env:CONVERT_VMAF_TARGET_WANIME  : $def) }
+        'movies'  { return [double]($env:CONVERT_VMAF_TARGET         ? $env:CONVERT_VMAF_TARGET         : $def) }
+        'classic' { return [double]($env:CONVERT_VMAF_TARGET_CLASSIC ? $env:CONVERT_VMAF_TARGET_CLASSIC : $def) }
+        'vintage' { return [double]($env:CONVERT_VMAF_TARGET_VINTAGE ? $env:CONVERT_VMAF_TARGET_VINTAGE : $def) }
+        'mtv'     { return [double]($env:CONVERT_VMAF_TARGET_MTV     ? $env:CONVERT_VMAF_TARGET_MTV     : $def) }
+        'vtv'     { return [double]($env:CONVERT_VMAF_TARGET_VTV     ? $env:CONVERT_VMAF_TARGET_VTV     : $def) }
+        default   { return [double]$def }
+    }
 }
 
 function Invoke-VesVmafCrfSearchAbAv1 {
@@ -630,4 +686,4 @@ function Get-VesFinalVmaf {
     return [math]::Round($vsum / $n, 1)
 }
 
-Export-ModuleMember -Function Get-VesVideoHeight, Get-VesVmafModelForSource, Invoke-VesVmafCrfSearchAbAv1, Resolve-VesCrfForEncode, Test-VesSvtAv1Preset8Safe, Get-VesFinalVmaf
+Export-ModuleMember -Function Get-VesVideoHeight, Get-VesVideoWidth, Test-VesSourceIsUhd, Get-VesVmafTargetForSource, Get-VesVmafModelForSource, Invoke-VesVmafCrfSearchAbAv1, Resolve-VesCrfForEncode, Test-VesSvtAv1Preset8Safe, Get-VesFinalVmaf
