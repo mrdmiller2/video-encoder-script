@@ -105,18 +105,27 @@ discover_svtav1encapp() {
 # finds a same-size copy reuses it. The manifest / claims / status stay on
 # NFS -- only the read-heavy extraction source moves local.
 _stage_source_local() {
-  local src="$1" dir base dst want have
+  local src="$1" dir base dst want have h
   [ "${SHOT_SRC_LOCAL_STAGE:-true}" = "true" ] || { printf '%s' "$src"; return 0; }
   [ -f "$src" ] || { printf '%s' "$src"; return 0; }
   dir="${SHOT_SRC_LOCAL_STAGE_DIR:-/var/tmp/ves-srcstage}"
   mkdir -p "$dir" 2>/dev/null || { printf '%s' "$src"; return 0; }
-  # sweep stale stages (>24h) so a churn of titles can't fill the disk
-  find "$dir" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null
-  base="$(printf '%s' "$src" | tr -c 'A-Za-z0-9._-' '_')"
-  dst="$dir/$base"
+  # Stage filename = sanitized basename + a short hash of the FULL path, so two
+  # different sources can never collide onto one file (review 2026-09-02).
+  h="$(printf '%s' "$src" | { cksum 2>/dev/null || md5sum 2>/dev/null; } | tr -cd '0-9a-f' | cut -c1-10)"
+  base="$(basename -- "$src" | tr -c 'A-Za-z0-9._-' '_')"
+  dst="$dir/${h}_${base}"
   want="$(stat -c%s -- "$src" 2>/dev/null || echo 0)"
+  # Sweep stale stages (>48h -- a Phase-1 title search should finish well
+  # inside that) but NEVER the file we are about to hand back, and prefer
+  # atime so a long-lived worker that is still reading its stage keeps it.
+  find "$dir" -maxdepth 1 -type f ! -name "$(basename -- "$dst")" \
+       \( -atime +2 -o -mmin +2880 \) -delete 2>/dev/null
   have="$(stat -c%s -- "$dst" 2>/dev/null || echo 0)"
-  if [ "$want" -gt 0 ] && [ "$have" = "$want" ]; then printf '%s' "$dst"; return 0; fi
+  if [ "$want" -gt 0 ] && [ "$have" = "$want" ]; then
+    touch -a -- "$dst" 2>/dev/null   # mark in-use so the sweep spares it
+    printf '%s' "$dst"; return 0
+  fi
   # disk guard: need the file size + 10% headroom on the stage fs
   local free_kb
   free_kb="$(df -Pk "$dir" 2>/dev/null | awk 'NR==2{print $4}')"
@@ -231,6 +240,42 @@ _vmaf_score_shot() {
   printf '%s %s' "$v" "$b"
 }
 
+# Encode the WHOLE shot once at a fixed QP and print its byte size (no VMAF).
+# Used to de-bias multi-window byte estimates: 3 isolated 8s windows under
+# keyint=15s carry more I-frame overhead per second than one continuous
+# encode, so mean(window_bytes/sec)*shot_secs runs high -- and the bias is
+# title-composition-dependent, not constant, so it does not cancel in the
+# survey's fraction ratio (review 2026-09-02). One real full-shot encode at
+# the chosen QP anchors the byte scale.
+_shot_encode_bytes_only() {
+  local src="$1" start="$2" end="$3" qp="$4" codec="$5" profile="$6"
+  local work clip y4m out nframes qpfile svtp enc_timeout b
+  discover_svtav1encapp || return 1
+  [ "$codec" = av1 ] || return 1
+  svtp="$(profile_svt_params "$profile")" || return 1
+  work="$(mktemp -d "${RAMDISK_JOB_DIR:-${TMPDIR:-/tmp}}/ves-shotbytes-XXXXXX")" || return 1
+  clip="$work/shot.mkv"; y4m="$work/shot.y4m"; out="$work/shot.ivf"
+  local _fast_ss _acc_ss _dur
+  _fast_ss="$(awk -v s="$start" 'BEGIN{f=s-30; if(f<0)f=0; printf "%.6f", f}')"
+  _acc_ss="$(awk -v s="$start" -v f="$_fast_ss" 'BEGIN{printf "%.6f", s-f}')"
+  _dur="$(awk -v s="$start" -v e="$end" 'BEGIN{d=e-s; if(d<0)d=0; printf "%.6f", d}')"
+  enc_timeout="$(_shot_ffmpeg_timeout "$_dur")"
+  run_ffmpeg_validation -y -v error -ss "$_fast_ss" -i "${SHOT_SRC_LOCAL:-$src}" -ss "$_acc_ss" -t "$_dur" \
+    -map 0:v:0 -c:v ffv1 -level 3 "$clip" 2>/dev/null || { rm -rf "$work"; return 1; }
+  run_ffmpeg_validation -y -v error -i "$clip" -map 0:v:0 -pix_fmt yuv420p10le -strict -1 "$y4m" 2>/dev/null \
+    || { rm -rf "$work"; return 1; }
+  nframes="$("${FFPROBE_CMD[@]}" -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of csv=p=0 "$clip" 2>/dev/null)"
+  [[ "$nframes" =~ ^[0-9]+$ ]] && [ "$nframes" -gt 0 ] || { rm -rf "$work"; return 1; }
+  qpfile="$work/uniform.qp"
+  awk -v q="$qp" -v n="$nframes" 'BEGIN{ while (n-- > 0) print q }' > "$qpfile"
+  _run_timeout_retry "$enc_timeout" "${SVTAV1ENCAPP_CMD[@]}" -i "$y4m" --use-q-file 1 --qpfile "$qpfile" \
+    --svtav1-params "${svtp}:rc=0" -b "$out" 2>/dev/null || { rm -rf "$work"; return 1; }
+  [ -s "$out" ] || { rm -rf "$work"; return 1; }
+  b="$(file_size_bytes "$out")"
+  rm -rf "$work"
+  printf '%s' "$b"
+}
+
 # Multi-window scorer for a LONG shot: instead of extracting + encoding +
 # scoring the whole shot (a 6-min take => 20-40GB ffv1, hours per QP probe),
 # score 3 short windows placed by content (SHOT_MW_OFFSETS, seconds from the
@@ -258,7 +303,12 @@ _vmaf_score_shot_mw() {
     vs+=("$wv")
     rates+=("$(awk -v b="$wb" -v s="$ws" -v e="$we" 'BEGIN{d=e-s; if(d<=0){print 0;exit} printf "%.6f", b/d}')")
   done
-  [ "${#vs[@]}" -ge 1 ] || return 1
+  # Need >=2 usable windows for a median; 1 lone window can bias a shot's QP.
+  if [ "${#vs[@]}" -lt 2 ]; then
+    log_err "  per-shot mw: only ${#vs[@]} usable window(s) shot=${start}-${end} -- full-shot fallback"
+    _vmaf_score_shot "$src" "$start" "$end" "$qp" "$codec" "$model" "$profile"
+    return $?
+  fi
   # median vmaf
   local med; med="$(printf '%s\n' "${vs[@]}" | sort -n | awk '{a[NR]=$1} END{print (NR%2)? a[int(NR/2)+1] : (a[NR/2]+a[NR/2+1])/2}')"
   # rate-scaled bytes
@@ -570,6 +620,28 @@ resolve_per_shot_qp() {
     best="$closest"; bv="$cv"
   fi
   [ -n "$best" ] || return 1
+
+  # Multi-window byte de-bias: anchor the whole RD-sample byte scale to ONE
+  # real full-shot encode at the chosen QP, then rescale every sample's bytes
+  # by the same ratio (curve SHAPE from the windows, byte MAGNITUDE from the
+  # real encode). Keeps the allocator's baseline + solve honest for long
+  # shots without a full-shot encode per probe.
+  if [ "${SHOT_MW_ACTIVE:-0}" = "1" ] && [ "${SHOT_MW_DEBIAS:-1}" = "1" ] \
+     && declare -F _shot_encode_bytes_only >/dev/null 2>&1 && [ -n "${bytes[$best]:-}" ]; then
+    local _realb
+    _realb="$(_shot_encode_bytes_only "$src" "$start" "$end" "$best" "$codec" "$profile" 2>/dev/null)"
+    if [[ "$_realb" =~ ^[0-9]+$ ]] && [ "$_realb" -gt 0 ] && [ "${bytes[$best]:-0}" -gt 0 ]; then
+      local _ratio; _ratio="$(awk -v r="$_realb" -v w="${bytes[$best]}" 'BEGIN{printf "%.6f", r/w}')"
+      log_err "  per-shot mw byte de-bias shot=${start}-${end} qp=$best window=${bytes[$best]} real=$_realb ratio=$_ratio"
+      local _i _q _v _b
+      for _i in "${!LAST_SHOT_SEARCH_SAMPLES[@]}"; do
+        IFS=: read -r _q _v _b <<<"${LAST_SHOT_SEARCH_SAMPLES[$_i]}"
+        [[ "$_b" =~ ^[0-9]+$ ]] || continue
+        LAST_SHOT_SEARCH_SAMPLES[$_i]="${_q}:${_v}:$(awk -v b="$_b" -v r="$_ratio" 'BEGIN{printf "%d", b*r}')"
+      done
+      bytes[$best]="$_realb"
+    fi
+  fi
   # 3rd field: every (qp,vmaf,bytes) sample this search actually probed,
   # comma-joined -- feeds the Phase 6.1 equal-slope allocator. Printed
   # here (not via a global) because every real caller invokes this
@@ -825,8 +897,12 @@ EOF
   # so every search worker uses the same VMAF-stride decision (stride only when
   # progressive -- telecine/interlace/ambiguous/unknown alias under frame
   # subsampling). detect_source_traits() is a read-only idet probe, cached.
-  local _fm="unknown" _bw="0" _st
-  if declare -F detect_source_traits >/dev/null 2>&1; then
+  # Skipped entirely when nothing that needs it is enabled (keeps a
+  # fully-disabled Phase-1 config a true no-op).
+  local _fm="unknown" _bw="0" _st _need_traits=0
+  { [ "${PER_SHOT_VMAF_STRIDE:-2}" -gt 1 ] 2>/dev/null || [ "${SHOT_COMPLEXITY_ENABLE:-true}" != "false" ] \
+      || [ "${PER_SHOT_MULTIWINDOW_ENABLE:-true}" != "false" ]; } && _need_traits=1
+  if [ "$_need_traits" = 1 ] && declare -F detect_source_traits >/dev/null 2>&1; then
     _st="$(detect_source_traits "$src" 2>/dev/null)" || _st=""
     [[ "$_st" =~ field_mode=([a-z]+) ]] && _fm="${BASH_REMATCH[1]}"
     [[ "$_st" =~ is_bw=([01]) ]] && _bw="${BASH_REMATCH[1]}"
@@ -1071,22 +1147,32 @@ shot_search_claimed() {
     fi
   fi
 
-  # Zero-signal fast-path: pure black / fade / flat static -> assign a fixed
-  # high QP, skip the search. Marked nosignal=1 so the coverage gate counts it
-  # as accounted-for and the allocator treats it as a reserved fixed-cost shot
-  # (same lane as search_failed, but deliberate -- not a failure).
-  local nosignal=0
+  # Zero-signal single-probe path: pure black / fade / flat static carries no
+  # RD calibration signal, so instead of a full ~6-probe search do ONE encode
+  # at NOSIG_QP and record its REAL (qp,vmaf,bytes) -- the shot is trivial so
+  # this is a couple of seconds, and it gives the allocator honest data
+  # (review 2026-09-02: an empty samples= line made the allocator price these
+  # by shot-count share, over-reserving budget and starving real shots).
+  # Gated on a min duration so a micro-cut (whose cx_* would be unreliable
+  # anyway) always takes the real search.
+  local nosignal=0 _nsdur
   result=""
-  if declare -F _shot_is_nosignal >/dev/null 2>&1 && _shot_is_nosignal "$shot_meta"; then
-    nosignal=1
-    result="${NOSIG_QP:-${PER_SHOT_QP_EXTEND_CEIL:-48}} "   # "qp <empty-vmaf> <empty-samples>"
-    warn "per-shot NOSIGNAL (black/static) shot ${start_ts}-${end_ts} -> fixed qp=${result% }"
-  else
-    result="$(resolve_per_shot_qp "$src" "$start_ts" "$end_ts" "$codec" "$target" "$model" "$profile")"
+  _nsdur="$(awk -v a="$start_ts" -v b="$end_ts" 'BEGIN{d=b-a; if(d<0)d=0; printf "%.3f", d}')"
+  if declare -F _shot_is_nosignal >/dev/null 2>&1 \
+     && awk -v d="$_nsdur" -v m="${NOSIG_MIN_SECS:-0.5}" 'BEGIN{exit !(d+0 >= m+0)}' \
+     && _shot_is_nosignal "$shot_meta"; then
+    local _nq="${NOSIG_QP:-${PER_SHOT_QP_EXTEND_CEIL:-48}}" _nr
+    _nr="$(SHOT_MW_ACTIVE=0 _vmaf_score_shot "${SHOT_SRC_LOCAL:-$src}" "$start_ts" "$end_ts" "$_nq" "$codec" "$model" "$profile" 2>/dev/null)"
+    if [ -n "$_nr" ]; then
+      nosignal=1
+      result="$_nq ${_nr%% *} ${_nq}:${_nr%% *}:${_nr##* }"
+      warn "per-shot NOSIGNAL (black/static) shot ${start_ts}-${end_ts} -> single probe qp=$_nq vmaf=${_nr%% *}"
+    fi
   fi
+  [ -n "$result" ] || result="$(resolve_per_shot_qp "$src" "$start_ts" "$end_ts" "$codec" "$target" "$model" "$profile")"
   local samples="" search_failed=0 bracket_edge=0 _bl _bh
   if [ "$nosignal" = 1 ]; then
-    read -r qp vmaf samples <<<"$result"; search_failed=1
+    read -r qp vmaf samples <<<"$result"
   elif [ -n "$result" ]; then
     # 3 whitespace-separated fields (qp, vmaf, samples) -- read, not the
     # old first/last-field shortcut, since the samples field itself would

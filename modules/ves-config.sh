@@ -638,8 +638,8 @@ SHOT_SRC_LOCAL_STAGE_DIR="${SHOT_SRC_LOCAL_STAGE_DIR:-/var/tmp/ves-srcstage}"
 # (the era-routed split+smooth production feature refines that later).
 PER_SHOT_MULTIWINDOW_ENABLE="${PER_SHOT_MULTIWINDOW_ENABLE:-true}"
 SHOT_LONG_SECS="${SHOT_LONG_SECS:-45}"
-PER_SHOT_MW_WINDOWS="${PER_SHOT_MW_WINDOWS:-3}"
-PER_SHOT_MW_LEN="${PER_SHOT_MW_LEN:-8}"
+PER_SHOT_MW_LEN="${PER_SHOT_MW_LEN:-8}"   # window count is fixed at 3 (one per shot-third)
+SHOT_MW_DEBIAS="${SHOT_MW_DEBIAS:-1}"     # 1 = anchor MW byte scale to one real full-shot encode at the chosen QP
 #
 # (B5) VMAF frame stride in the SEARCH only (never the final whole-file
 # measure). Relative QP comparison is stable under frame decimation. Applied

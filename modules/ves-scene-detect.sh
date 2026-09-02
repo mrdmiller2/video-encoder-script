@@ -106,8 +106,12 @@ _shot_complexity_table() {
     END {
       if (have) attribute()
       for (s=0; s<=nb; s++) {
-        c = (SC[s] ? SC[s] : 1)
-        printf "%d %.2f %.4f %.4f %.2f\n", s, SL[s]/c, SM[s]/c, SD[s]/c, SS[s]/c
+        # NO row for a shot with zero sampled frames (a micro-cut shorter than
+        # 1/SHOT_COMPLEXITY_FPS, or samples that all landed outside its range).
+        # Emitting 0/0/0 there made _shot_is_nosignal() fire on real content
+        # (review 2026-09-02). Absent cx_* => the shot is searched normally.
+        if (SC[s] < 2) continue
+        printf "%d %.2f %.4f %.4f %.2f\n", s, SL[s]/SC[s], SM[s]/SC[s], SD[s]/SC[s], SS[s]/SC[s]
       }
     }
   ' "$stats_file"
