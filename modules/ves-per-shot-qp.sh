@@ -230,6 +230,38 @@ _interp_qp() {
 # always empty in every caller as a result.
 LAST_SHOT_SEARCH_SAMPLES=()
 
+# SCAFFOLDING (2026-09-02) -- per-profile QP search bracket. Returns "lo hi"
+# for the anchor/refine range in resolve_per_shot_qp. When
+# PER_SHOT_QP_BRACKET_ENABLE is false (default) or no band is defined for the
+# profile, returns the global PER_SHOT_QP_MIN/MAX -- i.e. a pure no-op until
+# the bands are researched and the flag flipped. The band NEVER clamps the
+# final answer: the (B) extend logic in resolve_per_shot_qp still probes past
+# a bound, and _shot_status_bracket_edge() records when a shot resolved
+# at/past the band so a mis-bracketed title can be re-run wide (guard:
+# PER_SHOT_QP_BRACKET_EDGE_FAIL_PCT).
+_per_shot_qp_bracket_for() {
+  local profile="$1" band="" up
+  [ "${PER_SHOT_QP_BRACKET_ENABLE:-false}" = "true" ] || {
+    printf '%s %s' "${PER_SHOT_QP_MIN:-14}" "${PER_SHOT_QP_MAX:-50}"; return 0
+  }
+  up="$(printf '%s' "$profile" | tr '[:lower:]-' '[:upper:]_')"
+  eval "band=\"\${PER_SHOT_QP_BRACKET_${up}:-}\""
+  if printf '%s' "$band" | grep -Eq '^[0-9]+ +[0-9]+$'; then
+    printf '%s' "$band"
+  else
+    printf '%s %s' "${PER_SHOT_QP_MIN:-14}" "${PER_SHOT_QP_MAX:-50}"
+  fi
+}
+
+# SCAFFOLDING -- was this shot's resolved QP at/past its search band edge?
+# Args: <resolved_qp> <band_lo> <band_hi>.  echoes "1" (edge) or "0".
+# Consumed by the (not-yet-wired) title-level bracket-health check that
+# re-runs a title wide when > EDGE_FAIL_PCT of its shots hit an edge.
+_shot_status_bracket_edge() {
+  local q="$1" lo="$2" hi="$3"
+  { [ "${q:-30}" -le "${lo:-0}" ] || [ "${q:-30}" -ge "${hi:-63}" ]; } && echo 1 || echo 0
+}
+
 resolve_per_shot_qp() {
   local src="$1" start="$2" end="$3" codec="$4" target="$5" model="$6" profile="$7"
   local -A score=() bytes=()
@@ -307,8 +339,17 @@ resolve_per_shot_qp() {
   # Per-shot search bounds are independent of the whole-file VMAF_SEARCH_*_CRF
   # (see ves-config.sh, section B) so the wider range here can't move
   # production whole-file behaviour.
-  local qp_lo="$PER_SHOT_QP_MIN" qp_hi="$PER_SHOT_QP_MAX"
-  local anchors="$qp_lo 30 $qp_hi"
+  # Per-profile band when PER_SHOT_QP_BRACKET_ENABLE=true, else the global
+  # PER_SHOT_QP_MIN/MAX (unchanged behaviour). The (B) extend logic below
+  # still probes past whichever bound applies, so a too-tight band never
+  # clamps the real answer -- it only changes where the search anchors.
+  local qp_lo qp_hi qp_mid
+  read -r qp_lo qp_hi <<<"$(_per_shot_qp_bracket_for "$profile")"
+  : "${qp_lo:=${PER_SHOT_QP_MIN:-14}}" "${qp_hi:=${PER_SHOT_QP_MAX:-50}}"
+  # middle anchor: 30 when the band spans it (keeps a consistent cross-profile
+  # reference), else the band midpoint
+  if [ "$qp_lo" -le 30 ] && [ "$qp_hi" -ge 30 ]; then qp_mid=30; else qp_mid=$(( (qp_lo + qp_hi) / 2 )); fi
+  local anchors="$qp_lo $qp_mid $qp_hi"
   for qp in $anchors; do _probe_qp "$qp" || return 1; done
   for i in 1 2 3; do
     above=""; below=""
@@ -842,7 +883,7 @@ shot_search_claimed() {
   model="$(awk -F= '/^model=/{print substr($0,index($0,"=")+1); exit}' "$mdir/manifest.meta")"
 
   result="$(resolve_per_shot_qp "$src" "$start_ts" "$end_ts" "$codec" "$target" "$model" "$profile")"
-  local samples="" search_failed=0
+  local samples="" search_failed=0 bracket_edge=0 _bl _bh
   if [ -n "$result" ]; then
     # 3 whitespace-separated fields (qp, vmaf, samples) -- read, not the
     # old first/last-field shortcut, since the samples field itself would
@@ -854,6 +895,15 @@ shot_search_claimed() {
     vmaf=""
     search_failed=1
     warn "Shot search failed for shot $idx ($start_ts-$end_ts) on $(hostname 2>/dev/null) -- falling back to fixed qp=$qp"
+  fi
+
+  # SCAFFOLDING (2026-09-02): record whether this shot resolved at/past its
+  # per-profile QP band edge. No-op payload while PER_SHOT_QP_BRACKET_ENABLE
+  # is false (band == global, edge only if qp hit the global 14/50 -- rare).
+  # A real search failure is not a band-edge signal.
+  if [ "$search_failed" -eq 0 ]; then
+    read -r _bl _bh <<<"$(_per_shot_qp_bracket_for "$profile")"
+    bracket_edge="$(_shot_status_bracket_edge "$qp" "$_bl" "$_bh")"
   fi
 
   status_file="$mdir/shot-$(printf '%03d' "$idx").status"
@@ -868,6 +918,11 @@ shot_search_claimed() {
     # resolved status (don't block the pipeline) but marked so the
     # allocator and credits detection can tell it apart from a real result.
     printf 'search_failed=%s\n' "$search_failed"
+    # SCAFFOLDING: 1 if this shot's resolved QP sat at/past its per-profile
+    # search band edge (band unfit for this shot). Title-level guard (TODO,
+    # searchwalk) re-runs a title wide when >PER_SHOT_QP_BRACKET_EDGE_FAIL_PCT
+    # of its real shots carry bracket_edge=1.
+    printf 'bracket_edge=%s\n' "$bracket_edge"
     printf 'searched_host=%s\n' "$(hostname 2>/dev/null || echo unknown)"
     printf 'searched_utc=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   } >"$tmp"
@@ -892,6 +947,31 @@ shot_manifest_all_resolved() {
     [ "$st" = "resolved" ] || return 1
   done
   return 0
+}
+
+# SCAFFOLDING (2026-09-02) -- per-profile QP bracket health for one title.
+# Counts real (search_failed=0) shots whose bracket_edge=1 -- i.e. that
+# resolved at/past their per-profile search band. Echoes "<edge> <real> <pct>";
+# returns 0 if pct <= PER_SHOT_QP_BRACKET_EDGE_FAIL_PCT (band fit or bracket
+# disabled), 1 if the band was too tight for this title and it should be
+# re-searched wide (PER_SHOT_QP_BRACKET_ENABLE=false).
+# NOT yet wired -- searchwalk should call this after a title reaches
+# all-resolved and, on return 1, wipe + re-search with the flag off.
+shot_manifest_bracket_health() {
+  local src="$1" mdir f edge=0 real=0 pct=0 lim
+  mdir="$(shot_manifest_dir "$src")"
+  lim="${PER_SHOT_QP_BRACKET_EDGE_FAIL_PCT:-5}"
+  for f in "$mdir"/shot-*.status; do
+    [ -e "$f" ] || continue
+    grep -q '^search_failed=0' "$f" 2>/dev/null || continue
+    grep -q '^vmaf=[0-9]' "$f" 2>/dev/null || continue
+    real=$((real + 1))
+    grep -q '^bracket_edge=1' "$f" 2>/dev/null && edge=$((edge + 1))
+  done
+  [ "$real" -gt 0 ] && pct=$(( edge * 100 / real ))
+  printf '%s %s %s' "$edge" "$real" "$pct"
+  [ "${PER_SHOT_QP_BRACKET_ENABLE:-false}" = "true" ] || return 0
+  [ "$pct" -le "$lim" ]
 }
 
 # Reads every shot's resolved QP from the manifest (all shot_manifest_

@@ -529,6 +529,39 @@ PER_SHOT_QP_EXTEND_CEIL="${PER_SHOT_QP_EXTEND_CEIL:-55}"        # hard cap: neve
 PER_SHOT_QP_EXTEND_FLOOR="${PER_SHOT_QP_EXTEND_FLOOR:-10}"      # hard floor: bits below here buy no perceptual gain + SVT RC gets flaky
 PER_SHOT_QP_EXTEND_PROBES="${PER_SHOT_QP_EXTEND_PROBES:-2}"     # max extension probes per side
 #
+# (B2) SCAFFOLDING — per-profile QP bracket (2026-09-02, not yet wired into
+# resolve_per_shot_qp; safe no-op while PER_SHOT_QP_BRACKET_ENABLE=false).
+# ---------------------------------------------------------------------------
+# Rationale: the search anchors at [qp_lo, 30, qp_hi] then interpolation-
+# refines. Anchoring to a profile's *historical* QP band instead of the wide
+# global [14,50] cuts probes on clean content that clusters tightly (modern
+# animation ~24-38). It does NOT clamp the answer -- the (B) extend logic
+# already probes past a bound, and (B2) additionally records a bracket-edge
+# hit so a mis-bracketed title can be caught and re-run wide.
+#
+# Bands below are DELIBERATELY GENEROUS first cuts, centred on
+# FIXED_CRF_SVT_<profile> (the tuned per-profile "typical" QP): roughly
+# [fixed-10, fixed+14], floored/ceiled at the EXTEND_FLOOR/CEIL. They are
+# placeholders pending the research pass (per-shot qp distributions from the
+# survey + a library sample). Measured so far: vintage (Gun Crazy, 164 real
+# shots) spans qp 10-48, p50=19, **36% of shots at qp<=14** -- grainy 1080p
+# vintage genuinely wants the floor, so its band stays near-global; the
+# payoff is on clean profiles.
+#   format: "<lo> <hi>"   (integers, within [EXTEND_FLOOR, EXTEND_CEIL])
+PER_SHOT_QP_BRACKET_ENABLE="${PER_SHOT_QP_BRACKET_ENABLE:-false}"
+PER_SHOT_QP_BRACKET_EDGE_FAIL_PCT="${PER_SHOT_QP_BRACKET_EDGE_FAIL_PCT:-5}"  # >this% of a title's shots resolving at/past a band edge => band unfit => re-search wide
+# keys are the canonical profile strings from profile_svt_params():
+# movies mtv classic vintage anime canime wanime vtv  (+ hdr modifier)
+PER_SHOT_QP_BRACKET_MOVIES="${PER_SHOT_QP_BRACKET_MOVIES:-16 42}"
+PER_SHOT_QP_BRACKET_MTV="${PER_SHOT_QP_BRACKET_MTV:-16 42}"
+PER_SHOT_QP_BRACKET_CLASSIC="${PER_SHOT_QP_BRACKET_CLASSIC:-14 42}"
+PER_SHOT_QP_BRACKET_VINTAGE="${PER_SHOT_QP_BRACKET_VINTAGE:-10 44}"     # near-global: grain wants the floor (measured: 36% of Gun Crazy shots at qp<=14)
+PER_SHOT_QP_BRACKET_ANIME="${PER_SHOT_QP_BRACKET_ANIME:-18 44}"
+PER_SHOT_QP_BRACKET_CANIME="${PER_SHOT_QP_BRACKET_CANIME:-14 42}"       # flat cel + line art; refine from GITS data
+PER_SHOT_QP_BRACKET_WANIME="${PER_SHOT_QP_BRACKET_WANIME:-18 44}"
+PER_SHOT_QP_BRACKET_VTV="${PER_SHOT_QP_BRACKET_VTV:-14 42}"
+PER_SHOT_QP_BRACKET_HDR="${PER_SHOT_QP_BRACKET_HDR:-12 40}"
+#
 # (C) smooth position weight for the equal-slope allocator. The allocator
 # values head/tail VMAF slightly less, so under a tight byte budget it takes
 # the quality hit in the first HEAD_FRAC / last TAIL_FRAC of the file first.
