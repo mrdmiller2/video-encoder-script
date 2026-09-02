@@ -27,6 +27,14 @@
 #   - assemble_qpfile_via_equal_slope_budget  -> Assemble-VesQpfileViaEqualSlopeBudget
 #   - assemble_qpfile_from_shot_manifest      -> Assemble-VesQpfileFromShotManifest
 #   - assemble_qpfile_via_equal_slope         (dead in bash; do not revive)
+#
+# v6.0.1H Phase 1 port (2026-09-02): per-shot complexity fan-out on the
+# scene-detect decode (cx_luma/cx_motion/cx_detail/cx_sat in shot-NNN.meta),
+# field_mode/is_bw in manifest.meta, local source staging (SHOT_SRC_LOCAL),
+# long-shot multi-window search (Get-VesVmafScoreShotMw + content-driven
+# Get-VesShotLongWindows), VMAF frame stride (progressive-only), zero-signal
+# single-probe fast-path (Get-VesShotIsNosignal), per-profile QP-bracket
+# scaffolding (inert). All flag-gated -- matches the bash defaults.
 
 if (-not (Get-Module -Name VesSharedMutex)) {
     Import-Module (Join-Path $PSScriptRoot 'VesSharedMutex.psm1') -Force
@@ -102,6 +110,70 @@ function Get-VesPerShotQpExtendProbes {
 function Get-VesPerShotQpCrossoverProbes {
     if ($env:PER_SHOT_QP_CROSSOVER_PROBES) { return [int]$env:PER_SHOT_QP_CROSSOVER_PROBES }
     return 1
+}
+
+# --- Phase 1 (2026-09-02) config getters -------------------------------------
+function Get-VesShotLongSecs {
+    if ($env:SHOT_LONG_SECS) { return [double]$env:SHOT_LONG_SECS }
+    return 45.0
+}
+function Get-VesPerShotMwLen {
+    if ($env:PER_SHOT_MW_LEN) { return [double]$env:PER_SHOT_MW_LEN }
+    return 8.0
+}
+function Get-VesPerShotMultiwindowEnable {
+    return ($env:PER_SHOT_MULTIWINDOW_ENABLE -ne 'false')
+}
+function Get-VesShotMwDebias {
+    return ($env:SHOT_MW_DEBIAS -ne '0')
+}
+function Get-VesPerShotVmafStride {
+    if ($env:PER_SHOT_VMAF_STRIDE) { return [int]$env:PER_SHOT_VMAF_STRIDE }
+    return 2
+}
+function Get-VesShotComplexityEnable {
+    return ($env:SHOT_COMPLEXITY_ENABLE -ne 'false')
+}
+function Get-VesShotSrcLocalStage {
+    return ($env:SHOT_SRC_LOCAL_STAGE -ne 'false')
+}
+function Get-VesShotSrcLocalStageDir {
+    if ($env:SHOT_SRC_LOCAL_STAGE_DIR) { return $env:SHOT_SRC_LOCAL_STAGE_DIR }
+    return (Join-Path ([System.IO.Path]::GetTempPath()) 'ves-srcstage')
+}
+function Get-VesNosignalFastpath {
+    return ($env:PER_SHOT_NOSIGNAL_FASTPATH -ne 'false')
+}
+function Get-VesNosigBlackLuma   { if ($env:NOSIG_BLACK_LUMA)    { return [double]$env:NOSIG_BLACK_LUMA }    return 16.0 }
+function Get-VesNosigStaticMotion { if ($env:NOSIG_STATIC_MOTION) { return [double]$env:NOSIG_STATIC_MOTION } return 1.0 }
+function Get-VesNosigFlatDetail  { if ($env:NOSIG_FLAT_DETAIL)   { return [double]$env:NOSIG_FLAT_DETAIL }   return 3.0 }
+function Get-VesNosigQp          { if ($env:NOSIG_QP)            { return [int]$env:NOSIG_QP }              return 48 }
+function Get-VesNosigMinSecs     { if ($env:NOSIG_MIN_SECS)      { return [double]$env:NOSIG_MIN_SECS }      return 0.5 }
+function Get-VesPerShotQpBracketEnable {
+    return ($env:PER_SHOT_QP_BRACKET_ENABLE -eq 'true')
+}
+function Get-VesPerShotQpBracketEdgeFailPct {
+    if ($env:PER_SHOT_QP_BRACKET_EDGE_FAIL_PCT) { return [int]$env:PER_SHOT_QP_BRACKET_EDGE_FAIL_PCT }
+    return 5
+}
+function Get-VesPerShotQpBracketFor {
+    <#  Returns @(lo,hi). Global PER_SHOT_QP_MIN/MAX unless the bracket is
+        enabled AND a band is defined for the profile (env
+        PER_SHOT_QP_BRACKET_<PROFILE>="lo hi"). Never clamps the answer --
+        the (B) extend logic + Test-VesShotBracketEdge handle a tight band. #>
+    param([Parameter(Mandatory)][string]$Profile)
+    $g = @((Get-VesPerShotQpMin), (Get-VesPerShotQpMax))
+    if (-not (Get-VesPerShotQpBracketEnable)) { return $g }
+    $key = 'PER_SHOT_QP_BRACKET_' + ($Profile.ToUpper() -replace '[^A-Z0-9]', '_')
+    $band = [Environment]::GetEnvironmentVariable($key)
+    if ($band -and ($band -match '^\s*([0-9]+)\s+([0-9]+)\s*$')) {
+        return @([int]$Matches[1], [int]$Matches[2])
+    }
+    return $g
+}
+function Test-VesShotBracketEdge {
+    param([int]$Qp, [int]$Lo, [int]$Hi)
+    if ($Qp -le $Lo -or $Qp -ge $Hi) { return 1 } else { return 0 }
 }
 
 function Get-VesShotManifestDir {
@@ -285,11 +357,42 @@ function New-VesShotManifest {
             $Model = Get-VesVmafModelForSource -Source $Source -FfprobePath $FfprobePath
         }
 
+        # Phase 1: fan the single scene-detect decode to a signalstats+entropy
+        # branch. Raw per-frame file is LOCAL + transient (10s of MB); only
+        # the small aggregated per-shot table lands in the manifest.
+        $cxStats = $null
+        if (Get-VesShotComplexityEnable) {
+            $cxStats = Join-Path ([System.IO.Path]::GetTempPath()) ("ves-cxstats-$PID-$(Get-Random)")
+        }
         try {
-            $boundaries = @(Get-VesSceneBoundaries -Source $Source -FfmpegPath $FfmpegPath)
+            $boundaries = @(Get-VesSceneBoundaries -Source $Source -FfmpegPath $FfmpegPath -StatsOut $cxStats)
         } catch {
             Write-Warning "Get-VesSceneBoundaries failed for $Source -- $_"
+            if ($cxStats -and (Test-Path -LiteralPath $cxStats)) { Remove-Item -LiteralPath $cxStats -Force -ErrorAction SilentlyContinue }
             return $false
+        }
+
+        $cxTable = @{}
+        if ($cxStats -and (Test-Path -LiteralPath $cxStats) -and ((Get-Item -LiteralPath $cxStats).Length -gt 0)) {
+            try { $cxTable = Get-VesShotComplexityTable -StatsFile $cxStats -Boundaries $boundaries } catch { }
+        }
+        $longSecs = Get-VesShotLongSecs
+        $mwLen = Get-VesPerShotMwLen
+        $writeShotCx = {
+            param([int]$Idx, [double]$SStart, [double]$SEnd)
+            $lines = @()
+            if ($cxTable.ContainsKey($Idx)) {
+                $x = $cxTable[$Idx]
+                $lines += "cx_luma=$($x.Luma)"; $lines += "cx_motion=$($x.Motion)"
+                $lines += "cx_detail=$($x.Detail)"; $lines += "cx_sat=$($x.Sat)"
+            }
+            if ($cxStats -and (Test-Path -LiteralPath $cxStats) -and (($SEnd - $SStart) -gt $longSecs)) {
+                try {
+                    $w = Get-VesShotLongWindows -StatsFile $cxStats -Start $SStart -End $SEnd -WinLen $mwLen
+                    if ($w) { $lines += "cx_windows=$w" }
+                } catch { }
+            }
+            return $lines
         }
 
         $n = 0
@@ -301,11 +404,8 @@ function New-VesShotManifest {
             foreach ($ts in $boundaries) {
                 if (-not $ts) { continue }
                 $shotFile = Join-Path $buildTmp ("shot-{0:D3}.meta" -f $n)
-                @"
-index=$n
-start_ts=$prev
-end_ts=$ts
-"@ | Set-Content -LiteralPath $shotFile -Encoding utf8
+                $body = @("index=$n", "start_ts=$prev", "end_ts=$ts") + (& $writeShotCx $n ([double]$prev) ([double]$ts))
+                $body -join "`n" | Set-Content -LiteralPath $shotFile -Encoding utf8
                 $n++
                 $nb++
                 $prev = $ts
@@ -318,12 +418,23 @@ end_ts=$ts
             }
             $finalShot = Join-Path $buildTmp ("shot-{0:D3}.meta" -f $n)
             $durStr = $dur.ToString([System.Globalization.CultureInfo]::InvariantCulture)
-            @"
-index=$n
-start_ts=$prev
-end_ts=$durStr
-"@ | Set-Content -LiteralPath $finalShot -Encoding utf8
+            $fbody = @("index=$n", "start_ts=$prev", "end_ts=$durStr") + (& $writeShotCx $n ([double]$prev) ([double]$dur))
+            $fbody -join "`n" | Set-Content -LiteralPath $finalShot -Encoding utf8
             $n++
+
+            if ($cxStats -and (Test-Path -LiteralPath $cxStats)) { Remove-Item -LiteralPath $cxStats -Force -ErrorAction SilentlyContinue }
+
+            # Field mode + B&W, resolved once so every search worker uses the
+            # same VMAF-stride decision. Skipped when nothing that needs it is on.
+            $fm = 'unknown'; $bw = '0'
+            $needTraits = ((Get-VesPerShotVmafStride) -gt 1) -or (Get-VesShotComplexityEnable) -or (Get-VesPerShotMultiwindowEnable)
+            if ($needTraits -and (Get-Command Get-VesSourceTraits -ErrorAction SilentlyContinue)) {
+                try {
+                    $st = Get-VesSourceTraits -Source $Source -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath
+                    if ($st.FieldMode) { $fm = "$($st.FieldMode)" }
+                    if ($null -ne $st.IsBw) { $bw = "$([int]$st.IsBw)" }
+                } catch { }
+            }
 
             $manifestFile = Join-Path $buildTmp 'manifest.meta'
             @"
@@ -333,6 +444,8 @@ codec=$Codec
 profile=$Profile
 target=$Target
 model=$Model
+field_mode=$fm
+is_bw=$bw
 created_utc=$([DateTimeOffset]::UtcNow.ToString('o'))
 created_host=$env:COMPUTERNAME
 "@ | Set-Content -LiteralPath $manifestFile -Encoding utf8
@@ -486,6 +599,237 @@ function Clear-VesShotScratch {
     }
 }
 
+function Get-VesStageSourceLocal {
+    <#
+    .SYNOPSIS
+    Port of _stage_source_local(). Copy a fleet-shared (NFS/SMB) source to
+    local disk ONCE so per-shot extraction stops re-reading a ~30s window
+    over the network for every QP probe. Returns the local path on success,
+    or the original path (unchanged behaviour) on any failure / when
+    disabled. Idempotent per host (size match), disk-guarded, 48h sweep
+    that never touches the file it is about to return.
+    #>
+    param([Parameter(Mandatory)][string]$Source)
+    if (-not (Get-VesShotSrcLocalStage)) { return $Source }
+    if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { return $Source }
+    $dir = Get-VesShotSrcLocalStageDir
+    try { New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null } catch { return $Source }
+
+    $want = (Get-Item -LiteralPath $Source).Length
+    $h = ([System.BitConverter]::ToString(
+            [System.Security.Cryptography.MD5]::Create().ComputeHash(
+                [System.Text.Encoding]::UTF8.GetBytes($Source))) -replace '-', '').Substring(0, 10).ToLower()
+    $base = (Split-Path -Leaf $Source) -replace '[^A-Za-z0-9._-]', '_'
+    $dst = Join-Path $dir ("${h}_${base}")
+    $dstName = Split-Path -Leaf $dst
+
+    # sweep stale stages (>48h by last-access), never the file we hand back
+    Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue | ForEach-Object {
+        if ($_.Name -eq $dstName) { return }
+        if (([DateTimeOffset]::UtcNow - $_.LastAccessTimeUtc).TotalHours -gt 48) {
+            try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop } catch { }
+        }
+    }
+
+    if ((Test-Path -LiteralPath $dst) -and ((Get-Item -LiteralPath $dst).Length -eq $want)) {
+        try { (Get-Item -LiteralPath $dst).LastAccessTimeUtc = [DateTime]::UtcNow } catch { }
+        return $dst
+    }
+    try {
+        $free = (Get-PSDrive -Name ((Get-Item -LiteralPath $dir).PSDrive.Name)).Free
+        if ($null -ne $free -and $free -lt ($want + [math]::Floor($want / 10))) {
+            Write-Warning "Get-VesStageSourceLocal: not enough local space in $dir -- reading source from network"
+            return $Source
+        }
+    } catch { }
+    $tmp = "$dst.$PID.part"
+    try {
+        Copy-Item -LiteralPath $Source -Destination $tmp -Force -ErrorAction Stop
+        if ((Get-Item -LiteralPath $tmp).Length -eq $want) {
+            Move-Item -LiteralPath $tmp -Destination $dst -Force -ErrorAction Stop
+            return $dst
+        }
+    } catch { }
+    if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    return $Source
+}
+
+function Get-VesShotIsNosignal {
+    <#
+    .SYNOPSIS
+    Port of _shot_is_nosignal(). True when a shot's manifest complexity
+    fields all indicate pure black / fade / flat static (no RD signal):
+    cx_luma < NOSIG_BLACK_LUMA AND cx_motion < NOSIG_STATIC_MOTION AND
+    cx_detail < NOSIG_FLAT_DETAIL. Absent fields => $false (search it).
+    #>
+    param([Parameter(Mandatory)][string]$ShotMetaContent)
+    if (-not (Get-VesNosignalFastpath)) { return $false }
+    $l = Get-VesShotMetaValue -Content $ShotMetaContent -Key 'cx_luma'
+    $m = Get-VesShotMetaValue -Content $ShotMetaContent -Key 'cx_motion'
+    $d = Get-VesShotMetaValue -Content $ShotMetaContent -Key 'cx_detail'
+    if (-not $l -or -not $m -or -not $d) { return $false }
+    return (([double]$l -lt (Get-VesNosigBlackLuma)) -and
+            ([double]$m -lt (Get-VesNosigStaticMotion)) -and
+            ([double]$d -lt (Get-VesNosigFlatDetail)))
+}
+
+function Get-VesShotEncodeBytesOnly {
+    <#
+    .SYNOPSIS
+    Port of _shot_encode_bytes_only(). Encode the WHOLE shot once at a
+    fixed QP and return byte size (no VMAF) -- used to de-bias multi-window
+    byte estimates. Returns [long] or $null.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][double]$Start,
+        [Parameter(Mandatory)][double]$End,
+        [Parameter(Mandatory)][int]$Qp,
+        [Parameter(Mandatory)][string]$Codec,
+        [Parameter(Mandatory)][string]$Profile,
+        [Parameter(Mandatory)][string]$FfmpegPath,
+        [Parameter(Mandatory)][string]$FfprobePath,
+        [string]$SvtAv1EncAppPath
+    )
+    if ($Codec -ne 'av1') { return $null }
+    $src = if ($env:SHOT_SRC_LOCAL) { $env:SHOT_SRC_LOCAL } else { $Source }
+    $svtp = Get-VesProfileSvtParams -Profile $Profile -FfmpegPath $FfmpegPath
+    if (-not $svtp) { return $null }
+    $useSvtBin = $SvtAv1EncAppPath -and (Test-Path -LiteralPath $SvtAv1EncAppPath)
+    $base = if ($env:RAMDISK_JOB_DIR) { $env:RAMDISK_JOB_DIR } else { [System.IO.Path]::GetTempPath() }
+    $work = Join-Path $base ("ves-shotbytes-$PID-$(Get-Random)")
+    New-Item -ItemType Directory -Path $work -Force | Out-Null
+    try {
+        $inv = [System.Globalization.CultureInfo]::InvariantCulture
+        $fastSs = [math]::Max(0.0, $Start - 30.0)
+        $accSs = $Start - $fastSs
+        $clipDur = [math]::Max(0.0, $End - $Start)
+        $clip = Join-Path $work 'shot.mkv'
+        $tmo = Get-VesShotFfmpegTimeout -DurationSeconds $clipDur
+        $ext = Invoke-VesWithTimeoutRetry -FilePath $FfmpegPath -ArgumentList @(
+            '-y', '-v', 'error', '-ss', $fastSs.ToString('0.######', $inv), '-i', $src,
+            '-ss', $accSs.ToString('0.######', $inv), '-t', $clipDur.ToString('0.######', $inv),
+            '-map', '0:v:0', '-c:v', 'ffv1', '-level', '3', $clip
+        ) -TimeoutSeconds $tmo -MaxRetries 1
+        if ($ext.TimedOut -or $ext.ExitCode -ne 0) { return $null }
+        $y4m = Join-Path $work 'shot.y4m'
+        $y4mRun = Invoke-VesWithTimeoutRetry -FilePath $FfmpegPath -ArgumentList @(
+            '-y', '-v', 'error', '-i', $clip, '-map', '0:v:0', '-pix_fmt', 'yuv420p10le', '-strict', '-1', $y4m
+        ) -TimeoutSeconds $tmo -MaxRetries 1
+        if ($y4mRun.TimedOut -or $y4mRun.ExitCode -ne 0) { return $null }
+        $nfRun = Invoke-VesWithTimeoutRetry -FilePath $FfprobePath -ArgumentList @(
+            '-v', 'error', '-select_streams', 'v:0', '-count_packets',
+            '-show_entries', 'stream=nb_read_packets', '-of', 'csv=p=0', $clip
+        ) -TimeoutSeconds 60 -MaxRetries 1
+        $nframes = 0
+        if (-not [int]::TryParse(($nfRun.StdOut.Trim() -replace ',.*$', ''), [ref]$nframes) -or $nframes -le 0) { return $null }
+        if ($useSvtBin) {
+            $qpfile = Join-Path $work 'uniform.qp'
+            $qpLines = for ($i = 0; $i -lt $nframes; $i++) { "$Qp" }
+            $qpLines | Set-Content -LiteralPath $qpfile -Encoding ascii
+            $out = Join-Path $work 'shot.ivf'
+            $r = Invoke-VesWithTimeoutRetry -FilePath $SvtAv1EncAppPath -ArgumentList @(
+                '-i', $y4m, '--use-q-file', '1', '--qpfile', $qpfile, '--svtav1-params', "${svtp}:rc=0", '-b', $out
+            ) -TimeoutSeconds $tmo -MaxRetries 1
+        } else {
+            $out = Join-Path $work 'shot.mkv.out'
+            $r = Invoke-VesWithTimeoutRetry -FilePath $FfmpegPath -ArgumentList @(
+                '-y', '-v', 'error', '-i', $y4m, '-map', '0:v:0', '-c:v', 'libsvtav1', '-preset', '5',
+                '-svtav1-params', "${svtp}:rc=0:qp=$Qp", '-pix_fmt', 'yuv420p10le', $out
+            ) -TimeoutSeconds $tmo -MaxRetries 1
+        }
+        if ($r.TimedOut -or $r.ExitCode -ne 0) { return $null }
+        if (-not (Test-Path -LiteralPath $out) -or (Get-Item -LiteralPath $out).Length -le 0) { return $null }
+        return [long](Get-Item -LiteralPath $out).Length
+    } finally {
+        if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Get-VesVmafScoreShotMw {
+    <#
+    .SYNOPSIS
+    Port of _vmaf_score_shot_mw(). Score a LONG shot as 3 short windows
+    (placed by content via env SHOT_MW_OFFSETS, else evenly) and combine:
+    MEDIAN window VMAF + rate-scaled bytes. Same @{Vmaf;Bytes} contract as
+    Get-VesVmafScoreShot. >=2 usable windows required (else full-shot).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][double]$Start,
+        [Parameter(Mandatory)][double]$End,
+        [Parameter(Mandatory)][int]$Qp,
+        [Parameter(Mandatory)][string]$Codec,
+        [Parameter(Mandatory)][string]$Model,
+        [Parameter(Mandatory)][string]$Profile,
+        [Parameter(Mandatory)][string]$FfmpegPath,
+        [Parameter(Mandatory)][string]$FfprobePath,
+        [string]$SvtAv1EncAppPath
+    )
+    $wl = if ($env:SHOT_MW_LEN) { [double]$env:SHOT_MW_LEN } else { 8.0 }
+    $shotDur = [math]::Max(0.0, $End - $Start)
+    $offs = @()
+    if ($env:SHOT_MW_OFFSETS) {
+        $offs = $env:SHOT_MW_OFFSETS.Split(',') | Where-Object { $_ -ne '' } | ForEach-Object { [double]$_ }
+    }
+    if ($offs.Count -lt 1) {
+        for ($k = 0; $k -lt 3; $k++) {
+            $o = $shotDur * (2 * $k + 1) / 6.0 - $wl / 2.0
+            if ($o -lt 0) { $o = 0 }
+            if (($o + $wl) -gt $shotDur) { $o = $shotDur - $wl }
+            if ($o -lt 0) { $o = 0 }
+            $offs += $o
+        }
+    }
+    $vs = [System.Collections.Generic.List[double]]::new()
+    $rates = [System.Collections.Generic.List[double]]::new()
+    foreach ($o in $offs) {
+        $ws = $Start + $o
+        $we = [math]::Min($End, $ws + $wl)
+        $r = Get-VesVmafScoreShot -Source $Source -Start $ws -End $we -Qp $Qp `
+            -Codec $Codec -Model $Model -Profile $Profile `
+            -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -SvtAv1EncAppPath $SvtAv1EncAppPath
+        if (-not $r) { continue }
+        $vs.Add([double]$r.Vmaf)
+        $wd = $we - $ws
+        if ($wd -gt 0) { $rates.Add([double]$r.Bytes / $wd) }
+    }
+    if ($vs.Count -lt 2) {
+        Write-Host "  per-shot mw: only $($vs.Count) usable window(s) shot=${Start}-${End} -- full-shot fallback"
+        return (Get-VesVmafScoreShot -Source $Source -Start $Start -End $End -Qp $Qp `
+            -Codec $Codec -Model $Model -Profile $Profile `
+            -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -SvtAv1EncAppPath $SvtAv1EncAppPath)
+    }
+    $sorted = @($vs | Sort-Object)
+    $med = if ($sorted.Count % 2) { $sorted[[int]($sorted.Count / 2)] }
+           else { ($sorted[$sorted.Count / 2 - 1] + $sorted[$sorted.Count / 2]) / 2 }
+    $avgRate = ($rates | Measure-Object -Average).Average
+    return [PSCustomObject]@{ Vmaf = [math]::Round($med, 2); Bytes = [long]($avgRate * $shotDur) }
+}
+
+function Test-VesShotManifestBracketHealth {
+    <#
+    .SYNOPSIS
+    Port of shot_manifest_bracket_health(). Returns @{ Edge; Real; Pct; Fit }.
+    Fit is $false only when the bracket is ENABLED and > EdgeFailPct of a
+    title's real shots resolved at/past a band edge.
+    #>
+    param([Parameter(Mandatory)][string]$Source)
+    $mdir = Get-VesShotManifestDir -Source $Source
+    $edge = 0; $real = 0
+    Get-ChildItem -LiteralPath $mdir -Filter 'shot-*.status' -File -ErrorAction SilentlyContinue | ForEach-Object {
+        $c = Get-Content -LiteralPath $_.FullName -Raw
+        if ($c -notmatch '(?m)^search_failed=0') { return }
+        if ($c -notmatch '(?m)^vmaf=[0-9]') { return }
+        $real++
+        if ($c -match '(?m)^bracket_edge=1') { $edge++ }
+    }
+    $pct = if ($real -gt 0) { [int]([math]::Floor($edge * 100 / $real)) } else { 0 }
+    $fit = $true
+    if ((Get-VesPerShotQpBracketEnable) -and $pct -gt (Get-VesPerShotQpBracketEdgeFailPct)) { $fit = $false }
+    return [PSCustomObject]@{ Edge = $edge; Real = $real; Pct = $pct; Fit = $fit }
+}
+
 function Get-VesVmafScoreShot {
     <#
     .SYNOPSIS
@@ -508,6 +852,8 @@ function Get-VesVmafScoreShot {
         [string]$SvtAv1EncAppPath
     )
     if ($Codec -ne 'av1') { return $null }
+    # Phase 1: read the extraction from the worker's local stage when set.
+    if ($env:SHOT_SRC_LOCAL) { $Source = $env:SHOT_SRC_LOCAL }
     # SvtAv1EncApp is optional: several Windows fleet hosts (PRINCE) have no
     # standalone binary and encode via ffmpeg's libsvtav1. For the per-shot
     # SEARCH every qpfile is UNIFORM (one QP for the whole shot), which is
@@ -599,7 +945,16 @@ function Get-VesVmafScoreShot {
         $vlogName = "shot-$Qp.vmaf.json"
         $vlog = Join-Path $work $vlogName
         $nThreads = [Environment]::ProcessorCount
-        $lavfi = "[0:v]setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]setpts=PTS-STARTPTS,format=yuv420p10le[r];[d][r]libvmaf=model=${Model}:n_threads=${nThreads}:log_fmt=json:log_path=$vlogName"
+        # Phase 1 VMAF frame stride: score every Sth frame in the SEARCH only.
+        # ONLY when the source is confirmed progressive -- telecine/interlaced/
+        # ambiguous/unknown alias badly under decimation. SHOT_FIELD_MODE is
+        # set per-title by Invoke-VesShotSearchClaimed from manifest.meta.
+        $sel = ''
+        if ($env:SHOT_FIELD_MODE -eq 'progressive') {
+            $stride = Get-VesPerShotVmafStride
+            if ($stride -gt 1) { $sel = "select='not(mod(n\,$stride))'," }
+        }
+        $lavfi = "[0:v]${sel}setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]${sel}setpts=PTS-STARTPTS,format=yuv420p10le[r];[d][r]libvmaf=model=${Model}:n_threads=${nThreads}:log_fmt=json:log_path=$vlogName"
         $vmafRun = Invoke-VesWithTimeoutRetry -FilePath $FfmpegPath -ArgumentList @(
             '-y', '-v', 'error', '-i', $outMkv, '-i', $clip,
             '-lavfi', $lavfi, '-f', 'null', '-'
@@ -693,23 +1048,35 @@ function Resolve-VesPerShotQp {
         Write-Host "  per-shot adaptive-target shot=${Start}-${End} yavg=$yavg motion=$motion base=$baseT -> target=$workingTarget"
     }
 
+    # Phase 1: long-shot multi-window path -- Invoke-VesShotSearchClaimed sets
+    # SHOT_MW_ACTIVE=1 (+ SHOT_MW_OFFSETS) for a shot over SHOT_LONG_SECS.
+    $mwActive = ($env:SHOT_MW_ACTIVE -eq '1') -and (Get-VesPerShotMultiwindowEnable)
     $probeQp = {
         param([int]$Q)
         if ($score.ContainsKey($Q)) { return $true }
-        $r = Get-VesVmafScoreShot -Source $Source -Start $Start -End $End -Qp $Q `
-            -Codec $Codec -Model $Model -Profile $Profile `
-            -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -SvtAv1EncAppPath $SvtAv1EncAppPath
+        if ($mwActive) {
+            $r = Get-VesVmafScoreShotMw -Source $Source -Start $Start -End $End -Qp $Q `
+                -Codec $Codec -Model $Model -Profile $Profile `
+                -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -SvtAv1EncAppPath $SvtAv1EncAppPath
+        } else {
+            $r = Get-VesVmafScoreShot -Source $Source -Start $Start -End $End -Qp $Q `
+                -Codec $Codec -Model $Model -Profile $Profile `
+                -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -SvtAv1EncAppPath $SvtAv1EncAppPath
+        }
         if (-not $r) { return $false }
         $score[$Q] = [double]$r.Vmaf
         $bytes[$Q] = [long]$r.Bytes
         $samples.Add("${Q}:$($score[$Q]):$($bytes[$Q])")
-        Write-Host "  per-shot qp-search [$Codec] shot=${Start}-${End} qp=$Q vmaf=$($score[$Q])"
+        $tag = if ($mwActive) { ' mw' } else { '' }
+        Write-Host "  per-shot qp-search [$Codec]$tag shot=${Start}-${End} qp=$Q vmaf=$($score[$Q])"
         return $true
     }
 
-    $qpLo = Get-VesPerShotQpMin
-    $qpHi = Get-VesPerShotQpMax
-    foreach ($qp in @($qpLo, 30, $qpHi)) {
+    $band = Get-VesPerShotQpBracketFor -Profile $Profile
+    $qpLo = [int]$band[0]
+    $qpHi = [int]$band[1]
+    $qpMid = if ($qpLo -le 30 -and $qpHi -ge 30) { 30 } else { [int](($qpLo + $qpHi) / 2) }
+    foreach ($qp in @($qpLo, $qpMid, $qpHi)) {
         if (-not (& $probeQp $qp)) { return $null }
     }
 
@@ -820,6 +1187,26 @@ function Resolve-VesPerShotQp {
     }
     if ($null -eq $best) { return $null }
 
+    # Phase 1 multi-window byte de-bias: anchor the whole RD-sample byte scale
+    # to ONE real full-shot encode at the chosen QP, then rescale every
+    # sample's bytes by the same ratio (curve SHAPE from the windows, byte
+    # MAGNITUDE from the real encode).
+    if ($mwActive -and (Get-VesShotMwDebias) -and $bytes.ContainsKey([int]$best) -and $bytes[[int]$best] -gt 0) {
+        $realB = Get-VesShotEncodeBytesOnly -Source $Source -Start $Start -End $End -Qp ([int]$best) `
+            -Codec $Codec -Profile $Profile -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -SvtAv1EncAppPath $SvtAv1EncAppPath
+        if ($realB -and $realB -gt 0) {
+            $ratio = [double]$realB / [double]$bytes[[int]$best]
+            Write-Host "  per-shot mw byte de-bias shot=${Start}-${End} qp=$best window=$($bytes[[int]$best]) real=$realB ratio=$('{0:F6}' -f $ratio)"
+            for ($i = 0; $i -lt $samples.Count; $i++) {
+                $parts = $samples[$i].Split(':')
+                if ($parts.Count -eq 3 -and ($parts[2] -match '^[0-9]+$')) {
+                    $samples[$i] = "$($parts[0]):$($parts[1]):$([long]([long]$parts[2] * $ratio))"
+                }
+            }
+            $bytes[[int]$best] = [long]$realB
+        }
+    }
+
     return [PSCustomObject]@{
         Qp      = [int]$best
         Vmaf    = [double]$bv
@@ -866,10 +1253,43 @@ function Invoke-VesShotSearchClaimed {
     $profile = Get-VesShotMetaValue -Content $manifestMeta -Key 'profile'
     $target = [double](Get-VesShotMetaValue -Content $manifestMeta -Key 'target')
     $model = Get-VesShotMetaValue -Content $manifestMeta -Key 'model'
+    $sdur = [math]::Max(0.0, $endTs - $startTs)
 
-    $result = Resolve-VesPerShotQp -Source $Source -Start $startTs -End $endTs `
-        -Codec $codec -Target $target -Model $model -Profile $profile `
-        -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -SvtAv1EncAppPath $SvtAv1EncAppPath
+    # Phase 1 per-title / per-shot search modifiers, resolved from the manifest
+    # here so Resolve-VesPerShotQp / Get-VesVmafScoreShot stay signature-stable.
+    $fieldMode = Get-VesShotMetaValue -Content $manifestMeta -Key 'field_mode'
+    $env:SHOT_FIELD_MODE = if ($fieldMode) { $fieldMode } else { 'unknown' }
+    $env:SHOT_MW_ACTIVE = $null
+    $env:SHOT_MW_OFFSETS = $null
+    if ((Get-VesPerShotMultiwindowEnable) -and $sdur -gt (Get-VesShotLongSecs)) {
+        $env:SHOT_MW_ACTIVE = '1'
+        $cw = Get-VesShotMetaValue -Content $shotMeta -Key 'cx_windows'
+        $env:SHOT_MW_OFFSETS = if ($cw) { $cw } else { '' }
+        $env:SHOT_MW_LEN = "$(Get-VesPerShotMwLen)"
+    }
+
+    # Zero-signal single-probe path: one real encode at NOSIG_QP (the shot is
+    # trivial -> a couple of seconds), record the real (qp,vmaf,bytes).
+    $result = $null
+    $nosignal = 0
+    if ($sdur -ge (Get-VesNosigMinSecs) -and (Get-VesShotIsNosignal -ShotMetaContent $shotMeta)) {
+        $nq = Get-VesNosigQp
+        $prevMw = $env:SHOT_MW_ACTIVE; $env:SHOT_MW_ACTIVE = $null
+        $nr = Get-VesVmafScoreShot -Source $Source -Start $startTs -End $endTs -Qp $nq `
+            -Codec $codec -Model $model -Profile $profile `
+            -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -SvtAv1EncAppPath $SvtAv1EncAppPath
+        $env:SHOT_MW_ACTIVE = $prevMw
+        if ($nr) {
+            $nosignal = 1
+            $result = [PSCustomObject]@{ Qp = $nq; Vmaf = [double]$nr.Vmaf; Samples = "${nq}:$($nr.Vmaf):$($nr.Bytes)" }
+            Write-Warning "per-shot NOSIGNAL (black/static) shot $idx ($startTs-$endTs) -> single probe qp=$nq vmaf=$($nr.Vmaf)"
+        }
+    }
+    if (-not $result) {
+        $result = Resolve-VesPerShotQp -Source $Source -Start $startTs -End $endTs `
+            -Codec $codec -Target $target -Model $model -Profile $profile `
+            -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -SvtAv1EncAppPath $SvtAv1EncAppPath
+    }
 
     $searchFailed = 0
     $qp = $null
@@ -886,6 +1306,13 @@ function Invoke-VesShotSearchClaimed {
         Write-Warning "Shot search failed for shot $idx ($startTs-$endTs) on $env:COMPUTERNAME -- falling back to fixed qp=$qp"
     }
 
+    # bracket-edge flag (no-op payload while the bracket is disabled)
+    $bracketEdge = 0
+    if ($searchFailed -eq 0) {
+        $b = Get-VesPerShotQpBracketFor -Profile $profile
+        $bracketEdge = Test-VesShotBracketEdge -Qp ([int]$qp) -Lo ([int]$b[0]) -Hi ([int]$b[1])
+    }
+
     $tmp = "$statusFile.$PID.$(Get-Random).tmp"
     @"
 status=resolved
@@ -893,6 +1320,8 @@ qp=$qp
 vmaf=$vmaf
 samples=$samples
 search_failed=$searchFailed
+nosignal=$nosignal
+bracket_edge=$bracketEdge
 searched_host=$env:COMPUTERNAME
 searched_utc=$([DateTimeOffset]::UtcNow.ToString('o'))
 "@ | Set-Content -LiteralPath $tmp -Encoding utf8
@@ -921,6 +1350,19 @@ function Invoke-VesShotSearchWorkerLoop {
     if ($MaxIdleSeconds -lt 0) {
         $MaxIdleSeconds = (Get-VesShotSearchStaleSeconds) + ($retryWait * 3)
     }
+    # Phase 1: stage the shared source to local disk once so every extraction
+    # probe reads local instead of re-fetching a window over the network.
+    try {
+        $local = Get-VesStageSourceLocal -Source $Source
+        if ($local -and $local -ne $Source -and (Test-Path -LiteralPath $local)) {
+            $env:SHOT_SRC_LOCAL = $local
+            Write-Host "  staged source local: $local ($([math]::Round((Get-Item -LiteralPath $local).Length / 1GB, 2)) GB)"
+        } else {
+            $env:SHOT_SRC_LOCAL = $null
+            Write-Host "  local staging skipped -- reading source from network"
+        }
+    } catch { $env:SHOT_SRC_LOCAL = $null }
+
     $count = 0
     $idle = 0
     Clear-VesShotScratch
@@ -961,4 +1403,10 @@ Export-ModuleMember -Function `
     Test-VesShotManifestAllResolved, New-VesShotManifest, `
     Enter-VesShotClaim, Exit-VesShotClaim, `
     Clear-VesShotScratch, Invoke-VesShotSearchWorkerLoop, `
-    Get-VesVmafScoreShot, Resolve-VesPerShotQp, Invoke-VesShotSearchClaimed
+    Get-VesVmafScoreShot, Resolve-VesPerShotQp, Invoke-VesShotSearchClaimed, `
+    Get-VesStageSourceLocal, Get-VesShotIsNosignal, Get-VesShotEncodeBytesOnly, `
+    Get-VesVmafScoreShotMw, Test-VesShotManifestBracketHealth, `
+    Get-VesPerShotQpBracketFor, Test-VesShotBracketEdge, `
+    Get-VesShotLongSecs, Get-VesPerShotMwLen, Get-VesPerShotVmafStride, `
+    Get-VesShotComplexityEnable, Get-VesPerShotMultiwindowEnable, `
+    Get-VesNosignalFastpath, Get-VesNosigQp, Get-VesPerShotQpBracketEnable

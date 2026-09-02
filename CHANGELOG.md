@@ -51,9 +51,19 @@ a strict no-op with its flag off, shot metas byte-identical:
   genuinely wants the QP floor (36 % of Gun Crazy shots at qp ≤ 14), so its
   band stays near-global.
 
-The Windows fork owes the port of the `scene_detect_boundaries` /
-`shot_split_create_manifest` / per-shot-search changes; the shared VERSION
-bumps in lockstep per fleet policy.
+**Windows fork port (2026-09-02, same version).** `VesSceneDetect.psm1` gains
+`Get-VesSceneBoundaries -StatsOut` (split filter), `Get-VesShotComplexityTable`,
+`Get-VesShotLongWindows`. `VesPerShotQp.psm1` gains `Get-VesStageSourceLocal`,
+`Get-VesVmafScoreShotMw`, `Get-VesShotEncodeBytesOnly`, `Get-VesShotIsNosignal`,
+`Get-VesPerShotQpBracketFor` / `Test-VesShotBracketEdge` /
+`Test-VesShotManifestBracketHealth`, and all the Phase-1 config getters;
+`New-VesShotManifest` writes `cx_*` + `cx_windows` + `field_mode` / `is_bw`
+(via `Get-VesSourceTraits`); `Get-VesVmafScoreShot` reads `$env:SHOT_SRC_LOCAL`
+and applies the progressive-only stride; `Resolve-VesPerShotQp` does the
+bracket + multi-window dispatch + byte de-bias; `Invoke-VesShotSearchClaimed`
+threads `SHOT_FIELD_MODE` / `SHOT_MW_*` and runs the nosignal single-probe;
+`Invoke-VesShotSearchWorkerLoop` stages the source. Parity restored -- ELVIS
+can resume dedicated scene-detect duty; PRINCE / RANDYJ reach feature parity.
 
 ## v6.0.1G — 2026-09-01 (branch `6.x-chunk-redesign`)
 
