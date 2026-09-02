@@ -618,6 +618,16 @@ ALLOC_BYTES_CALIBRATION_K="${ALLOC_BYTES_CALIBRATION_K:-1.13}"
 # allocator a denser curve exactly where its lambda lands. 0 disables.
 PER_SHOT_QP_CROSSOVER_PROBES="${PER_SHOT_QP_CROSSOVER_PROBES:-1}"
 #
+# (B3) local source staging (2026-09-02). The per-shot search re-reads a ~30s
+# window of the source over NFS for every QP probe of every shot -- the
+# dominant cost of the distributed Linux search. When enabled,
+# worker_loop_discovery_multi.sh copies the source to local disk ONCE
+# (_stage_source_local) and exports SHOT_SRC_LOCAL; all extraction probes then
+# read local. Manifest/claims/status stay on NFS (shared coordination).
+# Idempotent per host, disk-guarded, 24h stale sweep.
+SHOT_SRC_LOCAL_STAGE="${SHOT_SRC_LOCAL_STAGE:-true}"
+SHOT_SRC_LOCAL_STAGE_DIR="${SHOT_SRC_LOCAL_STAGE_DIR:-/var/tmp/ves-srcstage}"
+#
 # (#2, GATED OFF) content-adaptive per-shot VMAF target. When true, the
 # per-shot target shifts by up to ±PER_SHOT_ADAPTIVE_TARGET_SPAN from a cheap
 # motion/luma read of the shot: high motion → lower target (the eye can't

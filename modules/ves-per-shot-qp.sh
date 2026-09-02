@@ -96,8 +96,47 @@ discover_svtav1encapp() {
 # and installed to /usr/bin, not whatever a package manager happens to
 # provide.
 # Prints "vmaf bytes" or fails.
+# Stage a fleet-shared (NFS) source to local disk ONCE so the per-shot search
+# stops re-reading a ~30s window over NFS for every QP probe of every shot
+# (2026-09-02 -- the dominant cost of the Linux fleet search; PRINCE was ~4x
+# faster mostly because it works from local disk). Echoes the local path on
+# success, or the original path (unchanged behaviour) on any failure / when
+# disabled. Idempotent + shareable: a re-launched worker on the same host that
+# finds a same-size copy reuses it. The manifest / claims / status stay on
+# NFS -- only the read-heavy extraction source moves local.
+_stage_source_local() {
+  local src="$1" dir base dst want have
+  [ "${SHOT_SRC_LOCAL_STAGE:-true}" = "true" ] || { printf '%s' "$src"; return 0; }
+  [ -f "$src" ] || { printf '%s' "$src"; return 0; }
+  dir="${SHOT_SRC_LOCAL_STAGE_DIR:-/var/tmp/ves-srcstage}"
+  mkdir -p "$dir" 2>/dev/null || { printf '%s' "$src"; return 0; }
+  # sweep stale stages (>24h) so a churn of titles can't fill the disk
+  find "$dir" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null
+  base="$(printf '%s' "$src" | tr -c 'A-Za-z0-9._-' '_')"
+  dst="$dir/$base"
+  want="$(stat -c%s -- "$src" 2>/dev/null || echo 0)"
+  have="$(stat -c%s -- "$dst" 2>/dev/null || echo 0)"
+  if [ "$want" -gt 0 ] && [ "$have" = "$want" ]; then printf '%s' "$dst"; return 0; fi
+  # disk guard: need the file size + 10% headroom on the stage fs
+  local free_kb
+  free_kb="$(df -Pk "$dir" 2>/dev/null | awk 'NR==2{print $4}')"
+  if [ -n "$free_kb" ] && [ "$(( free_kb * 1024 ))" -lt "$(( want + want/10 ))" ]; then
+    warn "_stage_source_local: not enough local space in $dir for $(basename "$src") -- reading from NFS"
+    printf '%s' "$src"; return 0
+  fi
+  # copy to a temp name then rename so a concurrent worker never sees a partial
+  local tmp="$dst.$$.part"
+  if cp -f -- "$src" "$tmp" 2>/dev/null && [ "$(stat -c%s -- "$tmp" 2>/dev/null || echo 0)" = "$want" ]; then
+    mv -f -- "$tmp" "$dst" 2>/dev/null && { printf '%s' "$dst"; return 0; }
+  fi
+  rm -f -- "$tmp" 2>/dev/null
+  printf '%s' "$src"
+}
+
 _vmaf_score_shot() {
   local src="$1" start="$2" end="$3" qp="$4" codec="$5" model="$6" profile="$7"
+  # Read the extraction from a local stage when the worker set one up.
+  src="${SHOT_SRC_LOCAL:-$src}"
   local work clip y4m out out_mkv vlog v b enc_timeout nframes qpfile
   local -a grain_decode_flag=()
   discover_svtav1encapp || return 1
@@ -267,6 +306,9 @@ resolve_per_shot_qp() {
   local -A score=() bytes=()
   local qp above below gap
   LAST_SHOT_SEARCH_SAMPLES=()
+  # read all probes from the worker's local stage when one is set (the
+  # manifest key derived upstream from the ORIGINAL path is unaffected)
+  src="${SHOT_SRC_LOCAL:-$src}"
 
   # --- (#2, GATED) content-adaptive per-shot target -------------------------
   # One cheap ffmpeg read of the shot (no encode): mean luma + inter-frame
