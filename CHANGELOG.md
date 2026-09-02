@@ -4,6 +4,34 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.1G — 2026-09-01 (branch `6.x-chunk-redesign`)
+
+**The `canime` (classic anime, ≤1997) profile was dead for every modular
+consumer.** `anime_profile_for_path()` picks `canime` vs `anime` by comparing
+the title year to `CLASSIC_ANIME_YEAR_CUTOFF` — but that variable was only
+assigned in the `convert-vX.Y.Z.sh` wrapper, *after* it sources the modules.
+Anything that sources `modules/` directly and doesn't set it — the regional
+D-validation survey's `dval_worker_encode.sh`, standalone module use — saw it
+empty, so `[ "$year" -le "" ]` failed and every classic anime silently fell
+through to the modern `anime` profile: `film-grain=6` + `film-grain-denoise`
+grain synthesis applied to flat cel art. Caught on Akira (1988): base AV1
+encode came out **142% of source size at VMAF 88.7**. Moved the definition
+into `modules/ves-config.sh` (env-overridable via
+`CONVERT_CLASSIC_ANIME_YEAR_CUTOFF`); the wrapper's own assignment is now a
+harmless duplicate. Akira and Ghost in the Shell (1995) now resolve to
+`canime`. The Windows fork already defined the cutoff inside
+`VesProfileDecision.psm1` and was not affected.
+
+## v6.0.1F — 2026-09-01 (branch `6.x-chunk-redesign`)
+
+**`_source_is_uhd()` threw on a trailing-comma ffprobe probe.** The v6.0.1E
+helper read width via a raw `-of csv=p=0` probe, which on some MKVs returns
+`3840,` (trailing comma from an empty second field). `[ "3840," -ge 3456 ]`
+is a fatal `integer expression expected`, so The Bad Guys (2022) — a
+3840×1608 master — fell through to the 1080p `neg` model. Now uses
+`video_width` / `video_height` (clean `nokey` format) with a digit-strip;
+`Get-VesVideoWidth`/`Height` in the Windows fork hardened the same way.
+
 ## v6.0.1E — 2026-08-31 (branch `6.x-chunk-redesign`)
 
 **UHD detection missed ultrawide 4K.** `vmaf_model_for_source` /
