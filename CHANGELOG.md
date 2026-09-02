@@ -6,28 +6,27 @@ has the full story — what was wrong, why it mattered, and how it was fixed.
 
 ## v6.0.1I — 2026-09-02 (branch `6.x-chunk-redesign`)
 
-**MARLONJ (macOS) rejoined the per-shot search pool + storage-path rework.**
-With the header-probe timeout fix below, MARLONJ's search worker runs clean
-end-to-end. `dval_research.sh` gained a `mac` host-kind: MARLONJ is now in
-`HOSTS`, launched via `_mac_remote_cmd` (explicit `/opt/homebrew/bin/bash` +
-Homebrew PATH + `/Volumes/*` mount remap + `nohup … & disown`, no `setsid`).
-Each survey title relaunches it.
+**MARLONJ (macOS) rejoined the per-shot search pool.** With the header-probe
+timeout fix below, MARLONJ's search worker runs clean end-to-end.
+`dval_research.sh` gained a `mac` host-kind: MARLONJ is now in `HOSTS`,
+launched via `_mac_remote_cmd` (explicit `/opt/homebrew/bin/bash` + Homebrew
+PATH + `/Volumes/*` mount remap + `nohup … & disown`, no `setsid`). Each
+survey title relaunches it. `VES_METADATA_PROBE_TIMEOUT=60`.
 
-Storage path: the ~17 ms inter-VLAN hop to the NAS (10.10.10.150) is
-universal to every 10.200.200.x fleet box — the Linux boxes hide it with
-NFS `nconnect=8` (8 parallel TCP streams), but macOS's NFS client has no
-`nconnect` and single-streams that RTT at ~10–12 MB/s. Fixed on MARLONJ by
-(1) switching the three media child-datasets from NFS to **SMB3** (macOS
-SMB3 pipelines the latency far better — 3.6× on a cold burst read),
-persisted via a `com.ves.smbmount` LaunchDaemon (`ves-smb-mount.sh`,
-idempotent, `RunAtLoad` + 300 s re-check, only swaps a mount when idle);
-(2) widening TCP socket buffers to 4 MB (`/etc/sysctl.conf`); (3)
-re-enabling local source staging (`SHOT_SRC_LOCAL_STAGE=true`) — stage the
-whole source once over SMB, then every per-shot extract reads local NVMe
-instead of re-paying the NFS latency tax ~100×. `VES_METADATA_PROBE_TIMEOUT=60`.
-(ESET Endpoint on-access scanning still throttles sustained transfers to
-~13 MB/s; exclusions for the mounts + `/var/tmp/ves-srcstage` need the ESET
-PROTECT console — user action.)
+**Local source staging re-enabled for MARLONJ** (`SHOT_SRC_LOCAL_STAGE=true`).
+The ~17 ms inter-VLAN hop to the NAS is universal to every 10.200.200.x
+fleet box — the Linux boxes hide it with NFS `nconnect=8` (8 parallel TCP
+streams), but macOS's NFS client has no `nconnect` and single-streams that
+RTT at ~11 MB/s. A per-shot search does 100+ latency-bound window reads, so
+staging the whole source once (~7 min for a 5 GB file) and reading every
+per-shot extract from local NVMe wins decisively. (SMB3 was tried — 3.6× on
+a cold burst read — but an unidentified remounter on MARLONJ reverts the
+mounts to NFS within ~10 min, and ESET Endpoint's on-access scanner throttles
+*sustained* transfers to ~11–13 MB/s over either protocol, erasing the SMB
+edge. Reverted. TCP socket buffers were widened to 4 MB in `/etc/sysctl.conf`
+— harmless, kept. The real remaining levers are ESET exclusions for
+`/var/tmp/ves-srcstage` via the ESET PROTECT console, and putting MARLONJ on
+the NAS subnet like STING — both out-of-band.)
 
 **Header-only ffprobe probes were getting a file-size-scaled timeout.**
 `_validation_timeout_for_args()` scales the validation timeout by the input
