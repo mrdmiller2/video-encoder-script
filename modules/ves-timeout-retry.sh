@@ -176,6 +176,19 @@ run_with_timeout() {
 _validation_timeout_for_args() {
   local base="${VALIDATION_TIMEOUT_SECS}" cap=3620 extra_per_gib=350
   local f="" prev="" a sz total=0 extra scaled
+
+  # Header-only ffprobe (metadata probe: -show_entries / -show_streams /
+  # -show_format with NO -count_packets / -count_frames / decode) reads a
+  # few KB of container header regardless of file size -- size-scaling its
+  # timeout to ~24 min for a 4 GiB source is wrong, and on macOS NFS a
+  # transient stall then looks like a dead worker for the whole window
+  # (2026-09-02, MARLONJ). Give those a short fixed ceiling.
+  case " $* " in
+    *" -count_packets "*|*" -count_frames "*|*" -f null "*|*" -show_packets "*|*" -show_frames "*) ;;
+    *" -show_entries "*|*" -show_streams "*|*" -show_format "*)
+      printf '%s' "${VES_METADATA_PROBE_TIMEOUT:-90}"; return ;;
+  esac
+
   for a in "$@"; do
     [ "$prev" = "-i" ] && f="$a"
     prev="$a"

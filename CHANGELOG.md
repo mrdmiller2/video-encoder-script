@@ -4,6 +4,21 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.1I — 2026-09-02 (branch `6.x-chunk-redesign`)
+
+**Header-only ffprobe probes were getting a file-size-scaled timeout.**
+`_validation_timeout_for_args()` scales the validation timeout by the input
+size (~350 s/GiB) — correct for `mkvalidator` and full-decode checks, but a
+metadata probe (`ffprobe -show_entries stream=width` / `-show_streams` /
+`-show_format`, no `-count_packets`/`-count_frames`/decode) reads only a few
+KB of container header regardless of file size. A 4 GiB source's
+`video_width`/`video_height` call was getting a ~24-minute timeout; on
+macOS NFS (MARLONJ) a transient read stall inside that window then looked
+exactly like a dead worker — the recurring "MARLONJ contributes ZERO,
+undetected" symptom. Now header-only probes get a fixed 90 s ceiling
+(`VES_METADATA_PROBE_TIMEOUT`); `-count_*` / decode probes keep the
+size-scaled curve.
+
 ## v6.0.1H — 2026-09-02 (branch `6.x-chunk-redesign`)
 
 **Per-shot search speed — Phase 1.** The regional D-validation survey's
