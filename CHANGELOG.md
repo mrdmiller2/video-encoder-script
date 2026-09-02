@@ -6,6 +6,16 @@ has the full story — what was wrong, why it mattered, and how it was fixed.
 
 ## v6.0.1I — 2026-09-02 (branch `6.x-chunk-redesign`)
 
+**MARLONJ (macOS) rejoined the per-shot search pool.** With the header-probe
+timeout fix below, MARLONJ's search worker runs clean end-to-end (verified
+resolving shots 103–115 of Gun Crazy against the live fleet search). Two
+macOS-specific adjustments: local source staging is forced OFF on MARLONJ
+(its NFS is ~4 MB/s — copying a 4 GB source is slower than per-shot NFS
+window reads), and `VES_METADATA_PROBE_TIMEOUT=60`. `dval_research.sh` gained
+a `mac` host-kind: MARLONJ is now in `HOSTS`, launched via `_mac_remote_cmd`
+(explicit `/opt/homebrew/bin/bash` + Homebrew PATH + `/Volumes/*` mount
+remap + `nohup … & disown`, no `setsid`). Each survey title relaunches it.
+
 **Header-only ffprobe probes were getting a file-size-scaled timeout.**
 `_validation_timeout_for_args()` scales the validation timeout by the input
 size (~350 s/GiB) — correct for `mkvalidator` and full-decode checks, but a
