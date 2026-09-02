@@ -252,6 +252,19 @@ CONVERT_CHUNK_TARGET_SECS="${CONVERT_CHUNK_TARGET_SECS:-600}"
 # default for this exact use -- not yet independently tuned/validated
 # against real fleet content.
 SCENE_DETECT_THRESHOLD="${SCENE_DETECT_THRESHOLD:-0.3}"
+# Per-shot complexity index (2026-09-02): when true, shot_split_create_manifest()
+# has scene_detect_boundaries() fan its single decode to a signalstats+entropy
+# branch and writes 4 aggregated fields per shot into shot-NNN.meta --
+#   cx_luma   mean YAVG   (0-255; low => dark / near-black)
+#   cx_motion mean YDIF   (inter-frame luma delta; ~0 => static take)
+#   cx_detail mean entropy (bits ~0-8; low => flat / simple)
+#   cx_sat    mean SATAVG (0 => greyscale source)
+# Feeds: credits/black/static fast-path, per-profile QP-band refinement, shot
+# clustering, and the production content-modifier. Additive + best-effort:
+# false, or any failure, just leaves the fields absent (nothing hard-depends).
+# Cost: ~1 extra filter branch on the decode already being done (no new pass).
+SHOT_COMPLEXITY_ENABLE="${SHOT_COMPLEXITY_ENABLE:-true}"
+SHOT_COMPLEXITY_FPS="${SHOT_COMPLEXITY_FPS:-4}"   # per-frame stats sample rate (keeps the raw file small)
 # Phase 6 (shot_claim_next(), ves-per-shot-qp.sh): staleness ceiling for a
 # claimed-but-not-yet-resolved shot search. Originally set to 1800s on the
 # assumption that a shot's bounded QP search always finishes in minutes

@@ -33,10 +33,82 @@
 # splitter, same pattern chunk_split_create_manifest() already uses for
 # CRF), never per-chunk or per-encoder.
 scene_detect_boundaries() {
-  local src="$1" threshold="${2:-${SCENE_DETECT_THRESHOLD:-0.3}}"
+  local src="$1" threshold="${2:-${SCENE_DETECT_THRESHOLD:-0.3}}" stats_out="${3:-}"
   # showinfo logs at AV_LOG_INFO -- `-v error` would silently suppress every
   # line this function needs; must stay at (or above) info level.
-  "${FFMPEG_CMD[@]}" -nostdin -v info -nostats -i "$src" \
-    -vf "select='gt(scene,${threshold})',showinfo" -an -sn -f null - 2>&1 \
-    | grep -oE 'pts_time:[0-9]+(\.[0-9]+)?' | cut -d: -f2
+  #
+  # Optional 3rd arg: a writable path. When given AND SHOT_COMPLEXITY_ENABLE
+  # is not "false", the SAME single decode also fans the stream to a
+  # signalstats+entropy branch (sampled at SHOT_COMPLEXITY_FPS) whose
+  # per-frame lavfi.* metadata is written to $stats_out -- the raw material
+  # for _shot_complexity_table() (per-shot luma / motion / spatial-detail /
+  # saturation, consumed by credits detection, QP-band refinement, and shot
+  # clustering). Purely additive: callers that pass no path, or set the flag
+  # false, get the exact original behaviour and cost.
+  if [ -n "$stats_out" ] && [ "${SHOT_COMPLEXITY_ENABLE:-true}" != "false" ]; then
+    : > "$stats_out" 2>/dev/null || stats_out=""
+  else
+    stats_out=""
+  fi
+  if [ -n "$stats_out" ]; then
+    local _fps="${SHOT_COMPLEXITY_FPS:-4}"
+    "${FFMPEG_CMD[@]}" -nostdin -v info -nostats -i "$src" -filter_complex "\
+[0:v]split=2[sc][st];\
+[sc]select='gt(scene,${threshold})',showinfo[cuts];\
+[st]fps=${_fps},signalstats,entropy=mode=normal,metadata=print:file='${stats_out}',nullsink" \
+      -map '[cuts]' -an -sn -f null - 2>&1 \
+      | grep -oE 'pts_time:[0-9]+(\.[0-9]+)?' | cut -d: -f2
+  else
+    "${FFMPEG_CMD[@]}" -nostdin -v info -nostats -i "$src" \
+      -vf "select='gt(scene,${threshold})',showinfo" -an -sn -f null - 2>&1 \
+      | grep -oE 'pts_time:[0-9]+(\.[0-9]+)?' | cut -d: -f2
+  fi
+}
+
+# Aggregate a scene_detect_boundaries() stats file into per-shot complexity.
+# Args: <stats_file> <boundaries_csv>  where boundaries_csv is the comma- or
+# newline-joined cut timestamps (NOT including 0 or EOF -- same as the
+# scene_detect_boundaries stdout). Emits one line per shot:
+#   <idx> <luma> <motion> <detail> <sat>
+#   luma   = mean signalstats YAVG   (0-255; low => dark/near-black)
+#   motion = mean signalstats YDIF   (inter-frame luma delta; ~0 => static)
+#   detail = mean entropy.normal.Y   (bits ~0-8; low => flat/simple)
+#   sat    = mean signalstats SATAVG (0 => greyscale)
+# A shot with no sampled frames in range emits all-zero (caller decides).
+_shot_complexity_table() {
+  local stats_file="$1" bounds="$2"
+  [ -s "$stats_file" ] || return 1
+  awk -v bounds="$(printf '%s' "$bounds" | tr '\n' ',' )" '
+    BEGIN {
+      n=split(bounds, bb, ",")
+      nb=0
+      for (i=1;i<=n;i++) if (bb[i] ~ /^[0-9]/) B[nb++]=bb[i]+0
+      # B is sorted ascending already (scene_detect emits increasing)
+      cur=0
+    }
+    /^frame:/ {
+      # new frame block: the previous block is complete -> attribute it
+      if (have) attribute()
+      have=1; t=-1; yavg=""; ydif=""; ent=""; sat=""
+      # pts_time is on this same line
+      for (i=1;i<=NF;i++) if ($i ~ /^pts_time:/) { split($i,a,":"); t=a[2]+0 }
+      next
+    }
+    /^lavfi\.signalstats\.YAVG=/ { split($0,a,"="); yavg=a[2]+0; next }
+    /^lavfi\.signalstats\.YDIF=/ { split($0,a,"="); ydif=a[2]+0; next }
+    /^lavfi\.signalstats\.SATAVG=/ { split($0,a,"="); sat=a[2]+0; next }
+    /^lavfi\.entropy\.entropy\.normal\.Y=/ { split($0,a,"="); ent=a[2]+0; next }
+    function attribute(   s) {
+      s=0
+      while (s < nb && t >= B[s]) s++
+      SL[s]+=yavg; SM[s]+=ydif; SD[s]+=ent; SS[s]+=sat; SC[s]++
+    }
+    END {
+      if (have) attribute()
+      for (s=0; s<=nb; s++) {
+        c = (SC[s] ? SC[s] : 1)
+        printf "%d %.2f %.4f %.4f %.2f\n", s, SL[s]/c, SM[s]/c, SD[s]/c, SS[s]/c
+      }
+    }
+  ' "$stats_file"
 }

@@ -631,18 +631,46 @@ shot_split_create_manifest() {
     err "scene_detect_boundaries() unavailable (ves-scene-detect.sh not loaded?) -- cannot build manifest for $src"
     rm -rf -- "$tmpdir"; rmdir -- "$mdir" 2>/dev/null; return 1
   fi
-  local _boundaries _nb=0
-  _boundaries="$(scene_detect_boundaries "$src")" || {
+  local _boundaries _nb=0 _cx_stats="" _cx_out=""
+  # Per-shot complexity piggyback: scene_detect_boundaries() fans its single
+  # decode to a signalstats+entropy branch when handed a stats path. The raw
+  # per-frame file is LOCAL + transient (can be 10s of MB); only the small
+  # aggregated per-shot table lands in the manifest. Best-effort -- a failure
+  # here leaves the cx_* fields empty, nothing downstream hard-depends on them.
+  if [ "${SHOT_COMPLEXITY_ENABLE:-true}" != "false" ]; then
+    _cx_stats="$(mktemp "${RAMDISK_JOB_DIR:-${TMPDIR:-/tmp}}/ves-cxstats-XXXXXX" 2>/dev/null)" || _cx_stats=""
+  fi
+  _boundaries="$(scene_detect_boundaries "$src" "${SCENE_DETECT_THRESHOLD:-0.3}" "$_cx_stats")" || {
     err "scene_detect_boundaries() failed for $src"
+    [ -n "$_cx_stats" ] && rm -f -- "$_cx_stats"
     rm -rf -- "$tmpdir"; rmdir -- "$mdir" 2>/dev/null; return 1
   }
+  # idx -> "luma motion detail sat"
+  local -A _CX=()
+  if [ -n "$_cx_stats" ] && [ -s "$_cx_stats" ] && declare -F _shot_complexity_table >/dev/null 2>&1; then
+    local _ci _cl _cm _cd _cs
+    while read -r _ci _cl _cm _cd _cs; do
+      [ -n "$_ci" ] && _CX[$_ci]="$_cl $_cm $_cd $_cs"
+    done < <(_shot_complexity_table "$_cx_stats" "$_boundaries" 2>/dev/null)
+  fi
+  [ -n "$_cx_stats" ] && rm -f -- "$_cx_stats"
+
+  _write_shot_cx() {  # $1 = shot index -> appends cx_* lines to stdout
+    local c="${_CX[$1]:-}"
+    [ -n "$c" ] || return 0
+    set -- $c
+    printf 'cx_luma=%s\ncx_motion=%s\ncx_detail=%s\ncx_sat=%s\n' "$1" "$2" "$3" "$4"
+  }
+
   while IFS= read -r ts; do
     [ -n "$ts" ] || continue
-    cat >"${tmpdir}/shot-$(printf '%03d' "$n").meta" <<EOF
+    { cat <<EOF
 index=$n
 start_ts=$prev
 end_ts=$ts
 EOF
+      _write_shot_cx "$n"
+    } >"${tmpdir}/shot-$(printf '%03d' "$n").meta"
     n=$((n + 1)); _nb=$((_nb + 1))
     prev="$ts"
   done <<EOF
@@ -656,11 +684,13 @@ EOF
     rm -rf -- "$tmpdir"; rmdir -- "$mdir" 2>/dev/null; return 1
   fi
   # Final shot runs from the last detected cut to the real end of the file.
-  cat >"${tmpdir}/shot-$(printf '%03d' "$n").meta" <<EOF
+  { cat <<EOF
 index=$n
 start_ts=$prev
 end_ts=$dur
 EOF
+    _write_shot_cx "$n"
+  } >"${tmpdir}/shot-$(printf '%03d' "$n").meta"
   n=$((n + 1))
 
   cat >"${tmpdir}/manifest.meta" <<EOF
