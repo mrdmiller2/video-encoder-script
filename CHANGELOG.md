@@ -4,6 +4,57 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.1H — 2026-09-02 (branch `6.x-chunk-redesign`)
+
+**Per-shot search speed — Phase 1.** The regional D-validation survey's
+distributed per-shot QP search was crawling on long-take content (Gun Crazy
+1950: a 6-minute shot plus 46 shots over 30s; per-shot cost scales with shot
+length, and the fleet re-reads a ~30s window over NFS for every QP probe of
+every shot). Six additive, individually flag-gated changes — each verified as
+a strict no-op with its flag off, shot metas byte-identical:
+
+- **Per-shot complexity index** (`SHOT_COMPLEXITY_ENABLE`, default on):
+  `scene_detect_boundaries()` fans its single decode to a
+  `signalstats,entropy` branch; `shot_split_create_manifest()` writes
+  `cx_luma / cx_motion / cx_detail / cx_sat` into each `shot-NNN.meta`. No new
+  decode. Foundation for the rest and for the production content-modifier.
+- **Local source staging** (`SHOT_SRC_LOCAL_STAGE`, default on):
+  `worker_loop_discovery_multi.sh` copies the NFS source to local disk once
+  (`_stage_source_local` — idempotent per host, disk-guarded, 24h sweep) and
+  every extraction probe reads local instead of re-fetching over NFS. The
+  manifest / claims / status stay on NFS.
+- **Long-shot multi-window** (`PER_SHOT_MULTIWINDOW_ENABLE`, default on): a
+  shot longer than `SHOT_LONG_SECS` (45) is scored as 3 × `PER_SHOT_MW_LEN`
+  (8) s windows placed by content — `_shot_long_windows()` reads the per-frame
+  YDIF and puts each window on its third's peak inter-frame motion (baked into
+  the meta as `cx_windows=`). `_vmaf_score_shot_mw()` combines: median of the
+  3 window VMAFs + rate-scaled bytes. Same `(qp,vmaf,bytes)` contract, so
+  `resolve_per_shot_qp()` is agnostic.
+- **VMAF frame stride** (`PER_SHOT_VMAF_STRIDE`, default 2): score every Sth
+  frame in the *search* only (the final whole-file measure is never strided).
+  Applied ONLY when the source is confirmed progressive —
+  `shot_split_create_manifest()` records `field_mode` + `is_bw` via
+  `detect_source_traits()`, threaded to the search as `SHOT_FIELD_MODE`;
+  telecine / interlaced / ambiguous / unknown all force stride 1.
+- **Zero-signal fast-path** (`PER_SHOT_NOSIGNAL_FASTPATH`, default on): a shot
+  that is near-black, static, and flat (triple gate on the complexity fields:
+  `cx_luma` < 16, `cx_motion` < 1.0, `cx_detail` < 3.0) gets `NOSIG_QP` (48)
+  with no search, marked `nosignal=1`. The detail gate keeps credits text and
+  grain-on-a-dark-scene out. Coverage counters count `vmaf=[0-9]` OR
+  `nosignal=1`.
+- **Per-profile QP bracket** (`PER_SHOT_QP_BRACKET_ENABLE`, default **off**):
+  scaffolding only. `_per_shot_qp_bracket_for()` returns a per-profile search
+  band; `shot_manifest_bracket_health()` + a searchwalk guard re-search a
+  title wide when more than `PER_SHOT_QP_BRACKET_EDGE_FAIL_PCT` (5) % of its
+  shots resolve at/past a band edge. Band values are placeholders pending a
+  research pass — the survey itself is the corpus. Measured so far: vintage
+  genuinely wants the QP floor (36 % of Gun Crazy shots at qp ≤ 14), so its
+  band stays near-global.
+
+The Windows fork owes the port of the `scene_detect_boundaries` /
+`shot_split_create_manifest` / per-shot-search changes; the shared VERSION
+bumps in lockstep per fleet policy.
+
 ## v6.0.1G — 2026-09-01 (branch `6.x-chunk-redesign`)
 
 **The `canime` (classic anime, ≤1997) profile was dead for every modular
