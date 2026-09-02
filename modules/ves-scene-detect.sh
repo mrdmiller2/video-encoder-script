@@ -112,3 +112,56 @@ _shot_complexity_table() {
     }
   ' "$stats_file"
 }
+
+# Content-driven window placement for a long shot. Reads the per-frame YDIF
+# samples in [start,end), splits the shot into 3 equal thirds, and in each
+# third finds the <win_len>s window whose summed inter-frame motion is
+# highest -- so the 3 sample windows land where the shot actually changes,
+# not at fixed 1/4-1/2-3/4 marks. Prints "o1,o2,o3" (window START offsets in
+# seconds, relative to the shot start, ascending). Falls back to the third's
+# centre when a third has too few samples. Empty output => caller uses even
+# spacing or a full-shot search.
+_shot_long_windows() {
+  local stats_file="$1" start="$2" end="$3" win_len="${4:-8}"
+  [ -s "$stats_file" ] || return 1
+  awk -v S="$start" -v E="$end" -v L="$win_len" '
+    /^frame:/ { ct=-1; for(i=1;i<=NF;i++) if($i ~ /^pts_time:/){ split($i,a,":"); ct=a[2]+0 }; next }
+    /^lavfi\.signalstats\.YDIF=/ {
+      if (ct < S || ct >= E) next
+      split($0,a,"="); T[n]=ct; Y[n]=a[2]+0; n++
+      next
+    }
+    END {
+      D = E - S
+      if (n < 6 || D <= L*1.5) exit 1
+      step = (T[n-1]-T[0])/(n-1); if (step <= 0) step = 0.25
+      wspan = int(L/step + 0.5); if (wspan < 1) wspan = 1
+      # sliding-window YDIF sum starting at each sample i (window = wspan samples)
+      for (i=0; i<n; i++) {
+        s=0; c=0
+        for (j=i; j<n && j<i+wspan; j++) { s+=Y[j]; c++ }
+        WS[i] = (c ? s/c : 0)
+      }
+      out=""
+      for (k=0; k<3; k++) {
+        lo = S + k*D/3.0; hi = S + (k+1)*D/3.0
+        centre = (lo-S) + (D/3.0 - L)/2.0; if (centre<0) centre=0
+        best=-1; boff=centre; msum=0; mc=0
+        for (i=0; i<n; i++) {
+          if (T[i] < lo || T[i] >= hi) continue
+          if (T[i] + L > E) continue
+          msum += WS[i]; mc++
+          if (WS[i] > best) { best=WS[i]; boff=T[i]-S }
+        }
+        # flat third (peak within 8% of the third mean) => centre it, dont
+        # chase sampling noise
+        if (mc > 0 && best <= (msum/mc) * 1.08) boff = centre
+        if (boff < 0) boff=0
+        if (S + boff + L > E) boff = (E-S) - L
+        if (boff < 0) boff=0
+        out = out (k?",":"") sprintf("%.2f", boff)
+      }
+      print out
+    }
+  ' "$stats_file"
+}

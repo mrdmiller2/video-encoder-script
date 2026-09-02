@@ -628,6 +628,25 @@ PER_SHOT_QP_CROSSOVER_PROBES="${PER_SHOT_QP_CROSSOVER_PROBES:-1}"
 SHOT_SRC_LOCAL_STAGE="${SHOT_SRC_LOCAL_STAGE:-true}"
 SHOT_SRC_LOCAL_STAGE_DIR="${SHOT_SRC_LOCAL_STAGE_DIR:-/var/tmp/ves-srcstage}"
 #
+# (B4) long-shot multi-window search (2026-09-02). A per-shot QP search on a
+# 6-minute take is a 20-40GB ffv1 + hours per QP probe. Instead, for a shot
+# longer than SHOT_LONG_SECS, score PER_SHOT_MW_WINDOWS windows of
+# PER_SHOT_MW_LEN s each, placed by content (peak inter-frame motion within
+# each third, via _shot_long_windows / cx_windows in the shot meta), and
+# combine: MEDIAN window VMAF + rate-scaled bytes. No accuracy loss on static
+# takes (the survey norm); a genuinely ramping take gets one compromise QP
+# (the era-routed split+smooth production feature refines that later).
+PER_SHOT_MULTIWINDOW_ENABLE="${PER_SHOT_MULTIWINDOW_ENABLE:-true}"
+SHOT_LONG_SECS="${SHOT_LONG_SECS:-45}"
+PER_SHOT_MW_WINDOWS="${PER_SHOT_MW_WINDOWS:-3}"
+PER_SHOT_MW_LEN="${PER_SHOT_MW_LEN:-8}"
+#
+# (B5) VMAF frame stride in the SEARCH only (never the final whole-file
+# measure). Relative QP comparison is stable under frame decimation. Applied
+# ONLY when the source is confirmed progressive -- telecine / interlaced /
+# ambiguous / unknown alias badly (combing, 3:2 dupes), so they force stride 1.
+PER_SHOT_VMAF_STRIDE="${PER_SHOT_VMAF_STRIDE:-2}"
+#
 # (#2, GATED OFF) content-adaptive per-shot VMAF target. When true, the
 # per-shot target shifts by up to ±PER_SHOT_ADAPTIVE_TARGET_SPAN from a cheap
 # motion/luma read of the shot: high motion → lower target (the eye can't

@@ -211,13 +211,59 @@ _vmaf_score_shot() {
     *) rm -rf "$work"; return 1 ;;
   esac
   vlog="${out}.vmaf.json"
+  # VMAF frame stride: score every Sth frame in the SEARCH only (relative QP
+  # comparison is stable under subsampling; the final whole-file measure is
+  # never strided). S>1 ONLY when the source is confirmed progressive --
+  # telecine/interlaced/ambiguous/unknown alias badly under frame decimation
+  # (combing on alternate fields, 3:2 pulldown dupes). SHOT_FIELD_MODE is set
+  # per-title by shot_search_claimed() from manifest.meta.
+  local _stride=1 _sel=""
+  if [ "${SHOT_FIELD_MODE:-unknown}" = "progressive" ]; then
+    _stride="${PER_SHOT_VMAF_STRIDE:-2}"
+  fi
+  [ "${_stride:-1}" -gt 1 ] 2>/dev/null && _sel="select='not(mod(n\,${_stride}))',"
   _run_timeout_retry "$enc_timeout" "${FFMPEG_CMD[@]}" -y -v error "${grain_decode_flag[@]}" -i "$out_mkv" -i "$clip" -lavfi \
-    "[0:v]setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]setpts=PTS-STARTPTS,format=yuv420p10le[r];[d][r]libvmaf=model=$model:n_threads=$(nproc 2>/dev/null || sysctl -n hw.ncpu):log_fmt=json:log_path=$vlog" \
+    "[0:v]${_sel}setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]${_sel}setpts=PTS-STARTPTS,format=yuv420p10le[r];[d][r]libvmaf=model=$model:n_threads=$(nproc 2>/dev/null || sysctl -n hw.ncpu):log_fmt=json:log_path=$vlog" \
     -f null - 2>/dev/null || { rm -rf "$work"; return 1; }
   v="$(python3 -c "import json;print(round(json.load(open('$vlog'))['pooled_metrics']['vmaf']['mean'],2))" 2>/dev/null)" || { rm -rf "$work"; return 1; }
   b="$(file_size_bytes "$out")"
   rm -rf "$work"
   printf '%s %s' "$v" "$b"
+}
+
+# Multi-window scorer for a LONG shot: instead of extracting + encoding +
+# scoring the whole shot (a 6-min take => 20-40GB ffv1, hours per QP probe),
+# score 3 short windows placed by content (SHOT_MW_OFFSETS, seconds from the
+# shot start -- content-driven from _shot_long_windows(), or evenly spaced as
+# a fallback) and combine:
+#   vmaf  = MEDIAN of the 3 window VMAFs   (robust to one odd window)
+#   bytes = mean(window_bytes / window_secs) * shot_secs   (rate-scaled)
+# Same (qp,vmaf,bytes) contract as _vmaf_score_shot so resolve_per_shot_qp()
+# is agnostic. Env in: SHOT_MW_OFFSETS (csv), SHOT_MW_LEN (default 8).
+_vmaf_score_shot_mw() {
+  local src="$1" start="$2" end="$3" qp="$4" codec="$5" model="$6" profile="$7"
+  local wl="${SHOT_MW_LEN:-8}" offs="${SHOT_MW_OFFSETS:-}" shot_dur o ws we r wv wb
+  local -a vs=() rates=()
+  shot_dur="$(awk -v a="$start" -v b="$end" 'BEGIN{d=b-a; if(d<0)d=0; printf "%.6f", d}')"
+  [ -n "$offs" ] || offs="$(awk -v d="$shot_dur" -v l="$wl" 'BEGIN{
+      for(k=0;k<3;k++){o=d*(2*k+1)/6.0 - l/2.0; if(o<0)o=0; if(o+l>d)o=d-l; if(o<0)o=0; printf "%s%.2f",(k?",":""),o}}')"
+  local IFS=,
+  for o in $offs; do
+    IFS=' '
+    ws="$(awk -v s="$start" -v o="$o" 'BEGIN{printf "%.6f", s+o}')"
+    we="$(awk -v s="$ws" -v l="$wl" -v e="$end" 'BEGIN{x=s+l; if(x>e)x=e; printf "%.6f", x}')"
+    r="$(_vmaf_score_shot "$src" "$ws" "$we" "$qp" "$codec" "$model" "$profile")" || continue
+    wv="${r%% *}"; wb="${r##* }"
+    [ -n "$wv" ] && [ -n "$wb" ] || continue
+    vs+=("$wv")
+    rates+=("$(awk -v b="$wb" -v s="$ws" -v e="$we" 'BEGIN{d=e-s; if(d<=0){print 0;exit} printf "%.6f", b/d}')")
+  done
+  [ "${#vs[@]}" -ge 1 ] || return 1
+  # median vmaf
+  local med; med="$(printf '%s\n' "${vs[@]}" | sort -n | awk '{a[NR]=$1} END{print (NR%2)? a[int(NR/2)+1] : (a[NR/2]+a[NR/2+1])/2}')"
+  # rate-scaled bytes
+  local est; est="$(printf '%s\n' "${rates[@]}" | awk -v d="$shot_dur" '{s+=$1;n++} END{if(n) printf "%d", (s/n)*d; else print 0}')"
+  printf '%s %s' "$med" "$est"
 }
 
 # Linear interpolation between two real, bracketing (QP,VMAF) samples to
@@ -339,13 +385,20 @@ resolve_per_shot_qp() {
     log_err "  per-shot adaptive-target shot=${start}-${end} yavg=${_yavg} motion=${_motion} base=${_base_t} -> target=${target}"
   fi
 
+  # Long-shot multi-window path: shot_search_claimed() sets SHOT_MW_ACTIVE=1
+  # (+ SHOT_MW_OFFSETS) when this shot is longer than SHOT_LONG_SECS and
+  # PER_SHOT_MULTIWINDOW_ENABLE is on.
+  local _score_fn=_vmaf_score_shot
+  if [ "${SHOT_MW_ACTIVE:-0}" = "1" ] && declare -F _vmaf_score_shot_mw >/dev/null 2>&1; then
+    _score_fn=_vmaf_score_shot_mw
+  fi
   _probe_qp() {
     local q="$1" r
     [ -n "${score[$q]:-}" ] && return 0
-    r="$(_vmaf_score_shot "$src" "$start" "$end" "$q" "$codec" "$model" "$profile")" || return 1
+    r="$("$_score_fn" "$src" "$start" "$end" "$q" "$codec" "$model" "$profile")" || return 1
     score[$q]="${r%% *}"; bytes[$q]="${r##* }"
     LAST_SHOT_SEARCH_SAMPLES+=("${q}:${score[$q]}:${bytes[$q]}")
-    log_err "  per-shot qp-search [$codec] shot=${start}-${end} qp=$q vmaf=${score[$q]}"
+    log_err "  per-shot qp-search [$codec]${SHOT_MW_ACTIVE:+ mw} shot=${start}-${end} qp=$q vmaf=${score[$q]}"
   }
 
   # QP shares CRF's exact 0-63 scale and direction in this SVT-AV1 build
@@ -687,7 +740,8 @@ shot_split_create_manifest() {
     [ -n "$_cx_stats" ] && rm -f -- "$_cx_stats"
     rm -rf -- "$tmpdir"; rmdir -- "$mdir" 2>/dev/null; return 1
   }
-  # idx -> "luma motion detail sat"
+  # idx -> "luma motion detail sat"  (raw stats file kept until after the meta
+  # loop -- _shot_long_windows() re-reads it per long shot for window placement)
   local -A _CX=()
   if [ -n "$_cx_stats" ] && [ -s "$_cx_stats" ] && declare -F _shot_complexity_table >/dev/null 2>&1; then
     local _ci _cl _cm _cd _cs
@@ -695,13 +749,23 @@ shot_split_create_manifest() {
       [ -n "$_ci" ] && _CX[$_ci]="$_cl $_cm $_cd $_cs"
     done < <(_shot_complexity_table "$_cx_stats" "$_boundaries" 2>/dev/null)
   fi
-  [ -n "$_cx_stats" ] && rm -f -- "$_cx_stats"
 
-  _write_shot_cx() {  # $1 = shot index -> appends cx_* lines to stdout
-    local c="${_CX[$1]:-}"
-    [ -n "$c" ] || return 0
-    set -- $c
-    printf 'cx_luma=%s\ncx_motion=%s\ncx_detail=%s\ncx_sat=%s\n' "$1" "$2" "$3" "$4"
+  local _long_secs="${SHOT_LONG_SECS:-45}" _mw_len="${PER_SHOT_MW_LEN:-8}"
+  _write_shot_cx() {  # <idx> <start_ts> <end_ts> -> appends cx_* lines to stdout
+    local c="${_CX[$1]:-}" _sdur _win
+    if [ -n "$c" ]; then
+      set -- "$1" "$2" "$3" $c   # $4..$7 = luma motion detail sat
+      printf 'cx_luma=%s\ncx_motion=%s\ncx_detail=%s\ncx_sat=%s\n' "$4" "$5" "$6" "$7"
+      set -- "$1" "$2" "$3"
+    fi
+    # content-driven multi-window offsets for a LONG shot
+    _sdur="$(awk -v a="$2" -v b="$3" 'BEGIN{d=b-a; if(d<0)d=0; printf "%.3f", d}')"
+    if [ -n "$_cx_stats" ] && [ -s "$_cx_stats" ] \
+       && awk -v d="$_sdur" -v l="$_long_secs" 'BEGIN{exit !(d+0 > l+0)}' \
+       && declare -F _shot_long_windows >/dev/null 2>&1; then
+      _win="$(_shot_long_windows "$_cx_stats" "$2" "$3" "$_mw_len" 2>/dev/null)"
+      [ -n "$_win" ] && printf 'cx_windows=%s\n' "$_win"
+    fi
   }
 
   while IFS= read -r ts; do
@@ -711,7 +775,7 @@ index=$n
 start_ts=$prev
 end_ts=$ts
 EOF
-      _write_shot_cx "$n"
+      _write_shot_cx "$n" "$prev" "$ts"
     } >"${tmpdir}/shot-$(printf '%03d' "$n").meta"
     n=$((n + 1)); _nb=$((_nb + 1))
     prev="$ts"
@@ -731,9 +795,21 @@ index=$n
 start_ts=$prev
 end_ts=$dur
 EOF
-    _write_shot_cx "$n"
+    _write_shot_cx "$n" "$prev" "$dur"
   } >"${tmpdir}/shot-$(printf '%03d' "$n").meta"
   n=$((n + 1))
+  [ -n "$_cx_stats" ] && rm -f -- "$_cx_stats"
+
+  # Field mode (progressive/telecine/interlaced/ambiguous) + B&W, resolved once
+  # so every search worker uses the same VMAF-stride decision (stride only when
+  # progressive -- telecine/interlace/ambiguous/unknown alias under frame
+  # subsampling). detect_source_traits() is a read-only idet probe, cached.
+  local _fm="unknown" _bw="0" _st
+  if declare -F detect_source_traits >/dev/null 2>&1; then
+    _st="$(detect_source_traits "$src" 2>/dev/null)" || _st=""
+    [[ "$_st" =~ field_mode=([a-z]+) ]] && _fm="${BASH_REMATCH[1]}"
+    [[ "$_st" =~ is_bw=([01]) ]] && _bw="${BASH_REMATCH[1]}"
+  fi
 
   cat >"${tmpdir}/manifest.meta" <<EOF
 source=$src
@@ -742,6 +818,8 @@ codec=$codec
 profile=$profile
 target=$target
 model=$model
+field_mode=$_fm
+is_bw=$_bw
 created_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 created_host=$(hostname 2>/dev/null || echo unknown)
 EOF
@@ -953,6 +1031,24 @@ shot_search_claimed() {
   # on MJACKSON (invalid libvmaf model= argument -> every ffmpeg call
   # failed -> every shot fell back to the static fixed-QP default).
   model="$(awk -F= '/^model=/{print substr($0,index($0,"=")+1); exit}' "$mdir/manifest.meta")"
+
+  # Per-title / per-shot search modifiers, resolved from the manifest here so
+  # resolve_per_shot_qp() + _vmaf_score_shot() stay signature-stable:
+  #  - SHOT_FIELD_MODE drives the VMAF frame-stride decision
+  #  - SHOT_MW_ACTIVE / SHOT_MW_OFFSETS drive the long-shot multi-window path
+  local _fieldmode _cxwin _sdur
+  _fieldmode="$(awk -F= '/^field_mode=/{print $2; exit}' "$mdir/manifest.meta")"
+  export SHOT_FIELD_MODE="${_fieldmode:-unknown}"
+  unset SHOT_MW_ACTIVE SHOT_MW_OFFSETS
+  if [ "${PER_SHOT_MULTIWINDOW_ENABLE:-true}" = "true" ]; then
+    _sdur="$(awk -v a="$start_ts" -v b="$end_ts" 'BEGIN{d=b-a; if(d<0)d=0; printf "%.3f", d}')"
+    if awk -v d="$_sdur" -v l="${SHOT_LONG_SECS:-45}" 'BEGIN{exit !(d+0 > l+0)}'; then
+      _cxwin="$(awk -F= '/^cx_windows=/{print $2; exit}' "$shot_meta")"
+      export SHOT_MW_ACTIVE=1
+      export SHOT_MW_OFFSETS="$_cxwin"        # empty => _vmaf_score_shot_mw uses even spacing
+      export SHOT_MW_LEN="${PER_SHOT_MW_LEN:-8}"
+    fi
+  fi
 
   result="$(resolve_per_shot_qp "$src" "$start_ts" "$end_ts" "$codec" "$target" "$model" "$profile")"
   local samples="" search_failed=0 bracket_edge=0 _bl _bh
