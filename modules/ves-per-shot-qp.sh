@@ -338,6 +338,27 @@ _per_shot_qp_bracket_for() {
   fi
 }
 
+# Zero-signal shot? Pure black / fade / flat static card -- carries no
+# rate-distortion calibration signal and ~0 bytes, so a full QP search on it
+# is wasted. Triple-gated on the manifest complexity fields (no encode):
+#   cx_luma  < NOSIG_BLACK_LUMA      (near-black)
+#   cx_motion < NOSIG_STATIC_MOTION  (nothing moving)
+#   cx_detail < NOSIG_FLAT_DETAIL    (genuinely flat -- excludes credits text,
+#                                     grain on a dark scene, etc.)
+# Reads the shot meta ($1). Returns 0 (is zero-signal) / 1 (search it).
+_shot_is_nosignal() {
+  local meta="$1" l m d
+  [ "${PER_SHOT_NOSIGNAL_FASTPATH:-true}" = "true" ] || return 1
+  [ -f "$meta" ] || return 1
+  l="$(awk -F= '/^cx_luma=/{print $2; exit}' "$meta")"
+  m="$(awk -F= '/^cx_motion=/{print $2; exit}' "$meta")"
+  d="$(awk -F= '/^cx_detail=/{print $2; exit}' "$meta")"
+  [ -n "$l" ] && [ -n "$m" ] && [ -n "$d" ] || return 1
+  awk -v l="$l" -v m="$m" -v d="$d" \
+      -v L="${NOSIG_BLACK_LUMA:-16}" -v M="${NOSIG_STATIC_MOTION:-1.0}" -v D="${NOSIG_FLAT_DETAIL:-3.0}" \
+      'BEGIN{ exit !(l+0 < L && m+0 < M && d+0 < D) }'
+}
+
 # SCAFFOLDING -- was this shot's resolved QP at/past its search band edge?
 # Args: <resolved_qp> <band_lo> <band_hi>.  echoes "1" (edge) or "0".
 # Consumed by the (not-yet-wired) title-level bracket-health check that
@@ -1050,9 +1071,23 @@ shot_search_claimed() {
     fi
   fi
 
-  result="$(resolve_per_shot_qp "$src" "$start_ts" "$end_ts" "$codec" "$target" "$model" "$profile")"
+  # Zero-signal fast-path: pure black / fade / flat static -> assign a fixed
+  # high QP, skip the search. Marked nosignal=1 so the coverage gate counts it
+  # as accounted-for and the allocator treats it as a reserved fixed-cost shot
+  # (same lane as search_failed, but deliberate -- not a failure).
+  local nosignal=0
+  result=""
+  if declare -F _shot_is_nosignal >/dev/null 2>&1 && _shot_is_nosignal "$shot_meta"; then
+    nosignal=1
+    result="${NOSIG_QP:-${PER_SHOT_QP_EXTEND_CEIL:-48}} "   # "qp <empty-vmaf> <empty-samples>"
+    warn "per-shot NOSIGNAL (black/static) shot ${start_ts}-${end_ts} -> fixed qp=${result% }"
+  else
+    result="$(resolve_per_shot_qp "$src" "$start_ts" "$end_ts" "$codec" "$target" "$model" "$profile")"
+  fi
   local samples="" search_failed=0 bracket_edge=0 _bl _bh
-  if [ -n "$result" ]; then
+  if [ "$nosignal" = 1 ]; then
+    read -r qp vmaf samples <<<"$result"; search_failed=1
+  elif [ -n "$result" ]; then
     # 3 whitespace-separated fields (qp, vmaf, samples) -- read, not the
     # old first/last-field shortcut, since the samples field itself would
     # otherwise be mistaken for the last field (see resolve_per_shot_qp()'s
@@ -1086,6 +1121,10 @@ shot_search_claimed() {
     # resolved status (don't block the pipeline) but marked so the
     # allocator and credits detection can tell it apart from a real result.
     printf 'search_failed=%s\n' "$search_failed"
+    # 1 = deliberate zero-signal skip (black/fade/flat static): fixed QP, no
+    # search. Distinct from a real search_failed -- the coverage gate counts
+    # nosignal shots as accounted-for.
+    printf 'nosignal=%s\n' "$nosignal"
     # SCAFFOLDING: 1 if this shot's resolved QP sat at/past its per-profile
     # search band edge (band unfit for this shot). Title-level guard (TODO,
     # searchwalk) re-runs a title wide when >PER_SHOT_QP_BRACKET_EDGE_FAIL_PCT

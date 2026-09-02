@@ -647,6 +647,18 @@ PER_SHOT_MW_LEN="${PER_SHOT_MW_LEN:-8}"
 # ambiguous / unknown alias badly (combing, 3:2 dupes), so they force stride 1.
 PER_SHOT_VMAF_STRIDE="${PER_SHOT_VMAF_STRIDE:-2}"
 #
+# (B6) zero-signal shot fast-path (2026-09-02). Pure black / fade / flat
+# static cards carry no rate-distortion calibration signal and ~0 bytes.
+# shot_search_claimed() triple-gates on the manifest complexity fields (no
+# encode) and, when all 3 hold, assigns NOSIG_QP and skips the search --
+# marked nosignal=1 (counts as accounted-for; allocator reserves it as a
+# fixed-cost shot). The detail gate excludes credits text / grain-on-dark.
+PER_SHOT_NOSIGNAL_FASTPATH="${PER_SHOT_NOSIGNAL_FASTPATH:-true}"
+NOSIG_BLACK_LUMA="${NOSIG_BLACK_LUMA:-16}"      # cx_luma below => near-black
+NOSIG_STATIC_MOTION="${NOSIG_STATIC_MOTION:-1.0}"  # cx_motion (YDIF) below => static
+NOSIG_FLAT_DETAIL="${NOSIG_FLAT_DETAIL:-3.0}"   # cx_detail (entropy bits) below => genuinely flat
+NOSIG_QP="${NOSIG_QP:-48}"                       # fixed QP for a zero-signal shot
+#
 # (#2, GATED OFF) content-adaptive per-shot VMAF target. When true, the
 # per-shot target shifts by up to ±PER_SHOT_ADAPTIVE_TARGET_SPAN from a cheap
 # motion/luma read of the shot: high motion → lower target (the eye can't
