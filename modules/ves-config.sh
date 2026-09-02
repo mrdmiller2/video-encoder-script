@@ -6,7 +6,7 @@
 # MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
 # bug fix) -- see its own comment.
 
-VERSION="6.0.1F"
+VERSION="6.0.1G"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
 # as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
@@ -701,6 +701,14 @@ SVT_PARAMS_ANIME='enable-qm=1:film-grain-denoise=1:film-grain=6:qm-min=0:scd=1:e
 # variance-boost-strength than modern anime (high variance-boost starves
 # flat regions of bits, the opposite of what hard-edged flat cel color needs).
 SVT_PARAMS_CANIME='enable-qm=1:qm-min=0:scd=1:enable-tf=0:keyint=15s:aq-mode=2:enable-variance-boost=1:variance-boost-strength=1:variance-octile=4:enable-overlays=1:sharpness=3'
+# The <=1997 boundary that anime_profile_for_path() uses to pick canime vs anime.
+# Historically defined only in the convert-vX.Y.Z.sh wrapper (after it sources
+# this module), so every MODULAR consumer -- the regional survey's
+# dval_worker_encode.sh, the Windows fork, any standalone module sourcing -- saw
+# it empty and silently fell through to the modern `anime` profile (film-grain=6
+# grain synth on flat cel art). Found 2026-09-01 on Akira (1988): base encode
+# 142% of source at VMAF 88.7. Defined here so it travels with the profile logic.
+CLASSIC_ANIME_YEAR_CUTOFF="${CONVERT_CLASSIC_ANIME_YEAR_CUTOFF:-1997}"
 SVT_PARAMS_MOVIES='enable-qm=1:qm-min=0:keyint=15s:scd=1:aq-mode=2'
 SVT_PARAMS_CLASSIC='enable-qm=1:film-grain-denoise=1:film-grain=6:qm-min=0:scd=1:enable-tf=1:keyint=15s:aq-mode=2:enable-variance-boost=1:variance-boost-strength=1:variance-octile=4:sharpness=1'
 SVT_PARAMS_VINTAGE='enable-qm=1:film-grain-denoise=1:film-grain=12:qm-min=0:scd=1:enable-tf=1:keyint=15s:aq-mode=2:enable-variance-boost=1:variance-boost-strength=2:variance-octile=4:sharpness=1'
