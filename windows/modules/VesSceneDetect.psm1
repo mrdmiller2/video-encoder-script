@@ -49,11 +49,15 @@ function Get-VesSceneBoundaries {
     $argv = @()
     if ($wantStats) {
         $fps = if ($env:SHOT_COMPLEXITY_FPS) { [int]$env:SHOT_COMPLEXITY_FPS } else { 4 }
-        # metadata=print:file= wants a forward-slash path even on Windows
-        $statsFf = ($StatsOut -replace '\\', '/')
+        # metadata=print:file= must be a BARE filename with the process CWD set
+        # to its directory -- a Windows drive-letter path (C:\... or C:/...)
+        # breaks ffmpeg's ':'-delimited filter-option parser (same fix as
+        # VesVmafCrfSearch.psm1's libvmaf log_path, 2026-08-05).
+        $statsName = Split-Path -Leaf $StatsOut
+        $psi.WorkingDirectory = Split-Path -Parent $StatsOut
         $fc = "[0:v]split=2[sc][st];" +
               "[sc]select='gt(scene,$threshStr)',showinfo[cuts];" +
-              "[st]fps=$fps,signalstats,entropy=mode=normal,metadata=print:file='$statsFf',nullsink"
+              "[st]fps=$fps,signalstats,entropy=mode=normal,metadata=print:file=$statsName,nullsink"
         $argv = @('-nostdin', '-v', 'info', '-nostats', '-i', $Source,
                   '-filter_complex', $fc, '-map', '[cuts]', '-an', '-sn', '-f', 'null', '-')
     } else {
