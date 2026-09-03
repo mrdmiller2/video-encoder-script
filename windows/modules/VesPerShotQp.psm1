@@ -4,24 +4,12 @@
 # reasoning (why SvtAv1EncApp --qpfile not ffmpeg -qp; why one continuous
 # encode with a per-frame qpfile, not per-shot spliced files).
 #
-# Deliberate Windows deviation from the bash version, not an oversight:
-# bash's per-shot claim reuses atomic mkdir-lock (same idiom as
-# place_in_progress_flag / chunk_claim_next). This port instead reuses
-# VesSharedMutex's atomic-FILE-creation primitive, for the exact same
-# documented reason VesTitleLock / VesChunkCoordinator avoid mkdir on
-# Windows: this NAS's SMB share gives freshly-created DIRECTORIES a
-# broken ACL that even the creating session can't write into
-# (VesSharedMutex.psm1's own header comment). The shot MANIFEST
-# directory itself (not a lock, a real content container) still has to
-# be a directory -- created via New-Item, then immediately widened via
-# Set-VesEveryoneReadWrite (VesDoneLog.psm1), matching
-# VesChunkCoordinator's established fix.
-#
-# Path keying also follows VesChunkCoordinator: full filename (not
-# bash's extension-stripped canonical_title_from_source). Manifest =
-# "<leaf>.shots", lock = "<leaf>.shot<N>.lock". Cross-platform claim
-# sharing with a concurrent bash fleet is therefore NOT automatic for
-# this stage -- same tradeoff already accepted for .chunks.
+# Per-shot claim coordination intentionally matches the live bash fleet:
+# canonical_title_from_source() keying, <title>.shots manifests, and
+# atomic mkdir-style <title>.shot<N>.lock directories with owner.meta
+# inside the lock dir. The earlier Windows file-lock deviation is obsolete
+# now that the NAS media datasets use posix ACLs and PRINCE can create,
+# write inside, mtime-check, rename, and remove SMB directories reliably.
 #
 # STAGE 2 DEFERRED (allocator still being calibrated by a live survey):
 #   - assemble_qpfile_via_equal_slope_budget  -> Assemble-VesQpfileViaEqualSlopeBudget
@@ -56,6 +44,9 @@ if (-not (Get-Module -Name VesVmafCrfSearch)) {
 }
 if (-not (Get-Module -Name VesSceneDetect)) {
     Import-Module (Join-Path $PSScriptRoot 'VesSceneDetect.psm1') -Force
+}
+if (-not (Get-Module -Name VesOrganize)) {
+    Import-Module (Join-Path $PSScriptRoot 'VesOrganize.psm1') -Force
 }
 
 # Manifest-build incomplete reclaim ceiling (bash: 1800s) -- scene-detect
@@ -176,42 +167,87 @@ function Test-VesShotBracketEdge {
     if ($Qp -le $Lo -or $Qp -ge $Hi) { return 1 } else { return 0 }
 }
 
+function Get-VesUtcStamp {
+    return [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Write-VesKvFile {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Lines
+    )
+    $dir = Split-Path -Parent $Path
+    if (-not $dir) { $dir = '.' }
+    $leaf = Split-Path -Leaf $Path
+    $tmp = Join-Path $dir (".$leaf.$PID.$(Get-Random).tmp")
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($tmp, (($Lines -join "`n") + "`n"), $utf8NoBom)
+    try {
+        [System.IO.File]::Move($tmp, $Path, $true)
+    } catch {
+        Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop
+    }
+}
+
+function Convert-VesFleetPath {
+    param(
+        [Parameter(Mandatory, Position = 0)][string]$Path,
+        [Parameter(Mandatory)][ValidateSet('Windows', 'Linux')][string]$To
+    )
+    $maps = @(
+        [PSCustomObject]@{ Linux = '/mnt/BigMomma/Media'; Windows = '\\10.10.10.150\Media' },
+        [PSCustomObject]@{ Linux = '/mnt/BabyBear/Media'; Windows = '\\10.10.10.150\BabyBearMedia' },
+        [PSCustomObject]@{ Linux = '/mnt/BigPoppa/Media'; Windows = '\\10.10.10.150\BigPoppaMedia' }
+    )
+    foreach ($m in $maps) {
+        if ($To -eq 'Windows') {
+            if ($Path.Equals($m.Linux, [System.StringComparison]::Ordinal)) { return $m.Windows }
+            $prefix = "$($m.Linux)/"
+            if ($Path.StartsWith($prefix, [System.StringComparison]::Ordinal)) {
+                $rest = $Path.Substring($prefix.Length) -replace '/', '\'
+                return "$($m.Windows)\$rest"
+            }
+        } else {
+            if ($Path.Equals($m.Windows, [System.StringComparison]::OrdinalIgnoreCase)) { return $m.Linux }
+            $prefix = "$($m.Windows)\"
+            if ($Path.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $rest = $Path.Substring($prefix.Length) -replace '\\', '/'
+                return "$($m.Linux)/$rest"
+            }
+        }
+    }
+    return $Path
+}
+
 function Get-VesShotManifestDir {
     <#
     .SYNOPSIS
-    Manifest directory for one title's shots. Full-filename keyed (see
-    module header), matching Get-VesChunkManifestDir.
+    Manifest directory for one title's shots, matching bash
+    shot_manifest_dir(): media_content_dir/<canonical_title>.shots.
     #>
     param([Parameter(Mandatory)][string]$Source)
-    $dir = Split-Path -Parent $Source
-    $name = Split-Path -Leaf $Source
-    return Join-Path $dir "$name.shots"
+    return Join-Path (Get-VesMediaContentDir -Source $Source) "$(Get-VesCanonicalTitleFromSource -Source $Source).shots"
 }
 
 function Get-VesShotLockPath {
     <#
     .SYNOPSIS
-    Lock FILE path for one shot index (atomic CreateNew target -- NOT a
-    directory). Bash's shot_lock_path prints the stem; callers append
-    .lock. Here the returned path already includes .lock so it can be
-    handed straight to Enter-VesSharedMutexOnce.
+    Lock directory path for one shot index, matching bash callers that
+    append .lock to shot_lock_path().
     #>
     param(
         [Parameter(Mandatory)][string]$Source,
         [Parameter(Mandatory)][int]$Index
     )
-    $dir = Split-Path -Parent $Source
-    $name = Split-Path -Leaf $Source
-    return Join-Path $dir "$name.shot$Index.lock"
+    return Join-Path (Get-VesMediaContentDir -Source $Source) "$(Get-VesCanonicalTitleFromSource -Source $Source).shot$Index.lock"
 }
 
 function Get-VesShotPathMtime {
     <#
     .SYNOPSIS
     Port of _shot_path_mtime(). Unix-epoch mtime seconds of a path, or
-    $null if unavailable. Used for stale-incomplete-mdir reclaim and
-    scratch sweep age checks; shot CLAIM staleness goes through
-    Get-VesSharedMutexAge / Enter-VesSharedMutexOnce (file lock mtime).
+    $null if unavailable. Used for stale-incomplete-mdir reclaim,
+    directory-lock stale checks, and scratch sweep age checks.
     #>
     param([Parameter(Mandatory)][string]$Path)
     try {
@@ -405,7 +441,7 @@ function New-VesShotManifest {
                 if (-not $ts) { continue }
                 $shotFile = Join-Path $buildTmp ("shot-{0:D3}.meta" -f $n)
                 $body = @("index=$n", "start_ts=$prev", "end_ts=$ts") + (& $writeShotCx $n ([double]$prev) ([double]$ts))
-                $body -join "`n" | Set-Content -LiteralPath $shotFile -Encoding utf8
+                Write-VesKvFile -Path $shotFile -Lines $body
                 $n++
                 $nb++
                 $prev = $ts
@@ -419,7 +455,7 @@ function New-VesShotManifest {
             $finalShot = Join-Path $buildTmp ("shot-{0:D3}.meta" -f $n)
             $durStr = $dur.ToString([System.Globalization.CultureInfo]::InvariantCulture)
             $fbody = @("index=$n", "start_ts=$prev", "end_ts=$durStr") + (& $writeShotCx $n ([double]$prev) ([double]$dur))
-            $fbody -join "`n" | Set-Content -LiteralPath $finalShot -Encoding utf8
+            Write-VesKvFile -Path $finalShot -Lines $fbody
             $n++
 
             if ($cxStats -and (Test-Path -LiteralPath $cxStats)) { Remove-Item -LiteralPath $cxStats -Force -ErrorAction SilentlyContinue }
@@ -437,18 +473,18 @@ function New-VesShotManifest {
             }
 
             $manifestFile = Join-Path $buildTmp 'manifest.meta'
-            @"
-source=$Source
-shot_count=$n
-codec=$Codec
-profile=$Profile
-target=$Target
-model=$Model
-field_mode=$fm
-is_bw=$bw
-created_utc=$([DateTimeOffset]::UtcNow.ToString('o'))
-created_host=$env:COMPUTERNAME
-"@ | Set-Content -LiteralPath $manifestFile -Encoding utf8
+            Write-VesKvFile -Path $manifestFile -Lines @(
+                "source=$(Convert-VesFleetPath -Path $Source -To Linux)",
+                "shot_count=$n",
+                "codec=$Codec",
+                "profile=$Profile",
+                "target=$Target",
+                "model=$Model",
+                "field_mode=$fm",
+                "is_bw=$bw",
+                "created_utc=$(Get-VesUtcStamp)",
+                "created_host=$env:COMPUTERNAME"
+            )
 
             Get-ChildItem -LiteralPath $buildTmp -File | ForEach-Object {
                 $dest = Join-Path $mdir $_.Name
@@ -461,7 +497,7 @@ created_host=$env:COMPUTERNAME
             }
         }
 
-        New-Item -ItemType File -Path $completeMarker -Force | Out-Null
+        Write-VesKvFile -Path $completeMarker -Lines @()
         Set-VesEveryoneReadWrite -Path $completeMarker
         Write-Host "Shot split: $n shot(s) created for $(Split-Path -Leaf $Source)"
         return $true
@@ -473,12 +509,10 @@ created_host=$env:COMPUTERNAME
 function Enter-VesShotClaim {
     <#
     .SYNOPSIS
-    Port of shot_claim_next(). Claims one not-yet-resolved shot via
-    VesSharedMutex atomic FILE creation (NOT mkdir). Returns a claim
-    object (Index/LockPath/Token/MetaPath) or $null. Staleness ceiling =
-    SHOT_SEARCH_STALE_SECS (default 25200). Companion .meta holds host/pid
-    for triage (never read by Enter/Exit-VesSharedMutex -- same VesTitleLock
-    composition rule).
+    Port of shot_claim_next(). Claims one not-yet-resolved shot via an
+    atomic lock directory containing owner.meta. Returns a claim object
+    (Index/LockPath/Token/MetaPath) or $null. Staleness ceiling =
+    SHOT_SEARCH_STALE_SECS (default 25200).
     #>
     param([Parameter(Mandatory)][string]$Source)
     $mdir = Get-VesShotManifestDir -Source $Source
@@ -498,51 +532,51 @@ function Enter-VesShotClaim {
         }
 
         $lockPath = Get-VesShotLockPath -Source $Source -Index $idx
-        $metaPath = "$lockPath.meta"
-
-        # Prefer SharedMutexOnce (CreateNew + one stale reclaim). Age for
-        # reclaim uses lock-file mtime; if the lock file is gone but a
-        # stranded companion .meta remains, fall back to that mtime the
-        # same way bash falls back owner.meta -> lockdir (_shot_path_mtime
-        # chain) -- then attempt CreateNew again after renaming the meta
-        # aside. Primary path is still the lock file.
-        $token = Enter-VesSharedMutexOnce -LockPath $lockPath -StaleSeconds $staleSecs
-        if (-not $token -and (Test-Path -LiteralPath $lockPath)) {
-            # Dual-mtime check matching bash: owner.meta age OR lock age.
+        $metaPath = Join-Path $lockPath 'owner.meta'
+        try {
+            New-Item -ItemType Directory -Path $lockPath -ErrorAction Stop | Out-Null
+            try {
+                Write-VesKvFile -Path $metaPath -Lines @(
+                    "host=$env:COMPUTERNAME",
+                    "pid=$PID",
+                    "claimed_utc=$(Get-VesUtcStamp)"
+                )
+                Set-VesEveryoneReadWrite -Path $metaPath
+            } catch { }
+            return [PSCustomObject]@{
+                Index    = $idx
+                LockPath = $lockPath
+                MetaPath = $metaPath
+                Token    = $null
+            }
+        } catch {
             $mtime = Get-VesShotPathMtime -Path $metaPath
             if ($null -eq $mtime) { $mtime = Get-VesShotPathMtime -Path $lockPath }
-            if ($null -ne $mtime) {
-                $age = [int]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $mtime)
-                if ($age -gt $staleSecs) {
-                    $reclaimName = "$lockPath.stale.$env:COMPUTERNAME.$PID.$(Get-Random)"
+            if ($null -eq $mtime) { continue }
+            $age = [int]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $mtime)
+            if ($age -le $staleSecs) { continue }
+            $reclaimName = "$lockPath.stale.$env:COMPUTERNAME.$PID.$(Get-Random)"
+            try {
+                [System.IO.Directory]::Move($lockPath, $reclaimName)
+                try { [System.IO.Directory]::Delete($reclaimName, $true) } catch { }
+                try {
+                    New-Item -ItemType Directory -Path $lockPath -ErrorAction Stop | Out-Null
                     try {
-                        [System.IO.File]::Move($lockPath, $reclaimName)
-                        try { [System.IO.File]::Delete($reclaimName) } catch { }
-                        if (Test-Path -LiteralPath $metaPath) {
-                            try { Remove-Item -LiteralPath $metaPath -Force -ErrorAction SilentlyContinue } catch { }
-                        }
-                        $token = Enter-VesSharedMutexOnce -LockPath $lockPath -StaleSeconds $staleSecs
+                        Write-VesKvFile -Path $metaPath -Lines @(
+                            "host=$env:COMPUTERNAME",
+                            "pid=$PID",
+                            "claimed_utc=$(Get-VesUtcStamp)"
+                        )
+                        Set-VesEveryoneReadWrite -Path $metaPath
                     } catch { }
-                }
-            }
-        }
-        if (-not $token) { continue }
-
-        $owner = @"
-host=$env:COMPUTERNAME
-pid=$PID
-claimed_utc=$([DateTimeOffset]::UtcNow.ToString('o'))
-"@
-        try {
-            $owner | Set-Content -LiteralPath $metaPath -Encoding utf8
-            Set-VesEveryoneReadWrite -Path $metaPath
-        } catch { }
-
-        return [PSCustomObject]@{
-            Index    = $idx
-            LockPath = $lockPath
-            MetaPath = $metaPath
-            Token    = $token
+                    return [PSCustomObject]@{
+                        Index    = $idx
+                        LockPath = $lockPath
+                        MetaPath = $metaPath
+                        Token    = $null
+                    }
+                } catch { }
+            } catch { }
         }
     }
     return $null
@@ -551,16 +585,12 @@ claimed_utc=$([DateTimeOffset]::UtcNow.ToString('o'))
 function Exit-VesShotClaim {
     <#
     .SYNOPSIS
-    Port of shot_release_claim() -- token-matched SharedMutex release +
-    companion meta cleanup.
+    Port of shot_release_claim() -- recursive removal of the lock dir.
     #>
     param(
         [Parameter(Mandatory)][PSCustomObject]$Claim
     )
-    if ($Claim.MetaPath) {
-        try { Remove-Item -LiteralPath $Claim.MetaPath -Force -ErrorAction SilentlyContinue } catch { }
-    }
-    Exit-VesSharedMutex -LockPath $Claim.LockPath -Token $Claim.Token
+    Remove-Item -LiteralPath $Claim.LockPath -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 function Clear-VesShotScratch {
@@ -1313,19 +1343,17 @@ function Invoke-VesShotSearchClaimed {
         $bracketEdge = Test-VesShotBracketEdge -Qp ([int]$qp) -Lo ([int]$b[0]) -Hi ([int]$b[1])
     }
 
-    $tmp = "$statusFile.$PID.$(Get-Random).tmp"
-    @"
-status=resolved
-qp=$qp
-vmaf=$vmaf
-samples=$samples
-search_failed=$searchFailed
-nosignal=$nosignal
-bracket_edge=$bracketEdge
-searched_host=$env:COMPUTERNAME
-searched_utc=$([DateTimeOffset]::UtcNow.ToString('o'))
-"@ | Set-Content -LiteralPath $tmp -Encoding utf8
-    Move-Item -LiteralPath $tmp -Destination $statusFile -Force
+    Write-VesKvFile -Path $statusFile -Lines @(
+        'status=resolved',
+        "qp=$qp",
+        "vmaf=$vmaf",
+        "samples=$samples",
+        "search_failed=$searchFailed",
+        "nosignal=$nosignal",
+        "bracket_edge=$bracketEdge",
+        "searched_host=$env:COMPUTERNAME",
+        "searched_utc=$(Get-VesUtcStamp)"
+    )
     Set-VesEveryoneReadWrite -Path $statusFile
     Exit-VesShotClaim -Claim $Claim
     return $true
@@ -1400,6 +1428,7 @@ function Invoke-VesShotSearchWorkerLoop {
 
 Export-ModuleMember -Function `
     Get-VesShotManifestDir, Get-VesShotLockPath, Get-VesShotPathMtime, `
+    Convert-VesFleetPath, `
     Test-VesShotManifestAllResolved, New-VesShotManifest, `
     Enter-VesShotClaim, Exit-VesShotClaim, `
     Clear-VesShotScratch, Invoke-VesShotSearchWorkerLoop, `

@@ -4,6 +4,23 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.1J — 2026-09-03 (branch `6.x-chunk-redesign`)
+
+**PRINCE can coordinate per-shot search with the bash fleet.** The Windows
+per-shot QP module now uses the same canonical sidecar names and directory-lock
+claim protocol as `modules/ves-per-shot-qp.sh`: `<canonical_title>.shots`,
+`<canonical_title>.shot<N>.lock/owner.meta`, owner/meta/status files written
+LF-only without a BOM, and bash-order status keys with second-granularity UTC
+timestamps. Stale claim reclaim follows the bash mtime chain (`owner.meta`, then
+lock dir) and rename-aside steal so a dead worker no longer wedges a title.
+
+**Fleet path persistence is Linux-form again.** PRINCE still works internally
+with SMB UNC paths, but `manifest.meta` persists `source=/mnt/...` so Linux
+workers reading the same NAS files resolve the same source. The explicit
+BigMomma/BabyBear/BigPoppa SMB mappings keep the bash/Windows lockstep note
+literal: both ports now land manifests, lock dirs, and status files on the same
+server-side paths.
+
 ## v6.0.1I — 2026-09-02 (branch `6.x-chunk-redesign`)
 
 **MARLONJ (macOS) rejoined the per-shot search pool.** With the header-probe

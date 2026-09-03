@@ -22,6 +22,12 @@ if (-not (Get-Module -Name VesStaging)) {
 if (-not (Get-Module -Name VesShardedScan)) {
     Import-Module (Join-Path $PSScriptRoot 'VesShardedScan.psm1') -Force
 }
+if (-not (Get-Module -Name VesProfileDecision)) {
+    Import-Module (Join-Path $PSScriptRoot 'VesProfileDecision.psm1') -Force
+}
+if (-not (Get-Module -Name VesDiscSource)) {
+    Import-Module (Join-Path $PSScriptRoot 'VesDiscSource.psm1') -Force
+}
 
 $script:VesSubtitleExtensions = @('srt', 'sub', 'idx', 'ass', 'ssa', 'vtt', 'sup')
 $script:VesMovieLanguageDirNames = @(
@@ -34,7 +40,63 @@ $script:VesMovieLanguageDirNames = @(
 
 function Get-VesMovieTitleFromFile {
     param([Parameter(Mandatory)][string]$Path)
-    return [System.IO.Path]::GetFileNameWithoutExtension($Path)
+    return [System.IO.Path]::GetFileNameWithoutExtension((Get-VesPathLeaf -Path $Path))
+}
+
+function Get-VesPathLeaf {
+    param([Parameter(Mandatory)][string]$Path)
+    $trimmed = $Path.TrimEnd('\', '/')
+    if ($trimmed -match '[\\/]([^\\/]+)$') { return $Matches[1] }
+    return $trimmed
+}
+
+function Get-VesPathParent {
+    param([Parameter(Mandatory)][string]$Path)
+    $trimmed = $Path.TrimEnd('\', '/')
+    if ($trimmed -match '^(.+)[\\/][^\\/]+$') { return $Matches[1] }
+    return Split-Path -Parent $Path
+}
+
+function Get-VesCanonicalTitleFromFile {
+    <#
+    .SYNOPSIS
+    Port of canonical_title_from_file(): movie_title_from_file, then
+    strip only the bash replacement suffixes used for shot/chunk sidecars.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $title = Get-VesMovieTitleFromFile -Path $Path
+    foreach ($suffix in @('.AV1', '.av1', '.x265', '.X265', '.merged', '.MERGED')) {
+        if ($title.EndsWith($suffix, [System.StringComparison]::Ordinal)) {
+            $title = $title.Substring(0, $title.Length - $suffix.Length)
+        }
+    }
+    return $title
+}
+
+function Get-VesCanonicalTitleFromSource {
+    <#
+    .SYNOPSIS
+    Port of canonical_title_from_source(): BDMV/disc roots use their
+    directory basename; ordinary files use canonical_title_from_file().
+    #>
+    param([Parameter(Mandatory)][string]$Source)
+    if (Test-VesIsDiskSource -Source $Source) {
+        return (Get-VesPathLeaf -Path $Source)
+    }
+    return (Get-VesCanonicalTitleFromFile -Path $Source)
+}
+
+function Get-VesMediaContentDir {
+    <#
+    .SYNOPSIS
+    Port of media_content_dir(): disc roots are their own content dir;
+    ordinary files use their parent directory.
+    #>
+    param([Parameter(Mandatory)][string]$Source)
+    if (Test-VesIsDiskSource -Source $Source) {
+        return (Get-VesDiscMediaContentDir -Source $Source)
+    }
+    return (Get-VesPathParent -Path $Source)
 }
 
 function Get-VesCanonicalOrganizeTitle {
@@ -416,7 +478,8 @@ function Invoke-VesOrganizeLibrary {
     return [PSCustomObject]@{ Total = $queue.Count; Organized = $organized; Failed = $failed; Skipped = $skipped }
 }
 
-Export-ModuleMember -Function Get-VesMovieTitleFromFile, Get-VesCanonicalOrganizeTitle, `
+Export-ModuleMember -Function Get-VesMovieTitleFromFile, Get-VesCanonicalTitleFromFile, `
+    Get-VesCanonicalTitleFromSource, Get-VesMediaContentDir, Get-VesCanonicalOrganizeTitle, `
     Test-VesIsTvEpisode, Test-VesIsPlexSeasonDirName, Test-VesIsTvLibraryPath, Test-VesIsTvShowDirectory, `
     Test-VesIsSubtitleFile, Test-VesIsDerivedOutput, Test-VesIsShelfDir, Test-VesUsesLetterBucketLibrary, `
     Test-VesIsMovieLanguageDir, Test-VesIsMovieOrganizeParent, Test-VesNeedsFlatOrganize, `
