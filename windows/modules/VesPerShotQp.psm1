@@ -113,27 +113,36 @@ function Get-VesPerShotMwLen {
     return 8.0
 }
 function Get-VesPerShotMultiwindowEnable {
-    return ($env:PER_SHOT_MULTIWINDOW_ENABLE -ne 'false')
+    $v = if ($env:PER_SHOT_MULTIWINDOW_ENABLE) { $env:PER_SHOT_MULTIWINDOW_ENABLE } else { 'true' }
+    return ($v -eq 'true')
 }
 function Get-VesShotMwDebias {
-    return ($env:SHOT_MW_DEBIAS -ne '0')
+    $v = if ($env:SHOT_MW_DEBIAS) { $env:SHOT_MW_DEBIAS } else { '1' }
+    return ($v -eq '1')
 }
 function Get-VesPerShotVmafStride {
     if ($env:PER_SHOT_VMAF_STRIDE) { return [int]$env:PER_SHOT_VMAF_STRIDE }
     return 2
 }
 function Get-VesShotComplexityEnable {
-    return ($env:SHOT_COMPLEXITY_ENABLE -ne 'false')
+    $v = if ($env:SHOT_COMPLEXITY_ENABLE) { $env:SHOT_COMPLEXITY_ENABLE } else { 'true' }
+    return ($v -ne 'false')
 }
 function Get-VesShotSrcLocalStage {
-    return ($env:SHOT_SRC_LOCAL_STAGE -ne 'false')
+    $v = if ($env:SHOT_SRC_LOCAL_STAGE) { $env:SHOT_SRC_LOCAL_STAGE } else { 'true' }
+    return ($v -eq 'true')
 }
 function Get-VesShotSrcLocalStageDir {
     if ($env:SHOT_SRC_LOCAL_STAGE_DIR) { return $env:SHOT_SRC_LOCAL_STAGE_DIR }
+    # bash default is /var/tmp/ves-srcstage; on Windows that path is not
+    # creatable, so fall back to a real temp dir. The PRINCE search-worker
+    # driver MUST set SHOT_SRC_LOCAL_STAGE_DIR to a D: path explicitly --
+    # C:\...\Temp is small and multi-GB sources will not fit there.
     return (Join-Path ([System.IO.Path]::GetTempPath()) 'ves-srcstage')
 }
 function Get-VesNosignalFastpath {
-    return ($env:PER_SHOT_NOSIGNAL_FASTPATH -ne 'false')
+    $v = if ($env:PER_SHOT_NOSIGNAL_FASTPATH) { $env:PER_SHOT_NOSIGNAL_FASTPATH } else { 'true' }
+    return ($v -eq 'true')
 }
 function Get-VesNosigBlackLuma   { if ($env:NOSIG_BLACK_LUMA)    { return [double]$env:NOSIG_BLACK_LUMA }    return 16.0 }
 function Get-VesNosigStaticMotion { if ($env:NOSIG_STATIC_MOTION) { return [double]$env:NOSIG_STATIC_MOTION } return 1.0 }
@@ -155,15 +164,15 @@ function Get-VesPerShotQpBracketFor {
     param([Parameter(Mandatory)][string]$Profile)
     $g = @((Get-VesPerShotQpMin), (Get-VesPerShotQpMax))
     if (-not (Get-VesPerShotQpBracketEnable)) { return $g }
-    $key = 'PER_SHOT_QP_BRACKET_' + ($Profile.ToUpper() -replace '[^A-Z0-9]', '_')
+    $key = 'PER_SHOT_QP_BRACKET_' + ($Profile.ToUpperInvariant() -replace '-', '_')
     $band = [Environment]::GetEnvironmentVariable($key)
-    if ($band -and ($band -match '^\s*([0-9]+)\s+([0-9]+)\s*$')) {
+    if ($band -and ($band -match '^([0-9]+) +([0-9]+)$')) {
         return @([int]$Matches[1], [int]$Matches[2])
     }
     return $g
 }
 function Test-VesShotBracketEdge {
-    param([int]$Qp, [int]$Lo, [int]$Hi)
+    param([int]$Qp = 30, [int]$Lo = 0, [int]$Hi = 63)
     if ($Qp -le $Lo -or $Qp -ge $Hi) { return 1 } else { return 0 }
 }
 
@@ -302,9 +311,9 @@ function Get-VesInterpQp {
     )
     if (($BelowQp - $AboveQp) -le 1) { return $AboveQp }
     $q = if ($BelowScore -eq $AboveScore) {
-        [int][math]::Round(($AboveQp + $BelowQp) / 2.0)
+        [int][math]::Floor((($AboveQp + $BelowQp) / 2.0) + 0.5)
     } else {
-        [int][math]::Round($AboveQp + ($Target - $AboveScore) * ($BelowQp - $AboveQp) / ($BelowScore - $AboveScore))
+        [int][math]::Floor(($AboveQp + ($Target - $AboveScore) * ($BelowQp - $AboveQp) / ($BelowScore - $AboveScore)) + 0.5)
     }
     if ($q -le $AboveQp) { $q = $AboveQp + 1 }
     if ($q -ge $BelowQp) { $q = $BelowQp - 1 }
@@ -762,7 +771,7 @@ function Get-VesShotEncodeBytesOnly {
                 '-i', $y4m, '--use-q-file', '1', '--qpfile', $qpfile, '--svtav1-params', "${svtp}:rc=0", '-b', $out
             ) -TimeoutSeconds $tmo -MaxRetries 1
         } else {
-            $out = Join-Path $work 'shot.mkv.out'
+            $out = Join-Path $work 'shot.ivf'
             $r = Invoke-VesWithTimeoutRetry -FilePath $FfmpegPath -ArgumentList @(
                 '-y', '-v', 'error', '-i', $y4m, '-map', '0:v:0', '-c:v', 'libsvtav1', '-preset', '5',
                 '-svtav1-params', "${svtp}:rc=0:qp=$Qp", '-pix_fmt', 'yuv420p10le', $out
@@ -944,8 +953,10 @@ function Get-VesVmafScoreShot {
             ) -TimeoutSeconds $encTimeout -MaxRetries 1
             if ($svtRun.TimedOut -or $svtRun.ExitCode -ne 0) { return $null }
         } else {
-            # ffmpeg libsvtav1, uniform QP == qp-file of one value
-            $out = Join-Path $work "shot-enc-$Qp.mkv"
+            # ffmpeg libsvtav1 fallback, uniform QP == qp-file of one value.
+            # Keep IVF as the measured byte artifact, matching the
+            # SvtAv1EncApp path and bash's byte contract.
+            $out = Join-Path $work "shot-enc-$Qp.ivf"
             $ffEnc = Invoke-VesWithTimeoutRetry -FilePath $FfmpegPath -ArgumentList @(
                 '-y', '-v', 'error', '-i', $y4m, '-map', '0:v:0',
                 '-c:v', 'libsvtav1', '-preset', '5',
@@ -963,7 +974,11 @@ function Get-VesVmafScoreShot {
             ) -TimeoutSeconds $encTimeout -MaxRetries 1
             if ($mux.TimedOut -or $mux.ExitCode -ne 0) { return $null }
         } else {
-            $outMkv = $out
+            $outMkv = Join-Path $work "shot-enc-$Qp.mkv"
+            $mux = Invoke-VesWithTimeoutRetry -FilePath $FfmpegPath -ArgumentList @(
+                '-y', '-v', 'error', '-i', $out, '-c', 'copy', $outMkv
+            ) -TimeoutSeconds $encTimeout -MaxRetries 1
+            if ($mux.TimedOut -or $mux.ExitCode -ne 0) { return $null }
         }
 
         # Grain-ON: grain_decode_flag intentionally empty (v6.0.1A).

@@ -6,6 +6,18 @@ has the full story — what was wrong, why it mattered, and how it was fixed.
 
 ## v6.0.1J — 2026-09-03 (branch `6.x-chunk-redesign`)
 
+**PRINCE per-shot numerical parity audit/fixes.** The Windows per-shot search
+port was audited function-by-function against the bash originals and the
+findings are committed in `docs/prince-parity/task2-findings.md`. Fixed
+Phase-1 parity drift in config getters (`PER_SHOT_MULTIWINDOW_ENABLE`,
+`SHOT_SRC_LOCAL_STAGE`, `SHOT_MW_DEBIAS`, `PER_SHOT_NOSIGNAL_FASTPATH`, and
+`SHOT_SRC_LOCAL_STAGE_DIR`), tightened per-profile bracket env normalization
+and band validation to match bash exactly, added bash-compatible default
+arguments to the bracket-edge helper, and made PRINCE's ffmpeg/libsvtav1
+fallback report IVF bytes rather than MKV bytes. The remaining encoder-path
+parity check (ffmpeg fallback vs `SvtAv1EncApp --qpfile`) is flagged for
+Phase 2 because PRINCE has no `SvtAv1EncApp.exe`.
+
 **PRINCE can coordinate per-shot search with the bash fleet.** The Windows
 per-shot QP module now uses the same canonical sidecar names and directory-lock
 claim protocol as `modules/ves-per-shot-qp.sh`: `<canonical_title>.shots`,
