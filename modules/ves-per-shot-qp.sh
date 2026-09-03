@@ -133,13 +133,60 @@ _stage_source_local() {
     warn "_stage_source_local: not enough local space in $dir for $(basename "$src") -- reading from NFS"
     printf '%s' "$src"; return 0
   fi
+  # Serialize concurrent workers on THIS host (multi-worker per host, 2026-09-03):
+  # an mkdir lock so only one worker copies the ~GB source; the rest wait, then
+  # find it done. Bounded wait -> fall back to NFS read if the copier is stuck.
+  local lockd="$dst.copylock.d" waited=0
+  while ! mkdir -- "$lockd" 2>/dev/null; do
+    have="$(stat -c%s -- "$dst" 2>/dev/null || echo 0)"
+    if [ "$want" -gt 0 ] && [ "$have" = "$want" ]; then
+      touch -a -- "$dst" 2>/dev/null; printf '%s' "$dst"; return 0
+    fi
+    # steal a stale lock (a killed copier) after 40min
+    if [ -d "$lockd" ]; then
+      local _la; _la="$(_shot_path_mtime "$lockd")"
+      [ -n "$_la" ] && [ "$(( $(date +%s) - _la ))" -gt 2400 ] && rm -rf -- "$lockd" 2>/dev/null
+    fi
+    sleep 5; waited=$((waited+5))
+    [ "$waited" -gt 2700 ] && { printf '%s' "$src"; return 0; }
+  done
+  # re-check now that we hold the lock (a peer may have just finished)
+  have="$(stat -c%s -- "$dst" 2>/dev/null || echo 0)"
+  if [ "$want" -gt 0 ] && [ "$have" = "$want" ]; then
+    rmdir -- "$lockd" 2>/dev/null; touch -a -- "$dst" 2>/dev/null
+    printf '%s' "$dst"; return 0
+  fi
   # copy to a temp name then rename so a concurrent worker never sees a partial
   local tmp="$dst.$$.part"
-  if cp -f -- "$src" "$tmp" 2>/dev/null && [ "$(stat -c%s -- "$tmp" 2>/dev/null || echo 0)" = "$want" ]; then
-    mv -f -- "$tmp" "$dst" 2>/dev/null && { printf '%s' "$dst"; return 0; }
+  if _stage_copy "$src" "$tmp" && [ "$(stat -c%s -- "$tmp" 2>/dev/null || echo 0)" = "$want" ]; then
+    mv -f -- "$tmp" "$dst" 2>/dev/null && { rmdir -- "$lockd" 2>/dev/null; printf '%s' "$dst"; return 0; }
   fi
-  rm -f -- "$tmp" 2>/dev/null
+  rm -f -- "$tmp" 2>/dev/null; rmdir -- "$lockd" 2>/dev/null
   printf '%s' "$src"
+}
+
+# Parallel byte-range copy: a network source over an nconnect=N NFS mount is
+# BDP-capped on a single sequential stream (~11 MB/s over the ~17ms site VPN),
+# but N parallel readers fan out across the N TCP connections. Falls back to
+# plain cp for a small/local file or when the tools are missing. 2026-09-03.
+_stage_copy() {  # <src> <dst>
+  local s="$1" d="$2" n="${VES_STAGE_COPY_STREAMS:-8}" sz i chunk ok
+  local -a pids=()
+  sz="$(stat -c%s -- "$s" 2>/dev/null)" || { cp -f -- "$s" "$d" 2>/dev/null; return $?; }
+  if [ "${sz:-0}" -lt 67108864 ] || [ "$n" -le 1 ]; then
+    cp -f -- "$s" "$d" 2>/dev/null; return $?
+  fi
+  { fallocate -l "$sz" -- "$d" 2>/dev/null \
+    || truncate -s "$sz" -- "$d" 2>/dev/null; } || { cp -f -- "$s" "$d" 2>/dev/null; return $?; }
+  chunk=$(( (sz + n - 1) / n ))
+  for ((i=0; i<n; i++)); do
+    dd if="$s" of="$d" bs=4M conv=notrunc \
+       iflag=skip_bytes,count_bytes oflag=seek_bytes \
+       skip=$((i*chunk)) seek=$((i*chunk)) count="$chunk" 2>/dev/null &
+    pids+=("$!")
+  done
+  ok=1; for i in "${pids[@]}"; do wait "$i" || ok=0; done
+  [ "$ok" = 1 ] && [ "$(stat -c%s -- "$d" 2>/dev/null || echo 0)" = "$sz" ]
 }
 
 _vmaf_score_shot() {

@@ -1087,16 +1087,47 @@ function Get-VesStageSourceLocal {
             return $Source
         }
     } catch { }
-    $tmp = "$dst.$PID.part"
+    # Serialize concurrent instances on this host (multi-worker per host,
+    # 2026-09-03): an mkdir lock so only one instance copies the multi-GB
+    # source; the rest wait, then find it done. Bounded -> fall back to a
+    # network read if the copier is stuck.
+    $lockDir = "$dst.copylock.d"
+    $waited = 0
+    while ($true) {
+        try { New-Item -ItemType Directory -Path ([System.Management.Automation.WildcardPattern]::Escape($lockDir)) -ErrorAction Stop | Out-Null; break }
+        catch {
+            if ((Test-Path -LiteralPath $dst) -and ((Get-Item -LiteralPath $dst -ErrorAction SilentlyContinue).Length -eq $want)) {
+                try { (Get-Item -LiteralPath $dst).LastAccessTimeUtc = [DateTime]::UtcNow } catch { }
+                return $dst
+            }
+            if (Test-Path -LiteralPath $lockDir) {
+                $la = (Get-Item -LiteralPath $lockDir -ErrorAction SilentlyContinue).LastWriteTimeUtc
+                if ($la -and ([DateTimeOffset]::UtcNow - $la).TotalSeconds -gt 2400) {
+                    try { Remove-Item -LiteralPath $lockDir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+                }
+            }
+            Start-Sleep -Seconds 5; $waited += 5
+            if ($waited -gt 2700) { return $Source }
+        }
+    }
     try {
-        Copy-Item -LiteralPath $Source -Destination $tmp -Force -ErrorAction Stop
-        if ((Get-Item -LiteralPath $tmp).Length -eq $want) {
-            Move-Item -LiteralPath $tmp -Destination $dst -Force -ErrorAction Stop
+        if ((Test-Path -LiteralPath $dst) -and ((Get-Item -LiteralPath $dst).Length -eq $want)) {
+            Remove-Item -LiteralPath $lockDir -Recurse -Force -ErrorAction SilentlyContinue
             return $dst
         }
-    } catch { }
-    if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
-    return $Source
+        $tmp = "$dst.$PID.part"
+        try {
+            Copy-Item -LiteralPath $Source -Destination $tmp -Force -ErrorAction Stop
+            if ((Get-Item -LiteralPath $tmp).Length -eq $want) {
+                Move-Item -LiteralPath $tmp -Destination $dst -Force -ErrorAction Stop
+                return $dst
+            }
+        } catch { }
+        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        return $Source
+    } finally {
+        Remove-Item -LiteralPath $lockDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Get-VesShotIsNosignal {
