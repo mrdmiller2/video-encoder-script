@@ -176,6 +176,13 @@ function Test-VesShotBracketEdge {
     if ($Qp -le $Lo -or $Qp -ge $Hi) { return 1 } else { return 0 }
 }
 
+function Get-VesAllocPosWeightHeadFrac { if ($env:ALLOC_POS_WEIGHT_HEAD_FRAC) { return [double]$env:ALLOC_POS_WEIGHT_HEAD_FRAC } return 0.05 }
+function Get-VesAllocPosWeightTailFrac { if ($env:ALLOC_POS_WEIGHT_TAIL_FRAC) { return [double]$env:ALLOC_POS_WEIGHT_TAIL_FRAC } return 0.12 }
+function Get-VesAllocPosWeightMin      { if ($env:ALLOC_POS_WEIGHT_MIN)       { return [double]$env:ALLOC_POS_WEIGHT_MIN }       return 0.85 }
+function Get-VesAllocMinShotVmafDrop   { if ($env:ALLOC_MIN_SHOT_VMAF_DROP)   { return [double]$env:ALLOC_MIN_SHOT_VMAF_DROP }   return 6.0 }
+function Get-VesAllocMinShotPinRounds  { if ($env:ALLOC_MIN_SHOT_PIN_ROUNDS)  { return [int]$env:ALLOC_MIN_SHOT_PIN_ROUNDS }     return 4 }
+function Get-VesAllocBytesCalibrationK { if ($env:ALLOC_BYTES_CALIBRATION_K)  { return [double]$env:ALLOC_BYTES_CALIBRATION_K }  return 1.13 }
+
 function Get-VesUtcStamp {
     return [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
 }
@@ -196,6 +203,22 @@ function Write-VesKvFile {
     } catch {
         Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop
     }
+}
+
+function Resolve-VesSvtAv1EncAppPath {
+    param([string]$SvtAv1EncAppPath)
+    if ($SvtAv1EncAppPath) {
+        if (Test-Path -LiteralPath $SvtAv1EncAppPath) {
+            return (Get-Item -LiteralPath $SvtAv1EncAppPath).FullName
+        }
+        $cmd = Get-Command $SvtAv1EncAppPath -ErrorAction SilentlyContinue
+        if ($cmd) { return $cmd.Source }
+    }
+    $cmd = Get-Command SvtAv1EncApp.exe -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    $cmd = Get-Command SvtAv1EncApp -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    return $null
 }
 
 function Convert-VesFleetPath {
@@ -341,6 +364,387 @@ function Test-VesShotManifestAllResolved {
         $st = Get-VesShotMetaValue -Content $stContent -Key 'status'
         if ($st -ne 'resolved') { return $false }
     }
+    return $true
+}
+
+function Get-VesManifestShotStatusPath {
+    param(
+        [Parameter(Mandatory)][string]$ManifestDir,
+        [Parameter(Mandatory)][string]$Index
+    )
+    return (Join-Path $ManifestDir ("shot-{0:D3}.status" -f [int]$Index))
+}
+
+function Get-VesFpsAndTotalFrames {
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$FfprobePath
+    )
+    $dur = Get-VesMediaDurationSeconds -Path $Source -FfprobePath $FfprobePath
+    if ($null -eq $dur) { throw "Unable to determine media duration for $Source" }
+    $fpsRate = & $FfprobePath -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 -- $Source 2>$null
+    $fpsRate = @($fpsRate)[0]
+    if (-not $fpsRate) { throw "Unable to determine frame rate for $Source" }
+    $fpsParts = "$fpsRate".Trim().Split('/')
+    $fpsNum = [double]$fpsParts[0]
+    $fpsDen = if ($fpsParts.Count -gt 1) { [double]$fpsParts[1] } else { 1.0 }
+    $fps = [double]::Parse(($fpsNum / $fpsDen).ToString('0.000000', [System.Globalization.CultureInfo]::InvariantCulture), [System.Globalization.CultureInfo]::InvariantCulture)
+    $totalFrames = [int64][math]::Truncate(([double]$dur * $fps) + 1.0)
+    return [PSCustomObject]@{ Duration = [double]$dur; Fps = [double]$fps; TotalFrames = $totalFrames }
+}
+
+function Write-VesShotQpsToQpfile {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Shots,
+        [Parameter(Mandatory)][int64]$TotalFrames,
+        [Parameter(Mandatory)][double]$Fps,
+        [Parameter(Mandatory)][string]$QpfileOut
+    )
+    $dir = Split-Path -Parent $QpfileOut
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+    $writer = [System.IO.StreamWriter]::new($QpfileOut, $false, $utf8NoBom)
+    try {
+        $si = 0
+        $count = $Shots.Count
+        if ($count -eq 0) { return }
+        for ($frame = [int64]0; $frame -lt $TotalFrames; $frame++) {
+            $t = [double]::Parse((([double]$frame / $Fps).ToString('0.000000', [System.Globalization.CultureInfo]::InvariantCulture)), [System.Globalization.CultureInfo]::InvariantCulture)
+            while ($si -lt ($count - 1)) {
+                $cur = "$($Shots[$si])"
+                $parts = $cur.Split(':')
+                $shotEnd = [double]$parts[1]
+                if ($t -ge $shotEnd) { $si++ } else { break }
+            }
+            $writer.WriteLine(("$($Shots[$si])".Split(':'))[-1])
+        }
+    } finally {
+        $writer.Dispose()
+    }
+}
+
+function ConvertTo-VesShotQpArray {
+    param([Parameter(Mandatory)][hashtable]$ShotQpMap)
+    return @($ShotQpMap.Keys | Sort-Object { [int]$_ } | ForEach-Object { $ShotQpMap[$_] })
+}
+
+function Assemble-VesQpfileFromShotManifest {
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$QpfileOut,
+        [double]$Target,
+        [Parameter(Mandatory)][string]$FfprobePath
+    )
+    $mdir = Get-VesShotManifestDir -Source $Source
+    if (-not (Test-VesShotManifestAllResolved -Source $Source)) {
+        throw "Shot manifest is not fully resolved: $mdir"
+    }
+    $shotQps = @{}
+    foreach ($f in (Get-ChildItem -LiteralPath $mdir -Filter 'shot-*.meta' -File -ErrorAction SilentlyContinue | Sort-Object Name)) {
+        $meta = Get-Content -LiteralPath $f.FullName -Raw
+        $idx = Get-VesShotMetaValue -Content $meta -Key 'index'
+        $startTs = Get-VesShotMetaValue -Content $meta -Key 'start_ts'
+        $endTs = Get-VesShotMetaValue -Content $meta -Key 'end_ts'
+        $status = Get-Content -LiteralPath (Get-VesManifestShotStatusPath -ManifestDir $mdir -Index $idx) -Raw
+        $qp = Get-VesShotMetaValue -Content $status -Key 'qp'
+        $shotQps["$idx"] = "${startTs}:${endTs}:${qp}"
+    }
+    $ft = Get-VesFpsAndTotalFrames -Source $Source -FfprobePath $FfprobePath
+    Write-VesShotQpsToQpfile -Shots (ConvertTo-VesShotQpArray -ShotQpMap $shotQps) -TotalFrames $ft.TotalFrames -Fps $ft.Fps -QpfileOut $QpfileOut
+    Write-Host "Assembled qpfile from shot manifest: $($shotQps.Count) shots, $QpfileOut ($($ft.TotalFrames) frames)"
+    return $true
+}
+
+function Get-VesCreditsRange {
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$FfprobePath
+    )
+    $dur = Get-VesMediaDurationSeconds -Path $Source -FfprobePath $FfprobePath
+    if ($null -eq $dur) { return $null }
+    $chapStarts = & $FfprobePath -v error -show_chapters -show_entries chapter=start_time -of csv=p=0 -- $Source 2>$null
+    $lines = @($chapStarts | Where-Object { $_ -ne '' })
+    if ($lines.Count -gt 0) {
+        $lastStartStr = ($lines[-1].Split(','))[0]
+        $lastStart = 0.0
+        if ([double]::TryParse($lastStartStr, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$lastStart)) {
+            $lastDur = [double]$dur - $lastStart
+            if ($lastDur -ge 30.0 -and $lastDur -le 300.0) {
+                return @($lastStart, [double]$dur)
+            }
+        }
+    }
+    return $null
+}
+
+function ConvertTo-VesAwkNumber {
+    param([AllowNull()][string]$Value)
+    if ($null -eq $Value) { return 0.0 }
+    $m = [regex]::Match($Value, '^\s*[+-]?((\d+(\.\d*)?)|(\.\d+))([eE][+-]?\d+)?')
+    if (-not $m.Success) { return 0.0 }
+    $parsed = 0.0
+    if ([double]::TryParse($m.Value.Trim(), [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) {
+        return $parsed
+    }
+    return 0.0
+}
+
+function ConvertFrom-VesShotSamplesLine {
+    param([AllowNull()][string]$SamplesLine)
+    $rows = [System.Collections.Generic.List[object]]::new()
+    if (-not $SamplesLine) { return $rows }
+    foreach ($p in $SamplesLine.Split(',')) {
+        if ($p -eq '') { continue }
+        $triple = $p.Split(':')
+        if ($triple.Count -ne 3) { continue }
+        if (($triple -join '') -notmatch '[0-9]') { continue }
+        $rows.Add([PSCustomObject]@{
+            Qp    = "$($triple[0])"
+            Vmaf  = ConvertTo-VesAwkNumber $triple[1]
+            Bytes = ConvertTo-VesAwkNumber $triple[2]
+        })
+    }
+    return $rows
+}
+
+function Get-VesEqualSlopeBudgetBaseline {
+    param(
+        [Parameter(Mandatory)][string]$ManifestDir,
+        [Parameter(Mandatory)][double]$Target
+    )
+    $pst = [double]::Parse($Target.ToString('0.0000', [System.Globalization.CultureInfo]::InvariantCulture), [System.Globalization.CultureInfo]::InvariantCulture)
+    $sum = 0.0
+    foreach ($st in (Get-ChildItem -LiteralPath $ManifestDir -Filter 'shot-*.status' -File -ErrorAction SilentlyContinue | Sort-Object Name)) {
+        $content = Get-Content -LiteralPath $st.FullName -Raw
+        $samplesLine = Get-VesShotMetaValue -Content $content -Key 'samples'
+        $samples = ConvertFrom-VesShotSamplesLine -SamplesLine $samplesLine
+        $best = -1.0
+        $bb = 0.0
+        foreach ($s in $samples) {
+            $sqp = ConvertTo-VesAwkNumber $s.Qp
+            if ($s.Vmaf -ge $pst -and $sqp -gt $best) {
+                $best = $sqp
+                $bb = $s.Bytes
+            }
+        }
+        if ($best -lt 0) {
+            $bv = $null
+            foreach ($s in $samples) {
+                if ($null -eq $bv) { $bv = $s.Vmaf }
+                if ($s.Vmaf -ge $bv) {
+                    $bv = $s.Vmaf
+                    $bb = $s.Bytes
+                }
+            }
+        }
+        $sum += $bb
+    }
+    return [double]::Parse($sum.ToString('0', [System.Globalization.CultureInfo]::InvariantCulture), [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Invoke-VesEqualSlopeBudgetSolve {
+    param(
+        [Parameter(Mandatory)][object[]]$Samples,
+        [Parameter(Mandatory)][hashtable]$ShotStart,
+        [Parameter(Mandatory)][hashtable]$ShotEnd,
+        [Parameter(Mandatory)][double]$Budget,
+        [AllowNull()][string]$DeprioStart,
+        [AllowNull()][string]$DeprioEnd,
+        [Parameter(Mandatory)][double]$DeprioWeight,
+        [Parameter(Mandatory)][double]$HeadFrac,
+        [Parameter(Mandatory)][double]$TailFrac,
+        [Parameter(Mandatory)][double]$WeightMin,
+        [Parameter(Mandatory)][double]$Target,
+        [Parameter(Mandatory)][double]$FloorDrop,
+        [Parameter(Mandatory)][int]$PinRounds
+    )
+    if ($Samples.Count -eq 0) { throw 'No valid shot samples for equal-slope solve' }
+    $dur = @{}
+    $shotIds = @($ShotStart.Keys | Sort-Object { [int]$_ })
+    $maxE = 0.0
+    foreach ($idx in $shotIds) {
+        $dur[$idx] = 1
+        if ([double]$ShotEnd[$idx] -gt $maxE) { $maxE = [double]$ShotEnd[$idx] }
+    }
+    $totalDur = if ($maxE -gt 0) { $maxE } else { 1.0 }
+    $haveDeprio = ($DeprioStart -ne '' -and $null -ne $DeprioStart -and $DeprioEnd -ne '' -and $null -ne $DeprioEnd)
+    $ds = if ($haveDeprio) { [double]$DeprioStart } else { 0.0 }
+    $de = if ($haveDeprio) { [double]$DeprioEnd } else { 0.0 }
+    $weight = @{}
+    foreach ($idx in $shotIds) {
+        $mid = ([double]$ShotStart[$idx] + [double]$ShotEnd[$idx]) / 2.0
+        if ($haveDeprio) {
+            $weight[$idx] = if ($mid -ge $ds -and $mid -le $de) { $DeprioWeight } else { 1.0 }
+        } else {
+            $p = $mid / $totalDur
+            if ($HeadFrac -gt 0 -and $p -lt $HeadFrac) {
+                $weight[$idx] = $WeightMin + (1.0 - $WeightMin) * ($p / $HeadFrac)
+            } elseif ($TailFrac -gt 0 -and $p -gt (1.0 - $TailFrac)) {
+                $weight[$idx] = $WeightMin + (1.0 - $WeightMin) * ((1.0 - $p) / $TailFrac)
+            } else {
+                $weight[$idx] = 1.0
+            }
+        }
+    }
+    $maxvQp = @{}; $maxvV = @{}; $maxvB = @{}
+    foreach ($s in $Samples) {
+        $idx = $s.Idx
+        if (-not $maxvV.ContainsKey($idx) -or [double]$s.Vmaf -gt [double]$maxvV[$idx]) {
+            $maxvV[$idx] = [double]$s.Vmaf; $maxvQp[$idx] = "$($s.Qp)"; $maxvB[$idx] = [double]$s.Bytes
+        }
+    }
+    $pinned = @{}
+    $bestQp = @{}; $bestVmaf = @{}; $bestBytes = @{}; $bestObj = @{}
+    $selectPicks = {
+        param([double]$Lambda)
+        $hasBest = @{}
+        foreach ($idx in $shotIds) { $hasBest[$idx] = $false }
+        foreach ($s in $Samples) {
+            $idx = $s.Idx
+            if ($pinned.ContainsKey($idx)) {
+                if (-not $hasBest[$idx]) {
+                    $hasBest[$idx] = $true
+                    $bestQp[$idx] = $maxvQp[$idx]; $bestVmaf[$idx] = $maxvV[$idx]; $bestBytes[$idx] = $maxvB[$idx]
+                }
+                continue
+            }
+            $obj = [double]$weight[$idx] * [double]$s.Vmaf - $Lambda * [double]$s.Bytes
+            if (-not $hasBest[$idx] -or $obj -gt [double]$bestObj[$idx]) {
+                $hasBest[$idx] = $true; $bestObj[$idx] = $obj
+                $bestQp[$idx] = "$($s.Qp)"; $bestVmaf[$idx] = [double]$s.Vmaf; $bestBytes[$idx] = [double]$s.Bytes
+            }
+        }
+    }
+    $floorV = if ($FloorDrop -gt 0) { $Target - $FloorDrop } else { -1.0 }
+    $pinAddedTotal = 0
+    $lambda = 0.0
+    for ($round = 0; $round -le $PinRounds; $round++) {
+        $lo = 1e-12; $hi = 1.0
+        for ($iter = 0; $iter -lt 60; $iter++) {
+            $lambda = [math]::Exp(([math]::Log($lo) + [math]::Log($hi)) / 2.0)
+            & $selectPicks $lambda
+            $totalBytes = 0.0
+            foreach ($idx in $shotIds) { $totalBytes += [double]$bestBytes[$idx] }
+            if ($totalBytes -gt $Budget) { $lo = $lambda } else { $hi = $lambda }
+        }
+        $lambda = [math]::Exp(([math]::Log($lo) + [math]::Log($hi)) / 2.0)
+        & $selectPicks $lambda
+        if ($floorV -lt 0) { break }
+        $newPins = 0
+        foreach ($idx in $shotIds) {
+            if ($pinned.ContainsKey($idx)) { continue }
+            if ([double]$weight[$idx] -lt 0.999) { continue }
+            if ([double]$bestVmaf[$idx] -lt $floorV -and [double]$maxvV[$idx] -gt ([double]$bestVmaf[$idx] + 0.01)) {
+                $pinned[$idx] = 1; $newPins++; $pinAddedTotal++
+            }
+        }
+        if ($newPins -eq 0) { break }
+    }
+    $totalBytesFinal = 0.0; $minVmaf = 999.0; $minIdx = ''; $minBodyVmaf = 999.0; $minBodyIdx = ''; $weightedN = 0
+    foreach ($idx in $bestVmaf.Keys) {
+        $totalBytesFinal += [double]$bestBytes[$idx]
+        if ([double]$bestVmaf[$idx] -lt $minVmaf) { $minVmaf = [double]$bestVmaf[$idx]; $minIdx = $idx }
+        if ([double]$weight[$idx] -lt 0.999) {
+            $weightedN++
+        } elseif ([double]$bestVmaf[$idx] -lt $minBodyVmaf) {
+            $minBodyVmaf = [double]$bestVmaf[$idx]; $minBodyIdx = $idx
+        }
+    }
+    $overPct = if ($Budget -gt 0) { 100.0 * ($totalBytesFinal - $Budget) / $Budget } else { 0.0 }
+    $report = "LAMBDA=$($lambda.ToString('0.##########e+0', [System.Globalization.CultureInfo]::InvariantCulture)) TOTAL_BYTES=$([int64][math]::Truncate($totalBytesFinal)) BUDGET=$([int64][math]::Truncate($Budget)) OVERSHOOT_PCT=$($overPct.ToString('0.0', [System.Globalization.CultureInfo]::InvariantCulture)) MIN_SHOT_VMAF=$($minVmaf.ToString('0.00', [System.Globalization.CultureInfo]::InvariantCulture)) (shot $minIdx) MIN_BODY_VMAF=$($minBodyVmaf.ToString('0.00', [System.Globalization.CultureInfo]::InvariantCulture)) (shot $minBodyIdx) POS_WEIGHTED_SHOTS=$weightedN FLOOR_PINNED=$pinAddedTotal (floor $($floorV.ToString('0.0', [System.Globalization.CultureInfo]::InvariantCulture)))"
+    $picks = foreach ($idx in $bestQp.Keys) {
+        [PSCustomObject]@{ Idx = $idx; Qp = "$($bestQp[$idx])"; Vmaf = [double]$bestVmaf[$idx] }
+    }
+    return [PSCustomObject]@{ Picks = @($picks); Report = $report; OvershootPct = $overPct }
+}
+
+function Assemble-VesQpfileViaEqualSlopeBudget {
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$QpfileOut,
+        [Parameter(Mandatory)][double]$ByteBudget,
+        [double]$DeprioStart,
+        [double]$DeprioEnd,
+        [double]$DeprioWeight = 1.0,
+        [Parameter(Mandatory)][string]$FfprobePath
+    )
+    $mdir = Get-VesShotManifestDir -Source $Source
+    if (-not (Test-VesShotManifestAllResolved -Source $Source)) {
+        throw "Shot manifest is not fully resolved: $mdir"
+    }
+    $pstTarget = 94.0
+    try {
+        $pstCandidate = Get-VesVmafTargetForSource -Source $Source -FfprobePath $FfprobePath
+        if ($null -ne $pstCandidate) { $pstTarget = [double]$pstCandidate }
+    } catch { $pstTarget = 94.0 }
+    $floorDrop = Get-VesAllocMinShotVmafDrop
+    $pinRounds = Get-VesAllocMinShotPinRounds
+    $calK = Get-VesAllocBytesCalibrationK
+
+    if ($ByteBudget -gt 0 -and $ByteBudget -le 4) {
+        $baseline = Get-VesEqualSlopeBudgetBaseline -ManifestDir $mdir -Target $pstTarget
+        $ByteBudget = [double]::Parse(($ByteBudget * $baseline).ToString('0', [System.Globalization.CultureInfo]::InvariantCulture), [System.Globalization.CultureInfo]::InvariantCulture)
+        Write-Warning "  equal-slope budget: fraction mode -> baseline=$([int64]$baseline) B, budget=$([int64]$ByteBudget) B"
+    } else {
+        $div = if ($calK -gt 0) { $calK } else { 1.0 }
+        $ByteBudget = [double]::Parse(($ByteBudget / $div).ToString('0', [System.Globalization.CultureInfo]::InvariantCulture), [System.Globalization.CultureInfo]::InvariantCulture)
+        Write-Warning "  equal-slope budget: absolute mode, /K=$calK -> internal budget=$([int64]$ByteBudget) B"
+    }
+
+    $shotStart = @{}; $shotEnd = @{}; $sampleShotStart = @{}; $sampleShotEnd = @{}
+    $samples = [System.Collections.Generic.List[object]]::new()
+    $noSampleIdx = [System.Collections.Generic.List[string]]::new()
+    foreach ($f in (Get-ChildItem -LiteralPath $mdir -Filter 'shot-*.meta' -File -ErrorAction SilentlyContinue | Sort-Object Name)) {
+        $meta = Get-Content -LiteralPath $f.FullName -Raw
+        $idx = Get-VesShotMetaValue -Content $meta -Key 'index'
+        $startTs = Get-VesShotMetaValue -Content $meta -Key 'start_ts'
+        $endTs = Get-VesShotMetaValue -Content $meta -Key 'end_ts'
+        $shotStart[$idx] = $startTs; $shotEnd[$idx] = $endTs
+        $statusFile = Get-VesManifestShotStatusPath -ManifestDir $mdir -Index $idx
+        $status = Get-Content -LiteralPath $statusFile -Raw
+        $samplesLine = Get-VesShotMetaValue -Content $status -Key 'samples'
+        $valid = ConvertFrom-VesShotSamplesLine -SamplesLine $samplesLine
+        if ($valid.Count -eq 0) {
+            $noSampleIdx.Add($idx)
+            continue
+        }
+        $sampleShotStart[$idx] = $startTs; $sampleShotEnd[$idx] = $endTs
+        foreach ($s in $valid) {
+            $samples.Add([PSCustomObject]@{ Idx = "$idx"; Qp = "$($s.Qp)"; Vmaf = [double]$s.Vmaf; Bytes = [double]$s.Bytes })
+        }
+    }
+    $nTotal = @(Get-ChildItem -LiteralPath $mdir -Filter 'shot-*.meta' -File -ErrorAction SilentlyContinue).Count
+    $nFb = $noSampleIdx.Count
+    if ($nFb -gt 0 -and $nTotal -gt $nFb) {
+        $ByteBudget = [double]::Parse(($ByteBudget * ($nTotal - $nFb) / $nTotal).ToString('0', [System.Globalization.CultureInfo]::InvariantCulture), [System.Globalization.CultureInfo]::InvariantCulture)
+        Write-Warning "  equal-slope budget: reserved for $nFb/$nTotal fallback shots -> solve budget=$([int64]$ByteBudget) B"
+    }
+
+    $bound = $PSBoundParameters.ContainsKey('DeprioStart') -and $PSBoundParameters.ContainsKey('DeprioEnd')
+    $solve = Invoke-VesEqualSlopeBudgetSolve -Samples @($samples) -ShotStart $sampleShotStart -ShotEnd $sampleShotEnd `
+        -Budget $ByteBudget -DeprioStart ($(if ($bound) { "$DeprioStart" } else { $null })) -DeprioEnd ($(if ($bound) { "$DeprioEnd" } else { $null })) `
+        -DeprioWeight $DeprioWeight -HeadFrac (Get-VesAllocPosWeightHeadFrac) -TailFrac (Get-VesAllocPosWeightTailFrac) `
+        -WeightMin (Get-VesAllocPosWeightMin) -Target $pstTarget -FloorDrop $floorDrop -PinRounds $pinRounds
+    Write-Warning $solve.Report
+    if ($solve.OvershootPct -gt 10.0) {
+        Write-Warning "  equal-slope budget: BUDGET_UNREACHABLE -- solve overshoots by $($solve.OvershootPct.ToString('0.0', [System.Globalization.CultureInfo]::InvariantCulture))% (floor pins + tight budget); qpfile is the constrained best, not the requested size"
+    }
+
+    $shotQps = @{}
+    foreach ($p in $solve.Picks) {
+        $shotQps["$($p.Idx)"] = "$($shotStart[$p.Idx]):$($shotEnd[$p.Idx]):$($p.Qp)"
+    }
+    foreach ($ni in $noSampleIdx) {
+        $status = Get-Content -LiteralPath (Get-VesManifestShotStatusPath -ManifestDir $mdir -Index $ni) -Raw
+        $fallbackQp = Get-VesShotMetaValue -Content $status -Key 'qp'
+        $shotQps["$ni"] = "$($shotStart[$ni]):$($shotEnd[$ni]):$fallbackQp"
+    }
+
+    $ft = Get-VesFpsAndTotalFrames -Source $Source -FfprobePath $FfprobePath
+    Write-VesShotQpsToQpfile -Shots (ConvertTo-VesShotQpArray -ShotQpMap $shotQps) -TotalFrames $ft.TotalFrames -Fps $ft.Fps -QpfileOut $QpfileOut
+    Write-Host "Assembled qpfile via equal-slope budget allocation: $($shotQps.Count) shots, $QpfileOut ($($ft.TotalFrames) frames)"
     return $true
 }
 
@@ -734,7 +1138,8 @@ function Get-VesShotEncodeBytesOnly {
     $src = if ($env:SHOT_SRC_LOCAL) { $env:SHOT_SRC_LOCAL } else { $Source }
     $svtp = Get-VesProfileSvtParams -Profile $Profile -FfmpegPath $FfmpegPath
     if (-not $svtp) { return $null }
-    $useSvtBin = $SvtAv1EncAppPath -and (Test-Path -LiteralPath $SvtAv1EncAppPath)
+    $SvtAv1EncAppPath = Resolve-VesSvtAv1EncAppPath -SvtAv1EncAppPath $SvtAv1EncAppPath
+    $useSvtBin = [bool]$SvtAv1EncAppPath
     $base = if ($env:RAMDISK_JOB_DIR) { $env:RAMDISK_JOB_DIR } else { [System.IO.Path]::GetTempPath() }
     $work = Join-Path $base ("ves-shotbytes-$PID-$(Get-Random)")
     New-Item -ItemType Directory -Path $work -Force | Out-Null
@@ -771,6 +1176,7 @@ function Get-VesShotEncodeBytesOnly {
                 '-i', $y4m, '--use-q-file', '1', '--qpfile', $qpfile, '--svtav1-params', "${svtp}:rc=0", '-b', $out
             ) -TimeoutSeconds $tmo -MaxRetries 1
         } else {
+            Write-Warning "per-shot bytes: SvtAv1EncApp not found; falling back to ffmpeg libsvtav1. Results may not be fleet-comparable."
             $out = Join-Path $work 'shot.ivf'
             $r = Invoke-VesWithTimeoutRetry -FilePath $FfmpegPath -ArgumentList @(
                 '-y', '-v', 'error', '-i', $y4m, '-map', '0:v:0', '-c:v', 'libsvtav1', '-preset', '5',
@@ -893,12 +1299,8 @@ function Get-VesVmafScoreShot {
     if ($Codec -ne 'av1') { return $null }
     # Phase 1: read the extraction from the worker's local stage when set.
     if ($env:SHOT_SRC_LOCAL) { $Source = $env:SHOT_SRC_LOCAL }
-    # SvtAv1EncApp is optional: several Windows fleet hosts (PRINCE) have no
-    # standalone binary and encode via ffmpeg's libsvtav1. For the per-shot
-    # SEARCH every qpfile is UNIFORM (one QP for the whole shot), which is
-    # identical to `-svtav1-params qp=N` -- no per-frame qpfile needed here.
-    # (The stage-2 allocator's per-frame qpfile will need the real thing.)
-    $useSvtBin = $SvtAv1EncAppPath -and (Test-Path -LiteralPath $SvtAv1EncAppPath)
+    $SvtAv1EncAppPath = Resolve-VesSvtAv1EncAppPath -SvtAv1EncAppPath $SvtAv1EncAppPath
+    $useSvtBin = [bool]$SvtAv1EncAppPath
 
     $svtp = Get-VesProfileSvtParams -Profile $Profile -FfmpegPath $FfmpegPath
     if (-not $svtp) { return $null }
@@ -956,6 +1358,7 @@ function Get-VesVmafScoreShot {
             # ffmpeg libsvtav1 fallback, uniform QP == qp-file of one value.
             # Keep IVF as the measured byte artifact, matching the
             # SvtAv1EncApp path and bash's byte contract.
+            Write-Warning "per-shot VMAF: SvtAv1EncApp not found; falling back to ffmpeg libsvtav1. Results may not be fleet-comparable."
             $out = Join-Path $work "shot-enc-$Qp.ivf"
             $ffEnc = Invoke-VesWithTimeoutRetry -FilePath $FfmpegPath -ArgumentList @(
                 '-y', '-v', 'error', '-i', $y4m, '-map', '0:v:0',
@@ -1450,6 +1853,10 @@ Export-ModuleMember -Function `
     Get-VesVmafScoreShot, Resolve-VesPerShotQp, Invoke-VesShotSearchClaimed, `
     Get-VesStageSourceLocal, Get-VesShotIsNosignal, Get-VesShotEncodeBytesOnly, `
     Get-VesVmafScoreShotMw, Test-VesShotManifestBracketHealth, `
+    Write-VesShotQpsToQpfile, Assemble-VesQpfileFromShotManifest, `
+    Get-VesCreditsRange, Assemble-VesQpfileViaEqualSlopeBudget, `
+    Get-VesAllocPosWeightHeadFrac, Get-VesAllocPosWeightTailFrac, Get-VesAllocPosWeightMin, `
+    Get-VesAllocMinShotVmafDrop, Get-VesAllocMinShotPinRounds, Get-VesAllocBytesCalibrationK, `
     Get-VesPerShotQpBracketFor, Test-VesShotBracketEdge, `
     Get-VesShotLongSecs, Get-VesPerShotMwLen, Get-VesPerShotVmafStride, `
     Get-VesShotComplexityEnable, Get-VesPerShotMultiwindowEnable, `

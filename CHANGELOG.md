@@ -6,6 +6,15 @@ has the full story — what was wrong, why it mattered, and how it was fixed.
 
 ## v6.0.1J — 2026-09-03 (branch `6.x-chunk-redesign`)
 
+**PRINCE stage-2 per-shot allocator ported.** `VesPerShotQp.psm1` now has
+the bash-parity stage-2 qpfile assembly path, including streamed per-frame
+qpfile writing, manifest-status QP assembly, chapter-marker credits range
+detection, and the equal-slope byte-budget allocator with position weighting,
+per-shot VMAF-floor pinning, fallback-shot budget reservation, and fraction
+budget baseline handling. The Windows search helpers now prefer a discoverable
+native `SvtAv1EncApp[.exe]` path and warn before falling back to ffmpeg
+`libsvtav1`, since the native binary is the fleet-comparable path.
+
 **PRINCE per-shot numerical parity audit/fixes.** The Windows per-shot search
 port was audited function-by-function against the bash originals and the
 findings are committed in `docs/prince-parity/task2-findings.md`. Fixed
