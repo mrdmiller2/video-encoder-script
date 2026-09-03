@@ -194,7 +194,10 @@ _vmaf_score_shot() {
       y4m="$work/shot.y4m"
       run_ffmpeg_validation -y -v error -i "$clip" -map 0:v:0 -pix_fmt yuv420p10le -strict -1 "$y4m" 2>/dev/null \
         || { rm -rf "$work"; return 1; }
-      nframes="$("${FFPROBE_CMD[@]}" -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of csv=p=0 "$clip" 2>/dev/null)"
+      # trailing-comma guard: see the note in _shot_encode_bytes_only. 4K HDR10
+      # (The Dark Tower) made `-of csv=p=0` print "40," -> the ^[0-9]+$ check
+      # failed -> every shot fell back to search_failed=1 (found live 2026-09-03).
+      nframes="$("${FFPROBE_CMD[@]}" -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of default=nokey=1:noprint_wrappers=1 "$clip" 2>/dev/null | grep -m1 -oE '[0-9]+' || true)"
       [[ "$nframes" =~ ^[0-9]+$ ]] && [ "$nframes" -gt 0 ] || { rm -rf "$work"; return 1; }
       qpfile="$work/uniform-$qp.qp"
       # awk generator, not `yes | head`: under `set -o pipefail` (production
@@ -264,7 +267,12 @@ _shot_encode_bytes_only() {
     -map 0:v:0 -c:v ffv1 -level 3 "$clip" 2>/dev/null || { rm -rf "$work"; return 1; }
   run_ffmpeg_validation -y -v error -i "$clip" -map 0:v:0 -pix_fmt yuv420p10le -strict -1 "$y4m" 2>/dev/null \
     || { rm -rf "$work"; return 1; }
-  nframes="$("${FFPROBE_CMD[@]}" -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of csv=p=0 "$clip" 2>/dev/null)"
+  # `-of csv=p=0` can emit a trailing "," for the ffv1 re-encode of some
+  # sources (seen live 2026-09-03 on The Dark Tower -- 4K HDR10: ffprobe
+  # prints "40," so the `^[0-9]+$` guard failed and EVERY shot fell back to
+  # search_failed=1). Same trailing-comma class as _source_is_uhd (v6.0.1F).
+  # `default=nokey=1:noprint_wrappers=1` never adds separators; grep the int.
+  nframes="$("${FFPROBE_CMD[@]}" -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of default=nokey=1:noprint_wrappers=1 "$clip" 2>/dev/null | grep -m1 -oE '[0-9]+' || true)"
   [[ "$nframes" =~ ^[0-9]+$ ]] && [ "$nframes" -gt 0 ] || { rm -rf "$work"; return 1; }
   qpfile="$work/uniform.qp"
   awk -v q="$qp" -v n="$nframes" 'BEGIN{ while (n-- > 0) print q }' > "$qpfile"
