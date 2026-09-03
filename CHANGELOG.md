@@ -6,6 +6,14 @@ has the full story — what was wrong, why it mattered, and how it was fixed.
 
 ## v6.0.1J — 2026-09-03 (branch `6.x-chunk-redesign`)
 
+**PRINCE D-val encode worker added.** `dval_worker_encode.ps1` mirrors the
+Linux survey encode worker on Windows: Linux `/mnt/...` source/shared paths are
+remapped to the NAS UNC, scratch space stays on `D:\VES-PRINCE\work\dval`, the
+force-resolve cap and resume-safe result checks are preserved, all eight survey
+variants encode through native `SvtAv1EncApp.exe`, and libvmaf scoring uses a
+bare JSON filename with ffmpeg's working directory set to scratch so Windows
+drive letters cannot break `log_path=`.
+
 **PRINCE stage-2 per-shot allocator ported.** `VesPerShotQp.psm1` now has
 the bash-parity stage-2 qpfile assembly path, including streamed per-frame
 qpfile writing, manifest-status QP assembly, chapter-marker credits range
