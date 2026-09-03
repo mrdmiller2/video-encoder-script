@@ -6,6 +6,20 @@ has the full story — what was wrong, why it mattered, and how it was fixed.
 
 ## v6.0.1J — 2026-09-03 (branch `6.x-chunk-redesign`)
 
+**PRINCE joined the fleet per-shot search pool (search parity complete).** After
+the v6.0.1J port + the multiwindow-median fix, an end-to-end run on PRINCE was
+compared shot-by-shot against the Linux fleet's live results for Conan the
+Destroyer: non-multiwindow shots byte-identical; multiwindow shots (0, 2)
+qp/vmaf/edge-flags/sample-VMAFs exact, sample bytes within 0.0001-0.04% (the
+mw byte-de-bias ratio in PS double vs bash awk `%.6f`). `dval_research.sh` gains
+a `win` host-kind (`PRINCE|2022|10.200.200.104|win`) launched via `dval_win_launch.ps1`
+-> an **S4U Scheduled Task** (survives ssh close; its token reaches the NAS SMB
+share -- verified via STING/direct-ZFS; an Interactive-logon task silently never
+runs with no console session). `kill_workers` stops the title-scoped task.
+SvtAv1EncApp.exe v4.2.0 (MSYS2 mingw build) on PRINCE is byte-identical to the
+Fedora fleet's for both the `--qpfile` and `crf=` paths. ELVIS manifest duty can
+be re-enabled next survey (the complexity port that gated it out is verified).
+
 **PRINCE D-val encode worker added.** `dval_worker_encode.ps1` mirrors the
 Linux survey encode worker on Windows: Linux `/mnt/...` source/shared paths are
 remapped to the NAS UNC, scratch space stays on `D:\VES-PRINCE\work\dval`, the
