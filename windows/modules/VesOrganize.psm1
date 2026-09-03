@@ -54,7 +54,12 @@ function Get-VesPathParent {
     param([Parameter(Mandatory)][string]$Path)
     $trimmed = $Path.TrimEnd('\', '/')
     if ($trimmed -match '^(.+)[\\/][^\\/]+$') { return $Matches[1] }
-    return Split-Path -Parent $Path
+    # Bare leaf with no separator -- bash `dirname` returns "." here; matching
+    # that keeps Join-Path in Get-VesShotManifestDir from throwing on a
+    # relative single-filename source.
+    $p = Split-Path -Parent $Path
+    if ([string]::IsNullOrEmpty($p)) { return '.' }
+    return $p
 }
 
 function Get-VesCanonicalTitleFromFile {
