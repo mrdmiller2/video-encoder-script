@@ -793,7 +793,9 @@ function New-VesShotManifest {
         if (Test-Path -LiteralPath $completeMarker) { return $true }
 
         if (-not (Test-Path -LiteralPath $mdir)) {
-            New-Item -ItemType Directory -Path $mdir -Force | Out-Null
+            # -Path (not -LiteralPath, which New-Item lacks) globs [ ] * ? -- a
+            # bracketed movie title would break the create. Escape it.
+            New-Item -ItemType Directory -Path ([System.Management.Automation.WildcardPattern]::Escape($mdir)) -Force | Out-Null
             Set-VesEveryoneReadWrite -Path $mdir
         }
 
@@ -947,7 +949,7 @@ function Enter-VesShotClaim {
         $lockPath = Get-VesShotLockPath -Source $Source -Index $idx
         $metaPath = Join-Path $lockPath 'owner.meta'
         try {
-            New-Item -ItemType Directory -Path $lockPath -ErrorAction Stop | Out-Null
+            New-Item -ItemType Directory -Path ([System.Management.Automation.WildcardPattern]::Escape($lockPath)) -ErrorAction Stop | Out-Null
             try {
                 Write-VesKvFile -Path $metaPath -Lines @(
                     "host=$env:COMPUTERNAME",
@@ -973,7 +975,7 @@ function Enter-VesShotClaim {
                 [System.IO.Directory]::Move($lockPath, $reclaimName)
                 try { [System.IO.Directory]::Delete($reclaimName, $true) } catch { }
                 try {
-                    New-Item -ItemType Directory -Path $lockPath -ErrorAction Stop | Out-Null
+                    New-Item -ItemType Directory -Path ([System.Management.Automation.WildcardPattern]::Escape($lockPath)) -ErrorAction Stop | Out-Null
                     try {
                         Write-VesKvFile -Path $metaPath -Lines @(
                             "host=$env:COMPUTERNAME",
@@ -1246,10 +1248,18 @@ function Get-VesVmafScoreShotMw {
             -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -SvtAv1EncAppPath $SvtAv1EncAppPath)
     }
     $sorted = @($vs | Sort-Object)
-    $med = if ($sorted.Count % 2) { $sorted[[int]($sorted.Count / 2)] }
-           else { ($sorted[$sorted.Count / 2 - 1] + $sorted[$sorted.Count / 2]) / 2 }
+    # Bash: sort -n; odd NR -> a[int(NR/2)+1] (1-indexed middle); even -> mean of
+    # the two middle. The middle 0-indexed element for odd N is floor(N/2) -- NOT
+    # [int](N/2), which for N=3 is [int]1.5 == 2 (PowerShell banker's rounding),
+    # i.e. the MAX, biasing every long-shot score high (found live 2026-09-03,
+    # PRINCE E2E: mw VMAFs ran +1..+7 vs the fleet).
+    $mid = [int][math]::Floor($sorted.Count / 2)
+    $med = if ($sorted.Count % 2) { $sorted[$mid] }
+           else { ($sorted[$mid - 1] + $sorted[$mid]) / 2 }
     $avgRate = ($rates | Measure-Object -Average).Average
-    return [PSCustomObject]@{ Vmaf = [math]::Round($med, 2); Bytes = [long]($avgRate * $shotDur) }
+    # Bash does not round the combined median (window VMAFs are already 2dp from
+    # _vmaf_score_shot; an even-count average may carry a 3rd digit -- keep it).
+    return [PSCustomObject]@{ Vmaf = $med; Bytes = [long]($avgRate * $shotDur) }
 }
 
 function Test-VesShotManifestBracketHealth {
