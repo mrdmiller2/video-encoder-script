@@ -170,7 +170,10 @@ _stage_source_local() {
 # but N parallel readers fan out across the N TCP connections. Falls back to
 # plain cp for a small/local file or when the tools are missing. 2026-09-03.
 _stage_copy() {  # <src> <dst>
-  local s="$1" d="$2" n="${VES_STAGE_COPY_STREAMS:-8}" sz i chunk ok
+  # 3 streams by default: enough to beat a single BDP-capped stream over the
+  # ~17ms site VPN, few enough that ~8 fleet hosts staging at once don't crush
+  # the NAS/tunnel (64 concurrent streams wedged even `ls` on 2026-09-03).
+  local s="$1" d="$2" n="${VES_STAGE_COPY_STREAMS:-3}" sz i chunk ok
   local -a pids=()
   sz="$(stat -c%s -- "$s" 2>/dev/null)" || { cp -f -- "$s" "$d" 2>/dev/null; return $?; }
   if [ "${sz:-0}" -lt 67108864 ] || [ "$n" -le 1 ]; then
