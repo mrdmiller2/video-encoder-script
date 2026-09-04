@@ -62,6 +62,15 @@ discover_svtav1encapp() {
   local tool
   tool="$(command -v SvtAv1EncApp 2>/dev/null)" || return 1
   SVTAV1ENCAPP_CMD=("$tool")
+  # VES_SVTAV1_ASM caps the assembly instruction set (SvtAv1EncApp --asm
+  # <c|sse2|...|avx512|max>). SVT-AV1 v4.2.0's x86 SIMD kernels SIGSEGV on
+  # some pre-AVX microarchitectures (verified: Nehalem Xeon X5570 crashes at
+  # sse3 and up, non-deterministically by content); `--asm 0` (pure C) is
+  # slower but bit-identical to the AVX fleet output (sha-verified 2026-09-04).
+  # A per-host override that reliably reaches an ssh-exec'd worker (a plain
+  # SvtAv1EncApp shell wrapper, or the launcher's env) is the affected box's
+  # to set; unset everywhere else so a normal node keeps auto-detect / max.
+  [ -n "${VES_SVTAV1_ASM:-}" ] && SVTAV1ENCAPP_CMD+=(--asm "$VES_SVTAV1_ASM")
   return 0
 }
 
