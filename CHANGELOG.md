@@ -4,6 +4,76 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.1K — 2026-09-04 (branch `6.x-chunk-redesign`)
+
+**D-val survey remediation — allocator fix (Phase A6) + local-first working set (Phase B).**
+Reviewed by Gemini + Codex + Cursor over two rounds (round 1: 7 CRITICAL / ~8 HIGH / ~6 MEDIUM;
+round 2: 2 CRITICAL + HIGH, all fixed) before merge. The survey was stopped and reset to a
+clean slate first; nothing here changes the non-survey conversion path unless `VES_CLAIM_CMD`
+/ `DVAL_LOCAL_FIRST` is set.
+
+*Round-2 fixes.* (a) `dval_watchdog.sh` referenced an unbound `$SD` under `set -u` — crashed
+every cron run; now defined (`DVAL_SURVEY_DIR`), and the reaper-stale check also alerts when
+the beat file is **absent** (cron never installed), not only when it's stale. (b) On a
+permanent NAS status-sync failure the worker loop no longer silently gambles on the lease
+TTL — it retries in place (heartbeat alive) 5× with backoff, then fails LOUD: moves the local
+resolved status aside so the shot is re-searched, releases the lease, drops
+`ALERT.status-sync-failed`. (c) Both background beats (`_dval_hb_bg`, encode `_BEAT_PID`)
+check parent liveness each cycle so a `pkill -9`'d worker can't orphan an immortal
+heartbeat/rsync. (d) `_dval_sync_status` returns non-zero on a missing/empty local status
+file instead of a phantom success; prestaged-source size check uses portable `file_size_bytes`
+(a bare `stat -c%s` compared "" to "" on macOS); local seed uses `rsync --delete` so a stale
+status from a prior run can't mask a shot that must be redone; migration writes
+`state/titles/<slug>` only after a verified landing. `ves-dval-release` takes an optional
+owner token (CAS delete).
+
+*Working-folder location.* `working_dir_for_source` now places `<base>_WORKING/` at the
+**category level** (beside the per-title / show folder), not inside the real title folder, so
+pipeline scratch stays out of what Plex scans and outside a bad `rm`'s blast radius — with a
+guard so a loose file sitting straight in a language/shelf dir keeps `_WORKING` beside it
+rather than escaping the library root. Each library's existing category-level `.plexignore`
+gains a `*_WORKING` line. Round-3 (Gemini + Cursor, ship-gate: go) also: the fail-loud path
+keeps the lease when it can't move the local status aside (rather than release-then-skip);
+each worker gets its own `$_H.$PID` local manifest subtree (siblings on one host no longer
+race on the seed `--delete`); `ALERT.status-sync-failed` self-retires once stale.
+
+*Allocator (`assemble_qpfile_via_equal_slope_budget`, fraction mode).* A shot that can't hit
+its VMAF target at any probed QP was priced at its **max-VMAF / qp-min / max-bytes** sample,
+inflating the fraction baseline until every `D_fXX` target sat above the CRF base →
+`BUDGET_UNREACHABLE` → `f90=f80=f70=f60` byte-identical (A Few Moments). Now priced at the most
+aggressive quality the equal-slope solver may actually reach: floor-off = highest probed QP;
+floor-on = highest QP still clearing `target − ALLOC_MIN_SHOT_VMAF_DROP`. Plus (a) a
+**physical-floor clamp** — `_baseline` is raised to the sum of each shot's smallest sample so
+the fallback can't *under*-count into the opposite degeneracy; (b) a **`BASELINE UNFIT`
+hard-fail** (`rc 2`) when `_baseline ≥ source` or `> ALLOC_BASELINE_MAX_RATIO ×` the CRF base
+(survey exports `ALLOC_BASELINE_SANITY_BYTES`) → logged to `BASELINE-UNFIT.log`, watchdog
+`ALERT.baseline-unfit`, the title stays INCOMPLETE for investigation rather than feeding
+calibration a degenerate sweep.
+
+*Concurrent-staging storm.* `_stage_source_local`'s mkdir-loop lock let simultaneous worker
+starts through — 4 parallel 9.4 GB source copies on one host. Replaced with `flock -w 2700`
+on a local lock file (auto-releases on holder exit, no stale-steal race). macOS falls back to
+a single-shot copy.
+
+*Working-folder convention.* `working_dir_for_source` / `working_basename` (`ves-organize.sh`)
+→ `<source basename minus final ext>_WORKING/{shots,logs}/` at the category level. `shot_manifest_dir`
+returns `$SHOT_MANIFEST_DIR_LOCAL` when a worker is in flight, else `<working>/shots`; new
+`shot_manifest_dir_nas` + `shot_manifest_all_resolved_nas` for the coordinator/encode side and
+the worker-loop exit check (a worker's local view lags the fleet). `assemble_qpfile_*` pinned
+to the NAS path. `shot_lock_path` retired → `_legacy_lock_path` inlined.
+
+*Claim-lease delegation.* `shot_claim_next` / `shot_release_claim` delegate to
+`$VES_CLAIM_CMD` / `$VES_CLAIM_RELEASE_CMD` when set (the survey's redis lease on the
+coordinator, spoken RESP-over-`/dev/tcp` from `ves-dval-claim-lib.sh` — no `redis-cli` on any
+worker); the legacy NFS `mkdir` dir-lock is unchanged when they're unset. Release/heartbeat
+carry an **owner token** (`VES_CLAIM_OWNER=<host>:<pid>`, Lua `EVAL` "only if `GET==owner`") so
+a lease that expired mid-search and was re-taken by a peer is never stolen back; a background
+heartbeat refreshes the TTL every 10 min. `shot_search_worker_loop`: claim-rc 2 (redis
+unreachable) → pause + retry, not exit; **status file synced to the NAS with read-back +
+retry BEFORE the lease is released** (a crash between resolve and sync keeps the lease so the
+reaper/TTL won't free it and we re-sync); idle ceiling raised above the lease TTL so a live
+worker outlasts a dead claim.
+
 ## v6.0.1J — 2026-09-03 (branch `6.x-chunk-redesign`)
 
 **PRINCE joined the fleet per-shot search pool (search parity complete).** After

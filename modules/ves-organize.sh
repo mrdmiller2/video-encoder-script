@@ -15,6 +15,41 @@ media_content_dir() {
   fi
 }
 
+# Per-source pipeline working folder (Phase B, 2026-09-04). One predictable
+# directory at the CATEGORY level -- beside the per-title / show folder, not
+# inside it -- for ALL generated artifacts (shot manifests, search status, logs,
+# encode variants, result). Named "<source basename minus extension>_WORKING"
+# verbatim (year kept), so bash and the PowerShell fork compute the identical
+# path with no canonical-title ambiguity. Plex skips it via a "*_WORKING" line
+# in each library's category-level .plexignore.
+#   <category dir>/<base>_WORKING/{shots,logs}/  +  result.log
+working_basename() {
+  local src="$1" b
+  b="$(basename -- "$src")"
+  printf '%s' "${b%.*}"          # strip the last .ext only
+}
+# <category dir>/<base>_WORKING -- BESIDE the per-title / show folder, not inside
+# it, so pipeline scratch stays out of the real media folder (what Plex scans,
+# what a bad rm could hit -- see feedback_plexignore_in_progress). category dir
+# = the parent of media_content_dir(): for a movie ".../Cat/Title/Title.mkv" ->
+# ".../Cat/Title_WORKING"; for a TV ep ".../Cat/Show/S01E01.mkv" ->
+# ".../Cat/S01E01 - Name_WORKING".
+working_dir_for_source() {
+  local src="$1" cdir
+  cdir="$(media_content_dir "$src")"
+  # Normally cdir is the per-title / show folder and we want the _WORKING dir
+  # one level up (the category). But a LOOSE file sitting straight in a
+  # language/shelf dir has no title folder -- cdir is already the category, and
+  # going up would escape the library root. Detect that and keep _WORKING beside
+  # the file instead. (declare -F guard: is_movie_organize_parent lives in this
+  # same module but a caller may source us partially.)
+  if declare -F is_movie_organize_parent >/dev/null 2>&1 && is_movie_organize_parent "$cdir"; then
+    printf '%s/%s_WORKING' "$cdir" "$(working_basename "$src")"
+  else
+    printf '%s/%s_WORKING' "$(dirname -- "$cdir")" "$(working_basename "$src")"
+  fi
+}
+
 # English-scale libraries bucket movies under single-letter dirs (A–Z) and 0 (digit-led).
 uses_letter_bucket_library() {
   local p="$1"

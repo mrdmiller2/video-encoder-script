@@ -133,35 +133,34 @@ _stage_source_local() {
     warn "_stage_source_local: not enough local space in $dir for $(basename "$src") -- reading from NFS"
     printf '%s' "$src"; return 0
   fi
-  # Serialize concurrent workers on THIS host (multi-worker per host, 2026-09-03):
-  # an mkdir lock so only one worker copies the ~GB source; the rest wait, then
-  # find it done. Bounded wait -> fall back to NFS read if the copier is stuck.
-  local lockd="$dst.copylock.d" waited=0
-  while ! mkdir -- "$lockd" 2>/dev/null; do
-    have="$(stat -c%s -- "$dst" 2>/dev/null || echo 0)"
-    if [ "$want" -gt 0 ] && [ "$have" = "$want" ]; then
-      touch -a -- "$dst" 2>/dev/null; printf '%s' "$dst"; return 0
-    fi
-    # steal a stale lock (a killed copier) after 40min
-    if [ -d "$lockd" ]; then
-      local _la; _la="$(_shot_path_mtime "$lockd")"
-      [ -n "$_la" ] && [ "$(( $(date +%s) - _la ))" -gt 2400 ] && rm -rf -- "$lockd" 2>/dev/null
-    fi
-    sleep 5; waited=$((waited+5))
-    [ "$waited" -gt 2700 ] && { printf '%s' "$src"; return 0; }
-  done
-  # re-check now that we hold the lock (a peer may have just finished)
-  have="$(stat -c%s -- "$dst" 2>/dev/null || echo 0)"
-  if [ "$want" -gt 0 ] && [ "$have" = "$want" ]; then
-    rmdir -- "$lockd" 2>/dev/null; touch -a -- "$dst" 2>/dev/null
-    printf '%s' "$dst"; return 0
+  # Serialize concurrent workers on THIS host (multi-worker per host): an flock
+  # on a LOCAL lock file so only one worker copies the ~GB source; the rest
+  # block, then find it done. flock releases automatically when the holder exits
+  # (killed or not) -- no stale-steal race. The old mkdir-loop let simultaneous
+  # starts through (2026-09-04: 4 parallel 9.4 GB copies on RANDYJ) because the
+  # re-check window between mkdir failure and the wait sleep was itself racy.
+  local lockf="$dir/.stagelock.$h"
+  if command -v flock >/dev/null 2>&1; then
+    (
+      flock -w 2700 9 || exit 99
+      _h2="$(stat -c%s -- "$dst" 2>/dev/null || echo 0)"
+      [ "$want" -gt 0 ] && [ "$_h2" = "$want" ] && exit 0    # a peer staged it
+      _t2="$dst.$$.part"
+      if _stage_copy "$src" "$_t2" && [ "$(stat -c%s -- "$_t2" 2>/dev/null || echo 0)" = "$want" ]; then
+        mv -f -- "$_t2" "$dst" 2>/dev/null && exit 0
+      fi
+      rm -f -- "$_t2" 2>/dev/null; exit 1
+    ) 9>"$lockf"
+    local _rc=$?
+    if [ "$_rc" -eq 0 ]; then touch -a -- "$dst" 2>/dev/null; printf '%s' "$dst"; return 0; fi
+    printf '%s' "$src"; return 0
   fi
-  # copy to a temp name then rename so a concurrent worker never sees a partial
+  # no flock (e.g. bare macOS) -- single-shot copy, best effort
   local tmp="$dst.$$.part"
   if _stage_copy "$src" "$tmp" && [ "$(stat -c%s -- "$tmp" 2>/dev/null || echo 0)" = "$want" ]; then
-    mv -f -- "$tmp" "$dst" 2>/dev/null && { rmdir -- "$lockd" 2>/dev/null; printf '%s' "$dst"; return 0; }
+    mv -f -- "$tmp" "$dst" 2>/dev/null && { printf '%s' "$dst"; return 0; }
   fi
-  rm -f -- "$tmp" 2>/dev/null; rmdir -- "$lockd" 2>/dev/null
+  rm -f -- "$tmp" 2>/dev/null
   printf '%s' "$src"
 }
 
@@ -799,18 +798,29 @@ _write_shot_qps_to_qpfile() {
 # files. Sibling to chunk_manifest_dir()'s own <title>.chunks convention.
 shot_manifest_dir() {
   local src="$1"
-  local dir title
-  dir="$(media_content_dir "$src")"
-  title="$(canonical_title_from_source "$src")"
-  printf '%s/%s.shots' "$dir" "$title"
+  # Phase B (2026-09-04): the per-shot manifest + status live under the source's
+  # <base>_WORKING/shots/ folder (see working_dir_for_source in ves-organize.sh),
+  # not a <canonical_title>.shots sibling. A worker keeps its in-flight copy on
+  # LOCAL disk (SHOT_MANIFEST_DIR_LOCAL) and rsyncs each completed shot-NNN.status
+  # back here; unset = operate directly on this NAS path (coordinator, migration).
+  if [ -n "${SHOT_MANIFEST_DIR_LOCAL:-}" ]; then
+    printf '%s' "$SHOT_MANIFEST_DIR_LOCAL"; return 0
+  fi
+  if declare -F working_dir_for_source >/dev/null 2>&1; then
+    printf '%s/shots' "$(working_dir_for_source "$src")"; return 0
+  fi
+  # pre-Phase-B fallback (module load order / callers without ves-organize.sh)
+  printf '%s/%s.shots' "$(media_content_dir "$src")" "$(canonical_title_from_source "$src")"
 }
 
-shot_lock_path() {
-  local src="$1" idx="$2"
-  local dir title
-  dir="$(media_content_dir "$src")"
-  title="$(canonical_title_from_source "$src")"
-  printf '%s/%s.shot%s' "$dir" "$title" "$idx"
+# NAS-side manifest dir (never the local override) -- for the sync-back target
+# and the coordinator's read-back.
+shot_manifest_dir_nas() {
+  local src="$1"
+  if declare -F working_dir_for_source >/dev/null 2>&1; then
+    printf '%s/shots' "$(working_dir_for_source "$src")"; return 0
+  fi
+  printf '%s/%s.shots' "$(media_content_dir "$src")" "$(canonical_title_from_source "$src")"
 }
 
 # Epoch mtime of a path (file or dir), or empty. Tries both stat dialects
@@ -1006,6 +1016,40 @@ shot_claim_next() {
   mdir="$(shot_manifest_dir "$src")"
   [ -f "$mdir/.complete" ] || return 1
   this_host="$(hostname 2>/dev/null || echo unknown)"
+  # shot_lock_path retired (Phase B) -- recompute the legacy NFS lock path here
+  # so the non-survey pipeline (no VES_CLAIM_CMD) still works.
+  _legacy_lock_path() {
+    local d t
+    d="$(media_content_dir "$1")"
+    t="$(canonical_title_from_source "$1" 2>/dev/null)" || t="$(basename -- "$1")"
+    printf '%s/%s.shot%s' "$d" "$t" "$2"
+  }
+
+  # Phase B (2026-09-04): when a lease backend is configured (survey: redis on
+  # the coordinator with an SSH fallback), delegate. VES_CLAIM_CMD is a command
+  # that takes  <slug> <idx> <host>  and prints OK / TAKEN. Falls through to the
+  # NFS dir-lock below only when no backend is set (the non-survey pipeline,
+  # until redis is proven fleet-wide).
+  if [ -n "${VES_CLAIM_CMD:-}" ]; then
+    local _slug _st _r _nasdir _nas_sf
+    _slug="$(basename -- "$src" | tr -c 'A-Za-z0-9._-' '_')"
+    _nasdir="$(shot_manifest_dir_nas "$src")"
+    for f in "$mdir"/shot-*.meta; do
+      [ -e "$f" ] || continue
+      idx="$(awk -F= '/^index=/{print $2; exit}' "$f")"
+      status_file="$mdir/shot-$(printf '%03d' "$idx").status"
+      if [ -f "$status_file" ] && grep -q '^status=resolved' "$status_file" 2>/dev/null; then continue; fi
+      if [ "$mdir" != "$_nasdir" ]; then
+        _nas_sf="$_nasdir/shot-$(printf '%03d' "$idx").status"
+        [ -f "$_nas_sf" ] && grep -q '^status=resolved' "$_nas_sf" 2>/dev/null && continue
+      fi
+      : "${VES_CLAIM_OWNER:=$this_host:$$}"
+      _r="$($VES_CLAIM_CMD "$_slug" "$idx" "$VES_CLAIM_OWNER" 2>/dev/null)"
+      [ "$_r" = "OK" ]   && { printf '%s' "$idx"; return 0; }
+      [ "$_r" = "WAIT" ] && return 2      # redis unreachable -- loop should pause, not exit
+    done
+    return 1
+  fi
 
   for f in "$mdir"/shot-*.meta; do
     [ -e "$f" ] || continue
@@ -1016,7 +1060,7 @@ shot_claim_next() {
       st="$(awk -F= '/^status=/{print $2; exit}' "$status_file" 2>/dev/null)"
       [ "$st" = "resolved" ] && continue
     fi
-    lockdir="$(shot_lock_path "$src" "$idx").lock"
+    lockdir="$(_legacy_lock_path "$src" "$idx").lock"
     if mkdir -- "$lockdir" 2>/dev/null; then
       cat >"${lockdir}/owner.meta" <<EOF
 host=$this_host
@@ -1063,7 +1107,20 @@ EOF
 
 shot_release_claim() {
   local src="$1" idx="$2"
-  rm -rf -- "$(shot_lock_path "$src" "$idx").lock" 2>/dev/null || true
+  if [ -n "${VES_CLAIM_RELEASE_CMD:-}" ]; then
+    local _slug _owner
+    _slug="$(basename -- "$src" | tr -c 'A-Za-z0-9._-' '_')"
+    _owner="${VES_CLAIM_OWNER:-$(hostname 2>/dev/null || echo '?'):$$}"
+    # owner token passed so the backend only frees a lease WE still hold --
+    # a lease that expired mid-search and was re-taken by a peer is left alone.
+    $VES_CLAIM_RELEASE_CMD "$_slug" "$idx" "$_owner" 2>/dev/null || true
+    return 0
+  fi
+  # legacy dir-lock (path recomputed inline -- shot_lock_path retired Phase B)
+  local dir title
+  dir="$(media_content_dir "$src")"
+  title="$(canonical_title_from_source "$src" 2>/dev/null)" || title="$(basename -- "$src")"
+  rm -rf -- "$dir/$title.shot$idx.lock" 2>/dev/null || true
 }
 
 # One fleet worker: claim -> search -> release, looping until the manifest is
@@ -1112,25 +1169,101 @@ shot_search_worker_loop() {
   # perform the reclaim.
   local retry_wait="${SHOT_SEARCH_RETRY_WAIT:-60}"
   local max_idle_secs="${3:-$(( ${SHOT_SEARCH_STALE_SECS:-25200} + retry_wait * 3 ))}"
-  local count=0 idle=0 idx rc
+  local count=0 idle=0 idx rc claim_rc _slug _hbpid sync_rc
+  _slug="$(basename -- "$src" | tr -c 'A-Za-z0-9._-' '_')"
+  # Phase B: with a redis lease backend, dead claims free at the lease TTL
+  # (VES_CLAIM_TTL, 2700s) + the reaper -- but the idle ceiling MUST still
+  # exceed the TTL so at least one live worker is around when a dead claim
+  # frees (else all idle workers exit and nothing reclaims -- review HIGH #8).
+  if [ -n "${VES_CLAIM_CMD:-}" ]; then
+    max_idle_secs="${3:-$(( ${VES_CLAIM_TTL:-2700} + retry_wait * 10 ))}"
+    # while this worker holds a shot, refresh the lease every ~10 min so a
+    # genuinely long (4K / grain / long take) search can't lose its claim.
+    : "${VES_CLAIM_OWNER:=$(hostname 2>/dev/null || echo '?'):$$}"
+    # $_wl_pid = the worker-loop shell. If it dies (incl. SIGKILL, which skips
+    # every trap -- dval_research.sh stops nodes with `pkill -9`), the bg
+    # heartbeat is reparented to init and would EXPIRE the lease forever,
+    # making it immortal. Bail the instant the parent is gone.
+    local _wl_pid=$$
+    _dval_hb_bg() { while :; do sleep 600; kill -0 "$_wl_pid" 2>/dev/null || exit 0
+      declare -F dval_heartbeat >/dev/null 2>&1 \
+      && dval_heartbeat "$_slug" "$1" "$VES_CLAIM_OWNER" || exit 0; done; }
+  fi
   _shot_scratch_sweep
   while [ "$count" -lt "$max_shots" ]; do
-    idx="$(shot_claim_next "$src")"
+    idx="$(shot_claim_next "$src")"; claim_rc=$?
+    if [ "$claim_rc" -eq 2 ]; then
+      warn "shot-search: claim backend unreachable -- pausing ${retry_wait}s"
+      sleep "$retry_wait"; continue
+    fi
     if [ -n "$idx" ]; then
       idle=0
       echo "claimed shot $idx"
-      shot_search_claimed "$src" "$idx"; rc=$?
+      _hbpid=""
+      if [ -n "${VES_CLAIM_CMD:-}" ]; then _dval_hb_bg "$idx" & _hbpid=$!; fi
+      # Phase B: don't let shot_search_claimed release the lease on success --
+      # the loop releases AFTER the status has landed on the NAS (review CRIT #1).
+      SHOT_CLAIM_DEFER_RELEASE="${VES_CLAIM_CMD:+1}" shot_search_claimed "$src" "$idx"; rc=$?
       if [ "$rc" -eq 0 ]; then
-        echo "resolved shot $idx"; count=$((count + 1))
+        count=$((count + 1))
+        if declare -F _dval_sync_status >/dev/null 2>&1; then
+          # Retry the NAS push IN PLACE, heartbeat still alive so the lease
+          # can't lapse under us (review CRIT #1: a bare `continue` here does
+          # NOT retry -- shot_claim_next skips this now-locally-resolved idx
+          # forever, and a sole worker then idles out with the title stuck).
+          local _st; sync_rc=1
+          for _st in 1 2 3 4 5; do
+            _dval_sync_status "$src" "$idx"; sync_rc=$?
+            [ "$sync_rc" -eq 0 ] && break
+            warn "shot-search: shot $idx resolved, NAS status sync failed (rc=$sync_rc), attempt $_st/5 -- retrying in $((_st*30))s"
+            sleep "$((_st*30))"
+          done
+          if [ "$sync_rc" -ne 0 ]; then
+            # Permanent failure -- fail LOUD, don't gamble on the TTL. Move the
+            # local resolved status aside so shot_claim_next stops skipping it,
+            # release the lease so any worker (incl. this one) re-searches it,
+            # and drop an ALERT for the watchdog / human.
+            local _lsf _aside_ok=1
+            _lsf="$(shot_manifest_dir "$src")/shot-$(printf '%03d' "$idx").status"
+            if [ -f "$_lsf" ]; then
+              mv -f -- "$_lsf" "${_lsf}.syncfailed.$(date +%s)" 2>/dev/null || _aside_ok=0
+            fi
+            if [ -n "${DVAL_SHARED_DIR:-}" ]; then
+              printf '%s %s shot %s on %s: NAS status sync failed 5x -- re-queued locally\n' \
+                "$(date -u +%FT%TZ)" "$_slug" "$idx" "$(hostname 2>/dev/null || echo '?')" \
+                >> "$DVAL_SHARED_DIR/ALERT.status-sync-failed" 2>/dev/null || true
+            fi
+            if [ "$_aside_ok" -eq 1 ]; then
+              # local status is out of the way -> safe to release; this or any
+              # worker re-claims and re-searches the idx.
+              warn "shot-search: shot $idx STATUS SYNC TO NAS FAILED 5x -- re-queued for a fresh search, releasing lease"
+              declare -F shot_release_claim >/dev/null 2>&1 && shot_release_claim "$src" "$idx"
+              [ -n "$_hbpid" ] && kill "$_hbpid" 2>/dev/null
+            else
+              # couldn't move the local resolved status -> releasing now would let
+              # shot_claim_next skip this idx forever (the silent-wedge class).
+              # KEEP the lease + heartbeat; the human alert above is the signal.
+              warn "shot-search: shot $idx sync failed AND could not set local status aside -- KEEPING the lease, needs a human"
+            fi
+            _shot_scratch_sweep; continue
+          fi
+        fi
+        echo "resolved shot $idx"
+        declare -F shot_release_claim >/dev/null 2>&1 && shot_release_claim "$src" "$idx"
       else
-        warn "shot-search: shot $idx did not resolve (rc=$rc) -- will retry"
+        warn "shot-search: shot $idx did not resolve (rc=$rc) -- releasing for retry"
+        declare -F shot_release_claim >/dev/null 2>&1 && shot_release_claim "$src" "$idx"
       fi
+      [ -n "$_hbpid" ] && kill "$_hbpid" 2>/dev/null
       _shot_scratch_sweep
       continue
     fi
-    if shot_manifest_all_resolved "$src"; then
-      echo "shot-search: manifest fully resolved"
-      break
+    # exit check: in Phase B the worker's LOCAL view lags the fleet -- the
+    # authoritative "all resolved" is the NAS manifest.
+    if [ -n "${VES_CLAIM_CMD:-}" ]; then
+      shot_manifest_all_resolved_nas "$src" && { echo "shot-search: manifest fully resolved (NAS)"; break; }
+    else
+      shot_manifest_all_resolved "$src" && { echo "shot-search: manifest fully resolved"; break; }
     fi
     idle=$((idle + retry_wait))
     if [ "$idle" -ge "$max_idle_secs" ]; then
@@ -1276,18 +1409,29 @@ shot_search_claimed() {
     printf 'bracket_edge=%s\n' "$bracket_edge"
     printf 'searched_host=%s\n' "$(hostname 2>/dev/null || echo unknown)"
     printf 'searched_utc=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-  } >"$tmp"
-  mv -f -- "$tmp" "$status_file"
+  } >"$tmp" || { rm -f -- "$tmp"; shot_release_claim "$src" "$idx"; return 1; }
+  mv -f -- "$tmp" "$status_file" || { rm -f -- "$tmp"; shot_release_claim "$src" "$idx"; return 1; }
   _restore_default_file_mode "$status_file"
-  shot_release_claim "$src" "$idx"
+  grep -q '^status=resolved' "$status_file" 2>/dev/null || { shot_release_claim "$src" "$idx"; return 1; }
+  # Phase B (review CRIT #1): the caller releases AFTER the status lands on the
+  # NAS. SHOT_CLAIM_DEFER_RELEASE is set by shot_search_worker_loop in that mode.
+  [ -n "${SHOT_CLAIM_DEFER_RELEASE:-}" ] || shot_release_claim "$src" "$idx"
   return 0
 }
 
 # True if every shot in the manifest has a resolved status -- the signal
 # that a title is ready for assemble_qpfile_from_shot_manifest().
 shot_manifest_all_resolved() {
-  local src="$1" mdir f idx status_file st
-  mdir="$(shot_manifest_dir "$src")"
+  _shot_manifest_all_resolved_at "$(shot_manifest_dir "$1")"
+}
+# Same check against the NAS manifest regardless of any SHOT_MANIFEST_DIR_LOCAL
+# override -- the authoritative "title is fully searched" gate for the worker
+# loop's exit and for coordinator/encode readiness (review HIGH).
+shot_manifest_all_resolved_nas() {
+  _shot_manifest_all_resolved_at "$(shot_manifest_dir_nas "$1")"
+}
+_shot_manifest_all_resolved_at() {
+  local mdir="$1" f idx status_file st
   [ -f "$mdir/.complete" ] || return 1
   for f in "$mdir"/shot-*.meta; do
     [ -e "$f" ] || continue
@@ -1577,8 +1721,10 @@ assemble_qpfile_via_equal_slope_budget() {
   local deprio_start="${4:-}" deprio_end="${5:-}" deprio_weight="${6:-1.0}"
   local mdir f idx start_ts end_ts dur fps_rate fps_num fps_den fps total_frames
   local -a shot_qps=()
-  mdir="$(shot_manifest_dir "$src")"
-  shot_manifest_all_resolved "$src" || return 1
+  # always the NAS manifest -- this runs on the encode node / coordinator, never
+  # against a search worker's partial local copy (review HIGH).
+  mdir="$(shot_manifest_dir_nas "$src")"
+  shot_manifest_all_resolved_nas "$src" || return 1
 
   # (#1) per-shot VMAF floor: no shot below (target - drop). target is the
   # same per-source figure the per-shot search aimed at.
@@ -1608,18 +1754,68 @@ assemble_qpfile_via_equal_slope_budget() {
   _cal_k="${ALLOC_BYTES_CALIBRATION_K:-1.0}"
   if awk -v b="$byte_budget" 'BEGIN{exit !(b+0 > 0 && b+0 <= 4)}'; then
     _budget_mode="fraction"
-    local _baseline
+    local _baseline _frac="$byte_budget"
     local _pst_num; _pst_num="$(awk -v x="$_pst_target" 'BEGIN{printf "%.4f", x+0}')"
+    # Per-shot baseline = the smallest file that meets the shot's VMAF target.
+    # FALLBACK (shot cannot reach target at any probed QP): price it at the most
+    # aggressive quality the equal-slope solver may actually drive it to --
+    #   floor ON  (drop>0): highest QP still clearing target-drop
+    #   floor OFF (drop==0): highest QP available (the solver has no per-shot floor)
+    # The old code priced every hard shot at its max-VMAF / qp-min / max-bytes
+    # sample, over-counting them and skewing the fraction baseline (A Few Moments:
+    # baseline vs CRF base wildly off -> BUDGET_UNREACHABLE -> f90=f80=f70=f60
+    # byte-identical). Only when even the drop-floor is unreachable do we fall to
+    # the shot's best-effort (max-VMAF) sample.
     _baseline="$(for st in "$mdir"/shot-*.status; do
-      awk -F= -v pst="$_pst_num" '/^samples=/{
-        line=substr($0,index($0,"=")+1); nf=split(line,a,","); best=-1; bb=0; bv=""
+      awk -F= -v pst="$_pst_num" -v drop="${_floor_drop:-0}" '/^samples=/{
+        line=substr($0,index($0,"=")+1); nf=split(line,a,","); best=-1; bb=0
         for(i=1;i<=nf;i++){ n=split(a[i],t,":"); if(n==3 && t[2]+0 >= pst && t[1]+0 > best){best=t[1]+0; bb=t[3]+0} }
-        if(best<0){ for(i=1;i<=nf;i++){ n=split(a[i],t,":"); if(n==3){bv=(bv==""?t[2]+0:bv); if(t[2]+0>=bv){bv=t[2]+0; bb=t[3]+0}} } }
+        if(best<0){
+          if(drop+0 > 0){
+            flr=pst-drop; fb=-1
+            for(i=1;i<=nf;i++){ n=split(a[i],t,":"); if(n==3 && t[2]+0 >= flr && t[1]+0 > fb){fb=t[1]+0; bb=t[3]+0} }
+            if(fb<0){ bv=-1; for(i=1;i<=nf;i++){ n=split(a[i],t,":"); if(n==3 && t[2]+0 > bv){bv=t[2]+0; bb=t[3]+0} } }
+          } else {
+            hq=-1
+            for(i=1;i<=nf;i++){ n=split(a[i],t,":"); if(n==3 && t[1]+0 > hq){hq=t[1]+0; bb=t[3]+0} }
+          }
+        }
         print bb
       }' "$st"
     done | awk '{s+=$1} END{printf "%.0f", s+0}')"
+    # Physical floor = sum of each shot's SMALLEST sample (highest QP the search
+    # probed). The solver can never spend less than this. If the fallback above
+    # under-priced hard shots and pushed _baseline below the floor, the whole
+    # fraction sweep would collapse to the minimum (review MEDIUM: under-count).
+    # Clamp up + note it.
+    local _floor_sum
+    _floor_sum="$(for st in "$mdir"/shot-*.status; do
+      awk -F= '/^samples=/{ line=substr($0,index($0,"=")+1); nf=split(line,a,","); mn=-1
+        for(i=1;i<=nf;i++){ n=split(a[i],t,":"); if(n==3 && (mn<0 || t[3]+0<mn)) mn=t[3]+0 }
+        if(mn>=0) print mn }' "$st"
+    done | awk '{s+=$1} END{printf "%.0f", s+0}')"
+    if [ "${_floor_sum:-0}" -gt "${_baseline:-0}" ] 2>/dev/null; then
+      log_err "  equal-slope budget: baseline ${_baseline} B < physical floor ${_floor_sum} B -- clamping up (hard-shot fallback under-priced)"
+      _baseline="$_floor_sum"
+    fi
+    # SANITY (Option 3 safety net): a per-shot-optimal AV1 encode bigger than the
+    # source, or well above the CRF base, means the search data or the VMAF
+    # target is wrong for this title. Fail loud rather than emit a degenerate
+    # fraction sweep. Survey caller exports ALLOC_BASELINE_SANITY_BYTES=<base>.
+    local _srcbytes; _srcbytes="$(stat -c%s "$src" 2>/dev/null || echo 0)"
+    if [ "${_baseline:-0}" -ge "${_srcbytes:-0}" ] 2>/dev/null && [ "${_srcbytes:-0}" -gt 0 ]; then
+      log_err "  equal-slope budget: BASELINE UNFIT -- baseline ${_baseline} B >= source ${_srcbytes} B; search data / VMAF target suspect for this title. Refusing to build a fraction qpfile."
+      return 2
+    fi
+    if [ -n "${ALLOC_BASELINE_SANITY_BYTES:-}" ] && [ "${ALLOC_BASELINE_SANITY_BYTES:-0}" -gt 0 ] 2>/dev/null; then
+      local _maxr="${ALLOC_BASELINE_MAX_RATIO:-1.15}"
+      if awk -v b="$_baseline" -v s="$ALLOC_BASELINE_SANITY_BYTES" -v r="$_maxr" 'BEGIN{exit !(b > s*r)}'; then
+        log_err "  equal-slope budget: BASELINE UNFIT -- baseline ${_baseline} B > ${_maxr}x CRF base ${ALLOC_BASELINE_SANITY_BYTES} B; hard shots inflating the sum. Refusing to build a fraction qpfile."
+        return 2
+      fi
+    fi
     byte_budget="$(awk -v f="$byte_budget" -v base="$_baseline" 'BEGIN{printf "%.0f", f*base}')"
-    log_err "  equal-slope budget: fraction mode -> baseline=${_baseline} B, budget=${byte_budget} B"
+    log_err "  equal-slope budget: fraction mode -> baseline=${_baseline} B (frac ${_frac}), budget=${byte_budget} B"
   else
     byte_budget="$(awk -v b="$byte_budget" -v k="$_cal_k" 'BEGIN{printf "%.0f", b / (k>0?k:1)}')"
     log_err "  equal-slope budget: absolute mode, /K=${_cal_k} -> internal budget=${byte_budget} B"
