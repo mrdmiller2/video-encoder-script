@@ -37,6 +37,19 @@ keeps the lease when it can't move the local status aside (rather than release-t
 each worker gets its own `$_H.$PID` local manifest subtree (siblings on one host no longer
 race on the seed `--delete`); `ALERT.status-sync-failed` self-retires once stale.
 
+*Windows fork (lockstep).* `Get-VesShotManifestDir` ported to the same category-level
+`<base>_WORKING/shots` layout (new `Get-VesWorkingDirForSource`, mirroring
+`working_dir_for_source` incl. the loose-file guard); path output verified byte-identical to
+bash for movie / TV-episode / anime / loose-file shapes. `Get-VesPathParent` / `Get-VesPathLeaf`
+exported from `VesOrganize.psm1`. PRINCE stays out of the survey — the redis claim client +
+Phase-B local-first are the remaining Windows items.
+
+*Launch-day fleet notes.* AI-PROCESSOR pulled from the Phase-B **search** pool (its 10.10.10.x
+subnet has no return path to the coordinator's `:6380` redis; it stays in the encode pool,
+which needs no lease backend). RANDYJ pulled from **both** pools — the fresh-Ubuntu box shipped
+SVT-AV1 v4.2.0 (fleet constant is v4.1.0) and its per-shot search errored across the board;
+re-add after toolchain parity + a verified search.
+
 *Allocator (`assemble_qpfile_via_equal_slope_budget`, fraction mode).* A shot that can't hit
 its VMAF target at any probed QP was priced at its **max-VMAF / qp-min / max-bytes** sample,
 inflating the fraction baseline until every `D_fXX` target sat above the CRF base →

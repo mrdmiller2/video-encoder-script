@@ -5,11 +5,13 @@
 # encode with a per-frame qpfile, not per-shot spliced files).
 #
 # Per-shot claim coordination intentionally matches the live bash fleet:
-# canonical_title_from_source() keying, <title>.shots manifests, and
-# atomic mkdir-style <title>.shot<N>.lock directories with owner.meta
-# inside the lock dir. The earlier Windows file-lock deviation is obsolete
-# now that the NAS media datasets use posix ACLs and PRINCE can create,
-# write inside, mtime-check, rename, and remove SMB directories reliably.
+# the Phase-B <base>_WORKING/shots manifest layout at the category level
+# (working_dir_for_source(), 2026-09-04) and atomic mkdir-style
+# <title>.shot<N>.lock directories with owner.meta inside the lock dir
+# (the legacy NFS lock -- the redis lease backend is bash-only for now).
+# The earlier Windows file-lock deviation is obsolete now that the NAS
+# media datasets use posix ACLs and PRINCE can create, write inside,
+# mtime-check, rename, and remove SMB directories reliably.
 #
 # STAGE 2 DEFERRED (allocator still being calibrated by a live survey):
 #   - assemble_qpfile_via_equal_slope_budget  -> Assemble-VesQpfileViaEqualSlopeBudget
@@ -251,14 +253,41 @@ function Convert-VesFleetPath {
     return $Path
 }
 
+function Get-VesWorkingDirForSource {
+    <#
+    .SYNOPSIS
+    Port of working_dir_for_source() (ves-organize.sh, 2026-09-04). The
+    per-source pipeline working folder: "<base>_WORKING" at the CATEGORY
+    level -- beside the per-title / show folder, not inside it -- so
+    pipeline scratch stays out of the real title folder (what Plex scans,
+    what a bad delete could hit). "<base>" is the source filename minus the
+    final extension only, verbatim (year kept), so bash and this fork
+    compute the identical path. A LOOSE file sitting straight in a
+    language/shelf dir has no title folder: keep _WORKING beside the file
+    (going up would escape the library root).
+    #>
+    param([Parameter(Mandatory)][string]$Source)
+    $cdir = Get-VesMediaContentDir -Source $Source
+    $base = Get-VesMovieTitleFromFile -Path $Source   # strips the final ext only
+    # A loose file straight in a language / shelf dir has no title folder --
+    # keep _WORKING beside it (going up escapes the library root). Otherwise
+    # cdir is the per-title / show folder: put _WORKING one level up (category).
+    if ((Test-VesIsMovieLanguageDir -Path $cdir) -or (Test-VesIsShelfDir -Path $cdir)) {
+        return (Join-Path $cdir "${base}_WORKING")
+    }
+    return (Join-Path (Get-VesPathParent -Path $cdir) "${base}_WORKING")
+}
+
 function Get-VesShotManifestDir {
     <#
     .SYNOPSIS
     Manifest directory for one title's shots, matching bash
-    shot_manifest_dir(): media_content_dir/<canonical_title>.shots.
+    shot_manifest_dir() / shot_manifest_dir_nas() (Phase B, 2026-09-04):
+    <category dir>/<base>_WORKING/shots. (This fork has no in-flight local
+    override yet -- PRINCE Phase-B local-first is a separate owed item.)
     #>
     param([Parameter(Mandatory)][string]$Source)
-    return Join-Path (Get-VesMediaContentDir -Source $Source) "$(Get-VesCanonicalTitleFromSource -Source $Source).shots"
+    return Join-Path (Get-VesWorkingDirForSource -Source $Source) 'shots'
 }
 
 function Get-VesShotLockPath {
@@ -1886,7 +1915,7 @@ function Invoke-VesShotSearchWorkerLoop {
 }
 
 Export-ModuleMember -Function `
-    Get-VesShotManifestDir, Get-VesShotLockPath, Get-VesShotPathMtime, `
+    Get-VesWorkingDirForSource, Get-VesShotManifestDir, Get-VesShotLockPath, Get-VesShotPathMtime, `
     Convert-VesFleetPath, `
     Test-VesShotManifestAllResolved, New-VesShotManifest, `
     Enter-VesShotClaim, Exit-VesShotClaim, `

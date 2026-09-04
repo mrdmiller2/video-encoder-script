@@ -485,6 +485,7 @@ function Invoke-VesOrganizeLibrary {
 
 Export-ModuleMember -Function Get-VesMovieTitleFromFile, Get-VesCanonicalTitleFromFile, `
     Get-VesCanonicalTitleFromSource, Get-VesMediaContentDir, Get-VesCanonicalOrganizeTitle, `
+    Get-VesPathParent, Get-VesPathLeaf, `
     Test-VesIsTvEpisode, Test-VesIsPlexSeasonDirName, Test-VesIsTvLibraryPath, Test-VesIsTvShowDirectory, `
     Test-VesIsSubtitleFile, Test-VesIsDerivedOutput, Test-VesIsShelfDir, Test-VesUsesLetterBucketLibrary, `
     Test-VesIsMovieLanguageDir, Test-VesIsMovieOrganizeParent, Test-VesNeedsFlatOrganize, `
