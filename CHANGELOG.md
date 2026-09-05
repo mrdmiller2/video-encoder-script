@@ -4,6 +4,52 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.1L — 2026-09-05 (branch `6.x-chunk-redesign`)
+
+**Per-shot QP search — self-inflicted `search_failed` fixes + VPN-safe source staging.**
+Two classes of bug were quietly turning "slow" into permanent `search_failed=1`
+(fixed-QP fallback, no real VMAF), which the survey's `searched` gate then
+(correctly) rejected — so affected titles re-searched every walk forever.
+
+*libvmaf thread oversubscription (`modules/ves-per-shot-qp.sh`).* `_vmaf_score_shot`
+asked libvmaf for `n_threads=$(nproc)` — the whole box — with no regard for how
+many sibling search workers on the same host make the identical call at the same
+moment (`dval_research.sh` runs 3–4 per host by design) or for unrelated load
+(the user's ML jobs on MJACKSON). 3× `nproc` on a 16-thread box is 48 threads
+self-competing for 16 cores; the resulting slowdown tripped the shot's
+wall-clock timeout → `_vmaf_score_shot` returns 1 → every anchor probe fails →
+`resolve_per_shot_qp` returns empty → `search_failed=1`. Every one of a title's
+permanently-failed shots reproduced with real VMAF data when re-run in isolation,
+including on a dedicated node with no competing load. New `_shot_vmaf_threads()`
+= `ncpu / DVAL_HOST_WORKER_COUNT` (set by the launcher to the count it just
+started on that host), so aggregate libvmaf thread demand never exceeds the
+box's real cores regardless of siblings or unrelated work.
+
+*`search_failed=1` was permanent (`modules/ves-per-shot-qp.sh`).* A failed shot
+is `status=resolved`, so `shot_claim_next()` skipped it forever and
+`_shot_manifest_all_resolved_*` counted it complete — every worker (including
+ones a 90-min stall-relaunch spun up fresh) saw "manifest fully resolved" and
+exited without ever retrying. A transient cause then wedged a title permanently
+with no signal beyond a stale watchdog alert. New `SHOT_SEARCH_RETRY_CAP=2` +
+`_shot_status_retriable()` / `_shot_status_claim_done()` / `retry_count=` in the
+status file: a search_failed shot is re-claimable up to the cap before it's
+accepted as permanent fallback noise; `shot_manifest_has_retriable_failures()`
+keeps the worker loop from exiting while any retriable failure remains.
+
+*VPN-safe source staging (`modules/ves-per-shot-qp.sh`, `modules/ves-config.sh`).*
+`_stage_copy` default is now single-stream **rsync** (`--partial --inplace`,
+size verify, optional `VES_STAGE_VERIFY_HASH`) behind a per-host **VPN pull
+slot** (`VES_VPN_PULL_MAX=2`, flock under the stage dir) so N hosts × parallel
+`dd` can't wedge the site-to-site tunnel (64 concurrent streams wedged even
+`ls` on 2026-09-03). `VES_STAGE_COPY_MODE=parallel-dd` restores the old
+fan-out. New `ves-config.sh` defaults: `VES_STAGE_COPY_MODE`, `VES_VPN_PULL_MAX`,
+`VES_STAGE_VERIFY_HASH`. See the survey slowdown triage under
+`orchestration/regional-survey/docs/reviews/` (local-only).
+
+*Repo prune.* `Old Versions/` and the root `convert-v5.1.1B…5.1.2A.sh` snapshots
+(≈1.07M lines) removed from the working tree — they were archived to compressed
+bundles to keep the repo lean; every blob remains in git history.
+
 ## v6.0.1K — 2026-09-04 (branch `6.x-chunk-redesign`)
 
 **D-val survey remediation — allocator fix (Phase A6) + local-first working set (Phase B).**

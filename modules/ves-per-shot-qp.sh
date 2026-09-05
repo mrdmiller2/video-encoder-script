@@ -37,6 +37,36 @@
 # Scales off the shot's own duration instead: real encode/VMAF cost tracks
 # how much video there is, not how many bytes the (post-copy, pre-encode)
 # clip happens to occupy.
+# Overload should only cost TIME, never correctness -- a wall-clock timeout
+# converts "slow" into "killed -> search_failed=1 -> silent fixed-QP
+# fallback" the instant something takes too long, so anything that makes a
+# probe run slower than expected quietly corrupts the search's own data
+# instead of just taking longer. Found live 2026-09-04: the VMAF comparison
+# below unconditionally asked libvmaf for n_threads=$(nproc) -- the WHOLE
+# box's core count -- with no regard for how many SIBLING search workers on
+# the SAME host are making the identical call at the same time (dval_research
+# .sh's WORKERS[] map runs several per host by design) or for anything else
+# sharing the box. 3 workers x n_threads=nproc on a 16-thread box is 48
+# threads self-competing for 16 real cores; a fourth (unrelated, e.g. the
+# user's own ML jobs on MJACKSON) makes it worse still. That self-inflicted
+# 3x-or-more slowdown is what actually tripped the wall-clock timeout, not
+# any real content difficulty -- confirmed live: every one of a title's
+# permanently-failed shots reproduced with REAL vmaf data when re-run in
+# isolation (no sibling workers), including on JJACKSON, a dedicated node
+# with no external competing load at all. DVAL_HOST_WORKER_COUNT is set by
+# the launcher to the actual worker count it just started on this host, so
+# aggregate libvmaf thread demand across all of them never exceeds the box's
+# real core count regardless of who else (siblings or unrelated jobs) is
+# also running. See project_dval_coordinator_migration_2026_09_04.
+_shot_vmaf_threads() {
+  local ncpu wc
+  ncpu="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null)"
+  [[ "$ncpu" =~ ^[0-9]+$ ]] && [ "$ncpu" -gt 0 ] || ncpu=1
+  wc="${DVAL_HOST_WORKER_COUNT:-1}"
+  [[ "$wc" =~ ^[0-9]+$ ]] && [ "$wc" -gt 0 ] || wc=1
+  printf '%s' $(( ncpu / wc > 0 ? ncpu / wc : 1 ))
+}
+
 _shot_ffmpeg_timeout() {
   local duration="$1" base=300 per_sec=120 cap=3600
   local d_int extra scaled
@@ -177,10 +207,65 @@ _stage_source_local() {
 # BDP-capped on a single sequential stream (~11 MB/s over the ~17ms site VPN),
 # but N parallel readers fan out across the N TCP connections. Falls back to
 # plain cp for a small/local file or when the tools are missing. 2026-09-03.
-_stage_copy() {  # <src> <dst>
-  # 3 streams by default: enough to beat a single BDP-capped stream over the
-  # ~17ms site VPN, few enough that ~8 fleet hosts staging at once don't crush
-  # the NAS/tunnel (64 concurrent streams wedged even `ls` on 2026-09-03).
+#
+# 2026-09-04 (survey/encode slowdown bind): DEFAULT is rsync over VPN — one
+# verified stream with --partial, size check, and a global VPN pull slot so
+# fleets do not wedge the tunnel with N×hosts parallel dd. Set
+# VES_STAGE_COPY_MODE=parallel-dd to restore the old fan-out (discouraged).
+_vpn_pull_slot_acquire() {
+  # Serialize concurrent heavy NAS→local pulls on THIS host for THIS stage
+  # tree only (slots live under SHOT_SRC_LOCAL_STAGE_DIR). D-val survey uses
+  # /var/tmp/dval-srcstage so it does not share flock slots with general VES
+  # (/var/tmp/ves-srcstage), comics OCR, or ebook staging.
+  local max="${VES_VPN_PULL_MAX:-2}" i slotdir
+  slotdir="${SHOT_SRC_LOCAL_STAGE_DIR:-/var/tmp/dval-srcstage}/.vpn-pull-slots"
+  mkdir -p "$slotdir" 2>/dev/null || return 0
+  command -v flock >/dev/null 2>&1 || return 0
+  for ((i=0; i<max; i++)); do
+    # shellcheck disable=SC2094
+    exec {VES_VPN_PULL_FD}>"$slotdir/slot.$i"
+    if flock -n -x "$VES_VPN_PULL_FD" 2>/dev/null; then
+      return 0
+    fi
+    eval "exec ${VES_VPN_PULL_FD}>&-"
+  done
+  # Block on slot 0 up to 45m
+  exec {VES_VPN_PULL_FD}>"$slotdir/slot.0"
+  flock -w 2700 -x "$VES_VPN_PULL_FD" 2>/dev/null || true
+}
+
+_vpn_pull_slot_release() {
+  if [ -n "${VES_VPN_PULL_FD:-}" ]; then
+    eval "exec ${VES_VPN_PULL_FD}>&-" 2>/dev/null || true
+    unset VES_VPN_PULL_FD
+  fi
+}
+
+_stage_copy_rsync() {  # <src> <dst>
+  local s="$1" d="$2" sz have
+  sz="$(stat -c%s -- "$s" 2>/dev/null)" || return 1
+  command -v rsync >/dev/null 2>&1 || return 1
+  _vpn_pull_slot_acquire
+  # --inplace avoids double space; --partial allows resume after VPN blip.
+  rsync -a --partial --inplace --timeout=600 \
+    --info=name0,progress0 \
+    "$s" "$d" 2>/dev/null
+  local rc=$?
+  _vpn_pull_slot_release
+  [ "$rc" -eq 0 ] || return "$rc"
+  have="$(stat -c%s -- "$d" 2>/dev/null || echo 0)"
+  [ "$have" = "$sz" ] || return 1
+  # Optional strong verify (expensive on multi-GB titles).
+  if [ "${VES_STAGE_VERIFY_HASH:-0}" = "1" ] && command -v sha256sum >/dev/null 2>&1; then
+    local hs hd
+    hs="$(sha256sum -- "$s" 2>/dev/null | awk '{print $1}')"
+    hd="$(sha256sum -- "$d" 2>/dev/null | awk '{print $1}')"
+    [ -n "$hs" ] && [ "$hs" = "$hd" ] || return 1
+  fi
+  return 0
+}
+
+_stage_copy_parallel_dd() {  # <src> <dst>
   local s="$1" d="$2" n="${VES_STAGE_COPY_STREAMS:-3}" sz i chunk ok
   local -a pids=()
   sz="$(stat -c%s -- "$s" 2>/dev/null)" || { cp -f -- "$s" "$d" 2>/dev/null; return $?; }
@@ -198,6 +283,43 @@ _stage_copy() {  # <src> <dst>
   done
   ok=1; for i in "${pids[@]}"; do wait "$i" || ok=0; done
   [ "$ok" = 1 ] && [ "$(stat -c%s -- "$d" 2>/dev/null || echo 0)" = "$sz" ]
+}
+
+_stage_copy() {  # <src> <dst>
+  local s="$1" d="$2" mode="${VES_STAGE_COPY_MODE:-rsync}" sz
+  sz="$(stat -c%s -- "$s" 2>/dev/null)" || { cp -f -- "$s" "$d" 2>/dev/null; return $?; }
+  # Small / already-local: plain cp
+  if [ "${sz:-0}" -lt 67108864 ]; then
+    cp -f -- "$s" "$d" 2>/dev/null; return $?
+  fi
+  case "$mode" in
+    parallel-dd|dd)
+      _vpn_pull_slot_acquire
+      _stage_copy_parallel_dd "$s" "$d"
+      local rc=$?
+      _vpn_pull_slot_release
+      return "$rc"
+      ;;
+    cp)
+      _vpn_pull_slot_acquire
+      cp -f -- "$s" "$d" 2>/dev/null
+      local rc=$?
+      _vpn_pull_slot_release
+      return "$rc"
+      ;;
+    rsync|*)
+      if _stage_copy_rsync "$s" "$d"; then
+        return 0
+      fi
+      # Fall back to single-stream cp (never parallel-dd unless explicitly asked)
+      warn "_stage_copy: rsync failed for $(basename "$s") -- falling back to cp"
+      _vpn_pull_slot_acquire
+      cp -f -- "$s" "$d" 2>/dev/null
+      local rc=$?
+      _vpn_pull_slot_release
+      [ "$rc" -eq 0 ] && [ "$(stat -c%s -- "$d" 2>/dev/null || echo 0)" = "$sz" ]
+      ;;
+  esac
 }
 
 _vmaf_score_shot() {
@@ -293,7 +415,7 @@ _vmaf_score_shot() {
   fi
   [ "${_stride:-1}" -gt 1 ] 2>/dev/null && _sel="select='not(mod(n\,${_stride}))',"
   _run_timeout_retry "$enc_timeout" "${FFMPEG_CMD[@]}" -y -v error "${grain_decode_flag[@]}" -i "$out_mkv" -i "$clip" -lavfi \
-    "[0:v]${_sel}setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]${_sel}setpts=PTS-STARTPTS,format=yuv420p10le[r];[d][r]libvmaf=model=$model:n_threads=$(nproc 2>/dev/null || sysctl -n hw.ncpu):log_fmt=json:log_path=$vlog" \
+    "[0:v]${_sel}setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]${_sel}setpts=PTS-STARTPTS,format=yuv420p10le[r];[d][r]libvmaf=model=$model:n_threads=$(_shot_vmaf_threads):log_fmt=json:log_path=$vlog" \
     -f null - 2>/dev/null || { rm -rf "$work"; return 1; }
   v="$(python3 -c "import json;print(round(json.load(open('$vlog'))['pooled_metrics']['vmaf']['mean'],2))" 2>/dev/null)" || { rm -rf "$work"; return 1; }
   b="$(file_size_bytes "$out")"
@@ -1019,6 +1141,53 @@ EOF
 # the ceiling is set well above the worst legitimate case -- past it, the
 # owner is almost certainly dead. shot_search_worker_loop's idle timeout is
 # kept above this so a live worker is always around to do the reclaim.
+
+# Self-healing retry gate (2026-09-04): a search_failed=1 shot was being
+# treated as permanently done -- shot_claim_next() skipped it forever (it IS
+# status=resolved) and _shot_manifest_all_resolved_at() counted it as
+# complete, so every worker (including ones a stalled-90min relaunch spun up
+# fresh) saw "manifest fully resolved" and exited without ever retrying it.
+# A transient cause (one host under heavy unrelated load at that moment --
+# see project_dval_coordinator_migration_2026_09_04) then wedges a title
+# forever with no human-visible signal beyond a stale watchdog alert that
+# nothing acts on. True only for a resolved-but-failed shot that hasn't used
+# up its retry budget -- i.e. "not really done yet, still claimable".
+SHOT_SEARCH_RETRY_CAP="${SHOT_SEARCH_RETRY_CAP:-2}"
+_shot_status_retriable() {
+  local sfile="$1" st sf rc
+  [ -f "$sfile" ] || return 1
+  st="$(awk -F= '/^status=/{print $2; exit}' "$sfile" 2>/dev/null)"
+  [ "$st" = "resolved" ] || return 1
+  sf="$(awk -F= '/^search_failed=/{print $2; exit}' "$sfile" 2>/dev/null)"
+  [ "$sf" = "1" ] || return 1
+  rc="$(awk -F= '/^retry_count=/{print $2; exit}' "$sfile" 2>/dev/null)"
+  [[ "$rc" =~ ^[0-9]+$ ]] || rc=0
+  [ "$rc" -lt "$SHOT_SEARCH_RETRY_CAP" ]
+}
+# True (skip-claiming) only once a shot has REAL data or has exhausted its
+# retry budget -- mirrors the old "status=resolved" gate but no longer treats
+# a fresh search_failed as permanent.
+_shot_status_claim_done() {
+  local sfile="$1" st
+  [ -f "$sfile" ] || return 1
+  st="$(awk -F= '/^status=/{print $2; exit}' "$sfile" 2>/dev/null)"
+  [ "$st" = "resolved" ] || return 1
+  _shot_status_retriable "$sfile" && return 1
+  return 0
+}
+# True if any shot in the manifest is resolved-but-failed with retry budget
+# left -- the worker-loop's "truly nothing left to do" exit gate must stay
+# false while this is true, or a relaunch just spins up workers that
+# immediately re-exit on the same stale "fully resolved" read.
+shot_manifest_has_retriable_failures() {
+  local mdir="$1" f
+  for f in "$mdir"/shot-*.status; do
+    [ -e "$f" ] || continue
+    _shot_status_retriable "$f" && return 0
+  done
+  return 1
+}
+
 shot_claim_next() {
   local src="$1" this_host
   local mdir f idx lockdir status_file reclaim_name
@@ -1047,10 +1216,10 @@ shot_claim_next() {
       [ -e "$f" ] || continue
       idx="$(awk -F= '/^index=/{print $2; exit}' "$f")"
       status_file="$mdir/shot-$(printf '%03d' "$idx").status"
-      if [ -f "$status_file" ] && grep -q '^status=resolved' "$status_file" 2>/dev/null; then continue; fi
+      _shot_status_claim_done "$status_file" && continue
       if [ "$mdir" != "$_nasdir" ]; then
         _nas_sf="$_nasdir/shot-$(printf '%03d' "$idx").status"
-        [ -f "$_nas_sf" ] && grep -q '^status=resolved' "$_nas_sf" 2>/dev/null && continue
+        [ -f "$_nas_sf" ] && _shot_status_claim_done "$_nas_sf" && continue
       fi
       : "${VES_CLAIM_OWNER:=$this_host:$$}"
       _r="$($VES_CLAIM_CMD "$_slug" "$idx" "$VES_CLAIM_OWNER" 2>/dev/null)"
@@ -1064,11 +1233,7 @@ shot_claim_next() {
     [ -e "$f" ] || continue
     idx="$(awk -F= '/^index=/{print $2; exit}' "$f")"
     status_file="$mdir/shot-$(printf '%03d' "$idx").status"
-    if [ -f "$status_file" ]; then
-      local st
-      st="$(awk -F= '/^status=/{print $2; exit}' "$status_file" 2>/dev/null)"
-      [ "$st" = "resolved" ] && continue
-    fi
+    _shot_status_claim_done "$status_file" && continue
     lockdir="$(_legacy_lock_path "$src" "$idx").lock"
     if mkdir -- "$lockdir" 2>/dev/null; then
       cat >"${lockdir}/owner.meta" <<EOF
@@ -1268,11 +1433,20 @@ shot_search_worker_loop() {
       continue
     fi
     # exit check: in Phase B the worker's LOCAL view lags the fleet -- the
-    # authoritative "all resolved" is the NAS manifest.
+    # authoritative "all resolved" is the NAS manifest. Don't exit while a
+    # search_failed shot still has retry budget left -- that's what used to
+    # let a transient fleet-wide hiccup wedge a title forever (every worker,
+    # including a stalled-90min relaunch, saw "fully resolved" and quit).
     if [ -n "${VES_CLAIM_CMD:-}" ]; then
-      shot_manifest_all_resolved_nas "$src" && { echo "shot-search: manifest fully resolved (NAS)"; break; }
+      if shot_manifest_all_resolved_nas "$src" \
+         && ! shot_manifest_has_retriable_failures "$(shot_manifest_dir_nas "$src")"; then
+        echo "shot-search: manifest fully resolved (NAS)"; break
+      fi
     else
-      shot_manifest_all_resolved "$src" && { echo "shot-search: manifest fully resolved"; break; }
+      if shot_manifest_all_resolved "$src" \
+         && ! shot_manifest_has_retriable_failures "$(shot_manifest_dir "$src")"; then
+        echo "shot-search: manifest fully resolved"; break
+      fi
     fi
     idle=$((idle + retry_wait))
     if [ "$idle" -ge "$max_idle_secs" ]; then
@@ -1308,13 +1482,16 @@ shot_search_claimed() {
   # real reduction in wasted duplicate search work. Found live 2026-08-24:
   # Sting redundantly re-searched 3 shots MJACKSON had already resolved.
   status_file="$mdir/shot-$(printf '%03d' "$idx").status"
+  # Bail early only if truly done (real data, or a failed shot with no retry
+  # budget left) -- a retriable search_failed=1 falls through to re-search.
+  if _shot_status_claim_done "$status_file"; then
+    shot_release_claim "$src" "$idx"
+    return 0
+  fi
+  local _prior_retry_count=0
   if [ -f "$status_file" ]; then
-    local already_st
-    already_st="$(awk -F= '/^status=/{print $2; exit}' "$status_file" 2>/dev/null)"
-    if [ "$already_st" = "resolved" ]; then
-      shot_release_claim "$src" "$idx"
-      return 0
-    fi
+    _prior_retry_count="$(awk -F= '/^retry_count=/{print $2; exit}' "$status_file" 2>/dev/null)"
+    [[ "$_prior_retry_count" =~ ^[0-9]+$ ]] || _prior_retry_count=0
   fi
   start_ts="$(awk -F= '/^start_ts=/{print $2; exit}' "$shot_meta")"
   end_ts="$(awk -F= '/^end_ts=/{print $2; exit}' "$shot_meta")"
@@ -1370,7 +1547,7 @@ shot_search_claimed() {
     fi
   fi
   [ -n "$result" ] || result="$(resolve_per_shot_qp "$src" "$start_ts" "$end_ts" "$codec" "$target" "$model" "$profile")"
-  local samples="" search_failed=0 bracket_edge=0 _bl _bh
+  local samples="" search_failed=0 bracket_edge=0 _bl _bh retry_count=0
   if [ "$nosignal" = 1 ]; then
     read -r qp vmaf samples <<<"$result"
   elif [ -n "$result" ]; then
@@ -1383,7 +1560,8 @@ shot_search_claimed() {
     qp="$(fixed_crf_for "$codec" "$profile" false)"
     vmaf=""
     search_failed=1
-    warn "Shot search failed for shot $idx ($start_ts-$end_ts) on $(hostname 2>/dev/null) -- falling back to fixed qp=$qp"
+    retry_count=$((_prior_retry_count + 1))
+    warn "Shot search failed for shot $idx ($start_ts-$end_ts) on $(hostname 2>/dev/null) -- falling back to fixed qp=$qp (attempt $retry_count/$SHOT_SEARCH_RETRY_CAP retries)"
   fi
 
   # SCAFFOLDING (2026-09-02): record whether this shot resolved at/past its
@@ -1407,6 +1585,12 @@ shot_search_claimed() {
     # resolved status (don't block the pipeline) but marked so the
     # allocator and credits detection can tell it apart from a real result.
     printf 'search_failed=%s\n' "$search_failed"
+    # How many times this shot has failed search and fallen back to fixed
+    # QP. shot_claim_next() lets a worker re-claim a search_failed shot
+    # while this is below SHOT_SEARCH_RETRY_CAP -- past the cap it's
+    # accepted as permanent fallback noise (the existing bracket-health /
+    # allocator tolerance for a few % of shots already assumes this).
+    printf 'retry_count=%s\n' "$retry_count"
     # 1 = deliberate zero-signal skip (black/fade/flat static): fixed QP, no
     # search. Distinct from a real search_failed -- the coverage gate counts
     # nosignal shots as accounted-for.

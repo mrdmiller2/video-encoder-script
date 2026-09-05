@@ -6,7 +6,7 @@
 # MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
 # bug fix) -- see its own comment.
 
-VERSION="6.0.1K"
+VERSION="6.0.1L"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
 # as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
@@ -627,6 +627,11 @@ PER_SHOT_QP_CROSSOVER_PROBES="${PER_SHOT_QP_CROSSOVER_PROBES:-1}"
 # Idempotent per host, disk-guarded, 24h stale sweep.
 SHOT_SRC_LOCAL_STAGE="${SHOT_SRC_LOCAL_STAGE:-true}"
 SHOT_SRC_LOCAL_STAGE_DIR="${SHOT_SRC_LOCAL_STAGE_DIR:-/var/tmp/ves-srcstage}"
+# VPN site-to-site: default rsync pull (not parallel-dd). See
+# docs/reviews/cursor_survey_encode_slowdown_infra_triage_20260904.md
+VES_STAGE_COPY_MODE="${VES_STAGE_COPY_MODE:-rsync}"
+VES_VPN_PULL_MAX="${VES_VPN_PULL_MAX:-2}"
+VES_STAGE_VERIFY_HASH="${VES_STAGE_VERIFY_HASH:-0}"
 #
 # (B4) long-shot multi-window search (2026-09-02). A per-shot QP search on a
 # 6-minute take is a 20-40GB ffv1 + hours per QP probe. Instead, for a shot
