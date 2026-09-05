@@ -4,6 +4,58 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.1M — 2026-09-05 (branch `6.x-chunk-redesign`)
+
+**Class-F degenerate survey titles — per-shot search that permanently fails
+on a large fraction of shots.** 3-peer consult (Cursor / Antigravity / Codex,
+all APPROVE_WITH_AMENDMENTS) — plan in
+`orchestration/regional-survey/docs/reviews/classf_BOUND_PLAN_20260905.md`
+(local). Root cause: `_shot_vmaf_threads` (v6.0.1L) capped libvmaf but the
+**decode legs** of `_vmaf_score_shot` (dav1d/h264 source, ffv1 intermediate,
+scale) still spawned a full-host thread pool *per worker* — 3–4 siblings/host
+self-compete, every probe blows its wall-clock timeout, `_run_timeout_retry`
+SIGKILLs, `resolve_per_shot_qp` returns empty → `search_failed=1`. Verified
+live: American Pop shot 120 (in the permanently-failed contiguous range)
+resolves in **5 s with real VMAF 96.04** when run with one worker.
+
+*`modules/ves-per-shot-qp.sh`.*
+- `_shot_decode_threads()` = `ncpu / DVAL_HOST_WORKER_COUNT` (override
+  `DVAL_SHOT_DECODE_THREADS`). Wired as `-threads` to the ffv1 extract, y4m
+  conversion and libvmaf ffmpeg in `_vmaf_score_shot` + `_shot_encode_bytes_only`,
+  and `SvtAv1EncApp --lp`.
+- `_shot_ffmpeg_timeout` is now `(duration, is_uhd, profile)`. UHD: base 600 /
+  240 per-sec / cap 7200. Heavy-grain profiles (`wanim-classic`, `la-classic`,
+  …): ×`PER_SHOT_GRAIN_TIMEOUT_MULT` (1.5), cap 5400. `DVAL_SHOT_TIMEOUT_OVERRIDE`
+  wins outright (diagnostic reruns). Legacy 1-arg call still works.
+- UHD 1080p VMAF proxy (`PER_SHOT_UHD_VMAF_PROXY`, default on): for UHD
+  sources, score the pair downscaled to 1080p with `vmaf_v0.6.1neg` and drop
+  the target by `PER_SHOT_UHD_VMAF_PROXY_TARGET_DELTA` (1.0) — native-2160p
+  `vmaf_4k` is an L3 cache-miss storm that times out every probe. Native 4K
+  stays available with the knob off. `SHOT_IS_UHD` exported once per shot by
+  `shot_search_claimed` from the manifest model string.
+- `PER_SHOT_VMAF_FGS` (default `on`): grain stays on **both** VMAF legs — the
+  measured, playback-honest default (grain-off suppressed the per-shot ceiling
+  1–3 VMAF). `off` strips it **symmetrically** for diagnostics; reference-only
+  stripping is never done (biases VIF/DLM 2–5 pts on uncorrelated synthetic
+  grain).
+- `DVAL_SHOT_DIAG=1`: one stderr line per `_vmaf_score_shot` phase (extract /
+  y4m / encode / remux / vmaf / parse) with elapsed seconds + rc + sizes —
+  settles real-timeout vs ffv1-I/O vs source-defect for a failing shot.
+
+*Orchestration (gitignored `orchestration/regional-survey/scripts/`).*
+Tri-state search gate: clean `searched/` (unchanged 90 %/85 %),
+`searched-degraded/` (all shots resolved + retries exhausted, ≤15 %
+`search_failed`, ≥85 % real, ≥80 % samples — encode proceeds on partial data,
+tagged `gate=degraded` / `fallback_shots=N` in the result log; the equal-slope
+allocator already prices fallback shots by duration share), `quarantine/`
+terminal. `search_ready()` / `search_gate_of()` in `dval_paths.sh` replace
+every direct `searched/$slug` test (dispatch, searchwalk, research, queue,
+queue_local, search_phase, prestage, watchdog). `dval_research.sh` gains a
+terminal-state guard so a degraded title is never re-entered (it wipes
+`search_failed` statuses on entry). H5 probe: before accepting degraded for a
+title with a contiguous ≥15-shot failed run, decode-probe that span with
+`ffmpeg -xerror -f null` → decode errors ⇒ `quarantine reason=source_defect`.
+
 ## v6.0.1L — 2026-09-05 (branch `6.x-chunk-redesign`)
 
 **Per-shot QP search — self-inflicted `search_failed` fixes + VPN-safe source staging.**

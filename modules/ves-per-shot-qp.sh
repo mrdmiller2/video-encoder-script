@@ -67,13 +67,71 @@ _shot_vmaf_threads() {
   printf '%s' $(( ncpu / wc > 0 ? ncpu / wc : 1 ))
 }
 
+# Decode/filter thread cap for the ffmpeg legs of _vmaf_score_shot +
+# _shot_encode_bytes_only (class-F fix, 3-peer consult 2026-09-05). Same math
+# as _shot_vmaf_threads: libvmaf's own n_threads was capped 2026-09-04, but the
+# dav1d (AV1 source), ffv1 (intermediate) and scale (UHD proxy) decode legs
+# still spawned a full-host pool PER worker -- 3-4 siblings/host self-competing
+# is the residual "slow -> wall-clock timeout -> search_failed=1" cause on
+# grainy/4K AV1 (American Pop hard reel, The Dark Tower). Override with
+# DVAL_SHOT_DECODE_THREADS.
+_shot_decode_threads() {
+  local v="${DVAL_SHOT_DECODE_THREADS:-}"
+  [[ "$v" =~ ^[1-9][0-9]*$ ]] && { printf '%s' "$v"; return; }
+  _shot_vmaf_threads
+}
+
+# UHD 1080p VMAF proxy active? (class-F: native-2160p libvmaf + vmaf_4k @ 95 is
+# a cache-miss storm that times out every probe.) On => _vmaf_score_shot scales
+# both legs to 1080p + swaps to vmaf_v0.6.1neg, and resolve_per_shot_qp drops
+# the target 1.0 to offset the downscaler low-pass. SHOT_IS_UHD is exported
+# once per shot by shot_search_claimed() from the manifest model string.
+_shot_uhd_proxy_active() {
+  [ "${PER_SHOT_UHD_VMAF_PROXY:-true}" = "true" ] && [ "${SHOT_IS_UHD:-0}" = "1" ]
+}
+
+# Phase timing for a single _vmaf_score_shot call. DVAL_SHOT_DIAG=1 -> one
+# stderr line per subprocess phase (extract / y4m / encode / remux / vmaf /
+# parse) with elapsed seconds + rc, plus the temp clip size. This is what
+# settles "real timeout vs ffv1 I/O bottleneck vs source defect" for a
+# permanently-failing shot without guessing.
+_shot_diag_now() { [ "${DVAL_SHOT_DIAG:-0}" = "1" ] && date +%s.%N 2>/dev/null || true; }
+_shot_diag() {  # $1=phase  $2=start epoch.ns (empty when DIAG off)  $3=rc  [$4=note]
+  [ "${DVAL_SHOT_DIAG:-0}" = "1" ] || return 0
+  [ -n "${2:-}" ] || return 0
+  local now; now="$(date +%s.%N 2>/dev/null)"
+  awk -v p="$1" -v s="$2" -v e="$now" -v rc="${3:-0}" -v n="${4:-}" -v pid="$$" \
+    'BEGIN{ printf "[shotdiag pid=%s] %-8s %8.2fs rc=%s %s\n", pid, p, e-s, rc, n }' >&2
+}
+
+# Per-shot subprocess wall-clock ceiling. Overload must only cost TIME, never
+# correctness -- past this, _run_timeout_retry SIGKILLs and the shot silently
+# falls back to fixed QP. 2026-09-05: made resolution/profile aware (was a flat
+# 300 + 120*dur, cap 3600 -- badly under-calibrated for 4K and heavy grain).
+#   $1 = shot duration (s)   $2 = is_uhd (1|0, optional)   $3 = profile (optional)
+# DVAL_SHOT_TIMEOUT_OVERRIDE wins outright (diagnostic reruns).
 _shot_ffmpeg_timeout() {
-  local duration="$1" base=300 per_sec=120 cap=3600
-  local d_int extra scaled
+  local duration="$1" is_uhd="${2:-0}" profile="${3:-}"
+  local base=300 per_sec=120 cap=3600 d_int extra scaled mult
+  if [[ "${DVAL_SHOT_TIMEOUT_OVERRIDE:-}" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s' "$DVAL_SHOT_TIMEOUT_OVERRIDE"; return
+  fi
+  if [ "$is_uhd" = "1" ]; then
+    base=600 per_sec=240 cap=7200
+  fi
   d_int="$(printf '%.0f' "$duration" 2>/dev/null)"
   case "$d_int" in ''|*[!0-9]*) d_int=0 ;; esac
   extra=$(( d_int * per_sec ))
   scaled=$(( base + extra ))
+  # Heavy-grain profiles: SVT-AV1 intra/RDO search expands 1.5-10x on rotoscoped
+  # / high-grain content -- give it headroom before calling it a failure.
+  case "$profile" in
+    wanim-classic|wanime-classic|la-classic|wanim|wanime)
+      mult="${PER_SHOT_GRAIN_TIMEOUT_MULT:-1.5}"
+      scaled="$(awk -v s="$scaled" -v m="$mult" 'BEGIN{ printf "%d", s*m }')"
+      [ "$is_uhd" = "1" ] || cap=5400
+      ;;
+  esac
   [ "$scaled" -gt "$cap" ] && scaled="$cap"
   printf '%s' "$scaled"
 }
@@ -326,8 +384,26 @@ _vmaf_score_shot() {
   local src="$1" start="$2" end="$3" qp="$4" codec="$5" model="$6" profile="$7"
   # Read the extraction from a local stage when the worker set one up.
   src="${SHOT_SRC_LOCAL:-$src}"
-  local work clip y4m out out_mkv vlog v b enc_timeout nframes qpfile
+  local work clip y4m out out_mkv vlog v b enc_timeout nframes qpfile _t0
   local -a grain_decode_flag=()
+  local _dthreads _vmaf_scale="" _lp_arg=()
+  _dthreads="$(_shot_decode_threads)"
+  _lp_arg=(--lp "$_dthreads")
+  # FGS on the VMAF compare (class-F consult 2026-09-05): grain stays ON on
+  # BOTH legs by default -- the measured, playback-calibrated choice (grain-off
+  # suppressed the per-shot ceiling 1-3 VMAF; the decoder re-synthesises grain
+  # at playback). PER_SHOT_VMAF_FGS=off strips it SYMMETRICALLY (both -i
+  # inputs) for diagnostics only; reference-only stripping is never allowed
+  # (biases VIF/DLM 2-5 pts on uncorrelated synthetic grain).
+  if [ "${PER_SHOT_VMAF_FGS:-on}" = "off" ]; then
+    grain_decode_flag=(-filmgrain 0)
+  fi
+  # UHD 1080p proxy: scale both legs down + standard neg model. Native-4K VMAF
+  # (vmaf_4k) stays available with PER_SHOT_UHD_VMAF_PROXY=false for spot checks.
+  if _shot_uhd_proxy_active; then
+    _vmaf_scale="scale=1920:1080:flags=bicubic,"
+    model="version=vmaf_v0.6.1neg"
+  fi
   discover_svtav1encapp || return 1
   work="$(mktemp -d "${RAMDISK_JOB_DIR:-${TMPDIR:-/tmp}}/ves-shotqp-XXXXXX")" || return 1
   clip="$work/shot.mkv"
@@ -364,16 +440,19 @@ _vmaf_score_shot() {
   _fast_ss="$(awk -v s="$start" -v m="$_seek_margin" 'BEGIN{ f=s-m; if(f<0)f=0; printf "%.6f", f }')"
   _acc_ss="$(awk -v s="$start" -v f="$_fast_ss" 'BEGIN{ printf "%.6f", s-f }')"
   _clip_dur="$(awk -v s="$start" -v e="$end" 'BEGIN{ d=e-s; if(d<0)d=0; printf "%.6f", d }')"
-  run_ffmpeg_validation -y -v error -ss "$_fast_ss" -i "$src" -ss "$_acc_ss" -t "$_clip_dur" \
-    -map 0:v:0 -c:v ffv1 -level 3 "$clip" 2>/dev/null || { rm -rf "$work"; return 1; }
+  _t0="$(_shot_diag_now)"
+  run_ffmpeg_validation -y -v error -threads "$_dthreads" -ss "$_fast_ss" -i "$src" -ss "$_acc_ss" -t "$_clip_dur" \
+    -map 0:v:0 -c:v ffv1 -level 3 "$clip" 2>/dev/null
+  { local _rc=$?; _shot_diag extract "$_t0" "$_rc" "clip=$(stat -c%s -- "$clip" 2>/dev/null || echo 0)B"; [ "$_rc" -eq 0 ]; } || { rm -rf "$work"; return 1; }
   [ -s "$clip" ] || { rm -rf "$work"; return 1; }
-  enc_timeout="$(_shot_ffmpeg_timeout "$(awk -v s="$start" -v e="$end" 'BEGIN{d=e-s; if(d<0)d=0; print d}')")"
+  enc_timeout="$(_shot_ffmpeg_timeout "$(awk -v s="$start" -v e="$end" 'BEGIN{d=e-s; if(d<0)d=0; print d}')" "${SHOT_IS_UHD:-0}" "$profile")"
   case "$codec" in
     av1)
       local svtp; svtp="$(profile_svt_params "$profile")" || { rm -rf "$work"; return 1; }
       y4m="$work/shot.y4m"
-      run_ffmpeg_validation -y -v error -i "$clip" -map 0:v:0 -pix_fmt yuv420p10le -strict -1 "$y4m" 2>/dev/null \
-        || { rm -rf "$work"; return 1; }
+      _t0="$(_shot_diag_now)"
+      run_ffmpeg_validation -y -v error -threads "$_dthreads" -i "$clip" -map 0:v:0 -pix_fmt yuv420p10le -strict -1 "$y4m" 2>/dev/null
+      { local _rc=$?; _shot_diag y4m "$_t0" "$_rc"; [ "$_rc" -eq 0 ]; } || { rm -rf "$work"; return 1; }
       # trailing-comma guard: see the note in _shot_encode_bytes_only. 4K HDR10
       # (The Dark Tower) made `-of csv=p=0` print "40," -> the ^[0-9]+$ check
       # failed -> every shot fell back to search_failed=1 (found live 2026-09-03).
@@ -385,20 +464,21 @@ _vmaf_score_shot() {
       # which aborts a bare `result="$(resolve_per_shot_qp ...)"` assignment.
       awk -v q="$qp" -v n="$nframes" 'BEGIN{ while (n-- > 0) print q }' > "$qpfile"
       out="$work/shot-enc-$qp.ivf"
+      _t0="$(_shot_diag_now)"
       _run_timeout_retry "$enc_timeout" "${SVTAV1ENCAPP_CMD[@]}" -i "$y4m" --use-q-file 1 --qpfile "$qpfile" \
-        --svtav1-params "${svtp}:rc=0" -b "$out" 2>/dev/null || { rm -rf "$work"; return 1; }
+        "${_lp_arg[@]}" --svtav1-params "${svtp}:rc=0" -b "$out" 2>/dev/null
+      { local _rc=$?; _shot_diag encode "$_t0" "$_rc" "out=$(stat -c%s -- "$out" 2>/dev/null || echo 0)B"; [ "$_rc" -eq 0 ]; } || { rm -rf "$work"; return 1; }
       [ -s "$out" ] || { rm -rf "$work"; return 1; }
       out_mkv="$work/shot-enc-$qp.mkv"
-      run_ffmpeg_validation -y -v error -i "$out" -c copy "$out_mkv" 2>/dev/null || { rm -rf "$work"; return 1; }
-      # NOT grain-stripped (was: -export_side_data film_grain). Decoding the
-      # AV1 grain-free and comparing to the grainy source penalises a
+      _t0="$(_shot_diag_now)"
+      run_ffmpeg_validation -y -v error -threads "$_dthreads" -i "$out" -c copy "$out_mkv" 2>/dev/null
+      { local _rc=$?; _shot_diag remux "$_t0" "$_rc"; [ "$_rc" -eq 0 ]; } || { rm -rf "$work"; return 1; }
+      # FGS default: grain stays ON on both legs (grain_decode_flag empty) --
+      # decoding grain-free and comparing to the grainy source penalises a
       # difference that does not exist in playback (the decoder re-synthesises
-      # grain), which suppressed the per-shot ceiling on grain profiles by
-      # 1-3 VMAF (Conan per-shot A 91.2 vs its low-CRF base 92.6). Score
-      # grain-on: synth-grain vs source-grain, which is the honest playback
-      # comparison. The matched extracted clips are already frame-aligned by
-      # the -ss extraction + the setpts=PTS-STARTPTS below.
-      : # grain_decode_flag intentionally left empty
+      # grain), which suppressed the per-shot ceiling 1-3 VMAF (Conan per-shot A
+      # 91.2 vs its low-CRF base 92.6). PER_SHOT_VMAF_FGS=off overrides
+      # symmetrically (set in the function preamble) for diagnostics.
       ;;
     *) rm -rf "$work"; return 1 ;;
   esac
@@ -414,10 +494,19 @@ _vmaf_score_shot() {
     _stride="${PER_SHOT_VMAF_STRIDE:-2}"
   fi
   [ "${_stride:-1}" -gt 1 ] 2>/dev/null && _sel="select='not(mod(n\,${_stride}))',"
-  _run_timeout_retry "$enc_timeout" "${FFMPEG_CMD[@]}" -y -v error "${grain_decode_flag[@]}" -i "$out_mkv" -i "$clip" -lavfi \
-    "[0:v]${_sel}setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]${_sel}setpts=PTS-STARTPTS,format=yuv420p10le[r];[d][r]libvmaf=model=$model:n_threads=$(_shot_vmaf_threads):log_fmt=json:log_path=$vlog" \
-    -f null - 2>/dev/null || { rm -rf "$work"; return 1; }
-  v="$(python3 -c "import json;print(round(json.load(open('$vlog'))['pooled_metrics']['vmaf']['mean'],2))" 2>/dev/null)" || { rm -rf "$work"; return 1; }
+  # grain_decode_flag (empty by default; -filmgrain 0 when PER_SHOT_VMAF_FGS=off)
+  # goes before BOTH -i so the strip is symmetric. -threads caps dav1d/scale on
+  # this leg; libvmaf gets its own n_threads. _vmaf_scale downscales both legs
+  # for the UHD 1080p proxy path.
+  _t0="$(_shot_diag_now)"
+  _run_timeout_retry "$enc_timeout" "${FFMPEG_CMD[@]}" -y -v error -threads "$_dthreads" \
+    "${grain_decode_flag[@]}" -i "$out_mkv" "${grain_decode_flag[@]}" -i "$clip" -lavfi \
+    "[0:v]${_sel}${_vmaf_scale}setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]${_sel}${_vmaf_scale}setpts=PTS-STARTPTS,format=yuv420p10le[r];[d][r]libvmaf=model=$model:n_threads=$(_shot_vmaf_threads):log_fmt=json:log_path=$vlog" \
+    -f null - 2>/dev/null
+  { local _rc=$?; _shot_diag vmaf "$_t0" "$_rc" "model=$model${_vmaf_scale:+ proxy1080}"; [ "$_rc" -eq 0 ]; } || { rm -rf "$work"; return 1; }
+  _t0="$(_shot_diag_now)"
+  v="$(python3 -c "import json;print(round(json.load(open('$vlog'))['pooled_metrics']['vmaf']['mean'],2))" 2>/dev/null)"
+  { local _rc=$?; _shot_diag parse "$_t0" "$_rc" "vmaf=${v:-?}"; [ "$_rc" -eq 0 ] && [ -n "$v" ]; } || { rm -rf "$work"; return 1; }
   b="$(file_size_bytes "$out")"
   rm -rf "$work"
   printf '%s %s' "$v" "$b"
@@ -432,20 +521,21 @@ _vmaf_score_shot() {
 # the chosen QP anchors the byte scale.
 _shot_encode_bytes_only() {
   local src="$1" start="$2" end="$3" qp="$4" codec="$5" profile="$6"
-  local work clip y4m out nframes qpfile svtp enc_timeout b
+  local work clip y4m out nframes qpfile svtp enc_timeout b _dthreads
   discover_svtav1encapp || return 1
   [ "$codec" = av1 ] || return 1
   svtp="$(profile_svt_params "$profile")" || return 1
+  _dthreads="$(_shot_decode_threads)"
   work="$(mktemp -d "${RAMDISK_JOB_DIR:-${TMPDIR:-/tmp}}/ves-shotbytes-XXXXXX")" || return 1
   clip="$work/shot.mkv"; y4m="$work/shot.y4m"; out="$work/shot.ivf"
   local _fast_ss _acc_ss _dur
   _fast_ss="$(awk -v s="$start" 'BEGIN{f=s-30; if(f<0)f=0; printf "%.6f", f}')"
   _acc_ss="$(awk -v s="$start" -v f="$_fast_ss" 'BEGIN{printf "%.6f", s-f}')"
   _dur="$(awk -v s="$start" -v e="$end" 'BEGIN{d=e-s; if(d<0)d=0; printf "%.6f", d}')"
-  enc_timeout="$(_shot_ffmpeg_timeout "$_dur")"
-  run_ffmpeg_validation -y -v error -ss "$_fast_ss" -i "${SHOT_SRC_LOCAL:-$src}" -ss "$_acc_ss" -t "$_dur" \
+  enc_timeout="$(_shot_ffmpeg_timeout "$_dur" "${SHOT_IS_UHD:-0}" "$profile")"
+  run_ffmpeg_validation -y -v error -threads "$_dthreads" -ss "$_fast_ss" -i "${SHOT_SRC_LOCAL:-$src}" -ss "$_acc_ss" -t "$_dur" \
     -map 0:v:0 -c:v ffv1 -level 3 "$clip" 2>/dev/null || { rm -rf "$work"; return 1; }
-  run_ffmpeg_validation -y -v error -i "$clip" -map 0:v:0 -pix_fmt yuv420p10le -strict -1 "$y4m" 2>/dev/null \
+  run_ffmpeg_validation -y -v error -threads "$_dthreads" -i "$clip" -map 0:v:0 -pix_fmt yuv420p10le -strict -1 "$y4m" 2>/dev/null \
     || { rm -rf "$work"; return 1; }
   # `-of csv=p=0` can emit a trailing "," for the ffv1 re-encode of some
   # sources (seen live 2026-09-03 on The Dark Tower -- 4K HDR10: ffprobe
@@ -457,7 +547,7 @@ _shot_encode_bytes_only() {
   qpfile="$work/uniform.qp"
   awk -v q="$qp" -v n="$nframes" 'BEGIN{ while (n-- > 0) print q }' > "$qpfile"
   _run_timeout_retry "$enc_timeout" "${SVTAV1ENCAPP_CMD[@]}" -i "$y4m" --use-q-file 1 --qpfile "$qpfile" \
-    --svtav1-params "${svtp}:rc=0" -b "$out" 2>/dev/null || { rm -rf "$work"; return 1; }
+    --lp "$_dthreads" --svtav1-params "${svtp}:rc=0" -b "$out" 2>/dev/null || { rm -rf "$work"; return 1; }
   [ -s "$out" ] || { rm -rf "$work"; return 1; }
   b="$(file_size_bytes "$out")"
   rm -rf "$work"
@@ -614,6 +704,15 @@ resolve_per_shot_qp() {
   # read all probes from the worker's local stage when one is set (the
   # manifest key derived upstream from the ORIGINAL path is unaffected)
   src="${SHOT_SRC_LOCAL:-$src}"
+
+  # UHD 1080p VMAF proxy (class-F 2026-09-05): _vmaf_score_shot scores the
+  # downscaled 1080p pair with vmaf_v0.6.1neg; drop the target 1.0 here so the
+  # search aims at an equivalent quality point (a 1080p downscale low-passes
+  # fine 4K texture, so the same bitstream reads ~1 VMAF higher on the proxy).
+  if _shot_uhd_proxy_active; then
+    target="$(awk -v t="$target" -v d="${PER_SHOT_UHD_VMAF_PROXY_TARGET_DELTA:-1.0}" \
+      'BEGIN{ printf "%.1f", (t+0) - (d+0) }')"
+  fi
 
   # --- (#2, GATED) content-adaptive per-shot target -------------------------
   # One cheap ffmpeg read of the shot (no encode): mean luma + inter-frame
@@ -1505,6 +1604,10 @@ shot_search_claimed() {
   # on MJACKSON (invalid libvmaf model= argument -> every ffmpeg call
   # failed -> every shot fell back to the static fixed-QP default).
   model="$(awk -F= '/^model=/{print substr($0,index($0,"=")+1); exit}' "$mdir/manifest.meta")"
+  # UHD flag for the per-shot timeout curve + the 1080p VMAF proxy. Derived
+  # from the manifest model string (vmaf_4k => the title was fingerprinted UHD
+  # upstream by _source_is_uhd) so no extra ffprobe per shot. 2026-09-05.
+  case "$model" in *vmaf_4k*) export SHOT_IS_UHD=1;; *) export SHOT_IS_UHD=0;; esac
 
   # Per-title / per-shot search modifiers, resolved from the manifest here so
   # resolve_per_shot_qp() + _vmaf_score_shot() stay signature-stable:

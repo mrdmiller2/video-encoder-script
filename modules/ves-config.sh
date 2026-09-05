@@ -6,7 +6,7 @@
 # MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
 # bug fix) -- see its own comment.
 
-VERSION="6.0.1L"
+VERSION="6.0.1M"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
 # as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
@@ -651,6 +651,34 @@ SHOT_MW_DEBIAS="${SHOT_MW_DEBIAS:-1}"     # 1 = anchor MW byte scale to one real
 # ONLY when the source is confirmed progressive -- telecine / interlaced /
 # ambiguous / unknown alias badly (combing, 3:2 dupes), so they force stride 1.
 PER_SHOT_VMAF_STRIDE="${PER_SHOT_VMAF_STRIDE:-2}"
+#
+# (B5b) Class-F degenerate-title remediation (3-peer consult 2026-09-05).
+# Titles whose per-shot QP search permanently fails on a large fraction of
+# shots (grainy AV1: American Pop; 4K: The Dark Tower) -- root cause was
+# dav1d/ffv1 DECODE threads (not just libvmaf) spawning a full-host pool per
+# worker, so N siblings self-compete and every probe blows its wall-clock
+# timeout -> search_failed=1.
+#   PER_SHOT_VMAF_FGS       on  = grain on both VMAF legs (measured, playback-
+#                                 honest default). off = strip SYMMETRICALLY,
+#                                 diagnostic only (never reference-only).
+#   PER_SHOT_UHD_VMAF_PROXY true = for UHD sources, score the VMAF pair
+#                                 downscaled to 1080p with vmaf_v0.6.1neg
+#                                 (native-2160p vmaf_4k is a cache-miss storm);
+#                                 resolve_per_shot_qp drops the target by
+#                                 PER_SHOT_UHD_VMAF_PROXY_TARGET_DELTA.
+#   PER_SHOT_GRAIN_TIMEOUT_MULT  wall-clock ceiling multiplier for heavy-grain
+#                                 profiles (SVT intra/RDO search expands there).
+#   DVAL_SHOT_DECODE_THREADS  hard override for the decode-thread cap (default
+#                                 = ncpu / DVAL_HOST_WORKER_COUNT).
+#   DVAL_SHOT_DIAG=1          one stderr line per _vmaf_score_shot phase
+#                                 (extract/y4m/encode/remux/vmaf/parse) with
+#                                 elapsed seconds + rc -- settles timeout vs
+#                                 I/O vs source-defect for a failing shot.
+#   DVAL_SHOT_TIMEOUT_OVERRIDE  fixed per-shot ceiling for diagnostic reruns.
+PER_SHOT_VMAF_FGS="${PER_SHOT_VMAF_FGS:-on}"
+PER_SHOT_UHD_VMAF_PROXY="${PER_SHOT_UHD_VMAF_PROXY:-true}"
+PER_SHOT_UHD_VMAF_PROXY_TARGET_DELTA="${PER_SHOT_UHD_VMAF_PROXY_TARGET_DELTA:-1.0}"
+PER_SHOT_GRAIN_TIMEOUT_MULT="${PER_SHOT_GRAIN_TIMEOUT_MULT:-1.5}"
 #
 # (B6) zero-signal shot fast-path (2026-09-02). Pure black / fade / flat
 # static cards carry no rate-distortion calibration signal and ~0 bytes.
