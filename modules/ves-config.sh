@@ -661,11 +661,21 @@ PER_SHOT_VMAF_STRIDE="${PER_SHOT_VMAF_STRIDE:-2}"
 #   PER_SHOT_VMAF_FGS       on  = grain on both VMAF legs (measured, playback-
 #                                 honest default). off = strip SYMMETRICALLY,
 #                                 diagnostic only (never reference-only).
-#   PER_SHOT_UHD_VMAF_PROXY true = for UHD sources, score the VMAF pair
-#                                 downscaled to 1080p with vmaf_v0.6.1neg
-#                                 (native-2160p vmaf_4k is a cache-miss storm);
-#                                 resolve_per_shot_qp drops the target by
-#                                 PER_SHOT_UHD_VMAF_PROXY_TARGET_DELTA.
+#   PER_SHOT_UHD_VMAF_PROXY  UHD sources: score the VMAF pair downscaled to
+#                                 1080p with vmaf_v0.6.1neg + target shifted by
+#                                 PER_SHOT_UHD_VMAF_PROXY_TARGET_DELTA. Default
+#                                 OFF (2026-09-05): a real Dark Tower 4K HEVC
+#                                 HDR10 shot measured only 2.4s native-4K VMAF
+#                                 with DVAL_HOST_WORKER_COUNT set -- the thread
+#                                 cap + UHD timeout (600/240/7200) + the fixed
+#                                 nframes trailing-comma bug clear the timeout
+#                                 without the proxy. The proxy also has an
+#                                 unresolved calibration gap: that shot read
+#                                 95.78 on the 1080p proxy vs 92.7 native
+#                                 (~3.1 pt, not 1.0) -- the DELTA needs
+#                                 real-data calibration before the proxy is a
+#                                 safe default. Turn it on only if UHD probes
+#                                 still time out under real fleet load.
 #   PER_SHOT_GRAIN_TIMEOUT_MULT  wall-clock ceiling multiplier for heavy-grain
 #                                 profiles (SVT intra/RDO search expands there).
 #   DVAL_SHOT_DECODE_THREADS  hard override for the decode-thread cap (default
@@ -676,7 +686,7 @@ PER_SHOT_VMAF_STRIDE="${PER_SHOT_VMAF_STRIDE:-2}"
 #                                 I/O vs source-defect for a failing shot.
 #   DVAL_SHOT_TIMEOUT_OVERRIDE  fixed per-shot ceiling for diagnostic reruns.
 PER_SHOT_VMAF_FGS="${PER_SHOT_VMAF_FGS:-on}"
-PER_SHOT_UHD_VMAF_PROXY="${PER_SHOT_UHD_VMAF_PROXY:-true}"
+PER_SHOT_UHD_VMAF_PROXY="${PER_SHOT_UHD_VMAF_PROXY:-false}"
 PER_SHOT_UHD_VMAF_PROXY_TARGET_DELTA="${PER_SHOT_UHD_VMAF_PROXY_TARGET_DELTA:-1.0}"
 PER_SHOT_GRAIN_TIMEOUT_MULT="${PER_SHOT_GRAIN_TIMEOUT_MULT:-1.5}"
 #

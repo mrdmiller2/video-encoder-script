@@ -27,12 +27,22 @@ resolves in **5 s with real VMAF 96.04** when run with one worker.
   240 per-sec / cap 7200. Heavy-grain profiles (`wanim-classic`, `la-classic`,
   …): ×`PER_SHOT_GRAIN_TIMEOUT_MULT` (1.5), cap 5400. `DVAL_SHOT_TIMEOUT_OVERRIDE`
   wins outright (diagnostic reruns). Legacy 1-arg call still works.
-- UHD 1080p VMAF proxy (`PER_SHOT_UHD_VMAF_PROXY`, default on): for UHD
-  sources, score the pair downscaled to 1080p with `vmaf_v0.6.1neg` and drop
-  the target by `PER_SHOT_UHD_VMAF_PROXY_TARGET_DELTA` (1.0) — native-2160p
-  `vmaf_4k` is an L3 cache-miss storm that times out every probe. Native 4K
-  stays available with the knob off. `SHOT_IS_UHD` exported once per shot by
-  `shot_search_claimed` from the manifest model string.
+- UHD 1080p VMAF proxy (`PER_SHOT_UHD_VMAF_PROXY`) available but **default
+  OFF** — confirmation testing on a real Dark Tower 4K HEVC HDR10 shot showed
+  native-4K VMAF is only ~2.4 s with `DVAL_HOST_WORKER_COUNT` set (the thread
+  cap + UHD timeout curve + the fixed `nframes` bug clear the wall-clock
+  without downscaling), and the proxy has an unresolved target-calibration gap
+  (proxy read 95.78 vs 92.7 native on that shot, ≈3.1 pt not 1.0). Enable it
+  only if UHD probes still time out under real fleet load; the DELTA needs
+  real-data calibration first. The UHD **timeout** curve (600/240/7200) still
+  applies to any `is_uhd` source regardless of the proxy flag. `SHOT_IS_UHD`
+  exported per shot by `shot_search_claimed` from the manifest model string.
+
+*Live confirmation.* American Pop — the flagship "degenerate" title — went
+718 → 746/783 real shots in **6 minutes** on a fresh research pass with
+v6.0.1M (`search_failed` 65 → 1) and wrote a **clean** `searched/` marker.
+The permanently-failed contiguous reel was 100% thread starvation, no content
+difficulty (shot 120 resolves in 5 s at 1 worker, VMAF 96.04).
 - `PER_SHOT_VMAF_FGS` (default `on`): grain stays on **both** VMAF legs — the
   measured, playback-honest default (grain-off suppressed the per-shot ceiling
   1–3 VMAF). `off` strips it **symmetrically** for diagnostics; reference-only
