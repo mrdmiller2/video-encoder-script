@@ -4,6 +4,30 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.1T — 2026-09-06 (branch `6.x-chunk-redesign`)
+
+**Every era-tier library folder now carries its year range in the name**, so a
+human filing new media sees the boundary without reading the code. Extends the
+v6.0.1S anime change to the live-action libraries. Ranges are the actual
+measured content spread:
+
+    Movies/<Language>/    Vintage (<=1958)   Classic (1959-1997)   Modern (1998+)
+    Television/<Country>/  Vintage (<=1989)                          Modern (1990+)
+    Concerts/             Classic (<=1996)                          Modern (1997+)
+    Movies/Anime, .../Anime/   Vintage (<=1958)   Classic (1959-2002)   Modern (2003+)
+
+(TV has no `Classic` tier; `Animation` under both Movies and TV stays bare — it
+is a content type, not an era. `Concerts/Vintage` was empty. `Concerts`' original
+relative spec — "<5 years", "5–20 years", ">20 years" — was replaced with fixed
+year ranges per the measured content, since a folder name can't track a rolling
+cutoff.)
+
+`detect_profile_for_path` / `Get-VesDetectedProfileForPath` match **both** the
+parenthesised names and the bare `Vintage`/`Classic`/`Modern` (transition-safe),
+so the rename and the code deploy don't have to be simultaneous. Only
+`ves-profile-decision.sh` + `VesProfileDecision.psm1` change — every other module
+derives its era from that one function.
+
 ## v6.0.1S — 2026-09-06 (branch `6.x-chunk-redesign`)
 
 **Classic-anime cutoff 1997 → 2002** (`CLASSIC_ANIME_YEAR_CUTOFF`; new symmetric

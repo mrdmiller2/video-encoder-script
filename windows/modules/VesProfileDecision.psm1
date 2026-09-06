@@ -136,11 +136,14 @@ function Get-VesDetectedProfileForPath {
     if ($pNorm -match '/Stand-Up Comedy/') { return 'standup' }
     if ($pNorm -match '/Learning Series/') { return 'learning' }
     if ($pNorm -match '/Animation/') { return 'wanime' }
-    if ($pNorm -match '/Movies/[^/]+/Modern/') { return 'movies' }
-    if ($pNorm -match '/Movies/[^/]+/Classic/') { return 'classic' }
-    if ($pNorm -match '/Movies/[^/]+/Vintage/') { return 'vintage' }
-    if ($pNorm -match '/Television/[^/]+/Modern/') { return 'mtv' }
-    if ($pNorm -match '/Television/[^/]+/Vintage/') { return 'vtv' }
+    # Live-action era tiers -- folders now carry their year range in the name
+    # (Movies/<Lang>/"Classic (1959-1997)" etc.); match both parenthesised and
+    # bare (transition-safe). TV has no Classic tier; "Animation" stays bare.
+    if ($pNorm -match '/Movies/[^/]+/Modern( \([^)]*\))?/') { return 'movies' }
+    if ($pNorm -match '/Movies/[^/]+/Classic( \([^)]*\))?/') { return 'classic' }
+    if ($pNorm -match '/Movies/[^/]+/Vintage( \([^)]*\))?/') { return 'vintage' }
+    if ($pNorm -match '/Television/[^/]+/Modern( \([^)]*\))?/') { return 'mtv' }
+    if ($pNorm -match '/Television/[^/]+/Vintage( \([^)]*\))?/') { return 'vtv' }
     return $null
 }
 
