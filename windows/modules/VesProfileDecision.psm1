@@ -113,6 +113,9 @@ function Get-VesDetectedProfileForPath {
     if ($pNorm -match '/Movies/Japanese/Animation/') { return $null }  # ambiguous -- caller must force
     if ($pNorm -match '/Movies/Anime/') { return Get-VesAnimeProfileForPath -Path $pNorm }
     if ($pNorm -match '/Anime/') { return Get-VesAnimeProfileForPath -Path $pNorm }
+    # Routing-layer compound buckets (2026-09-06) -- see ves-profile-decision.sh.
+    if ($pNorm -match '/Animation-Vintage/') { return 'vintage' }
+    if ($pNorm -match '/Animation-Classic/') { return 'classic' }
     if ($pNorm -match '/Concerts/') { return 'concert' }
     if ($pNorm -match '/Stand-Up Comedy/') { return 'standup' }
     if ($pNorm -match '/Learning Series/') { return 'learning' }

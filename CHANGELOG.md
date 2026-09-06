@@ -4,6 +4,21 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.1P — 2026-09-06 (branch `6.x-chunk-redesign`)
+
+**Routing-layer compound buckets.** `detect_profile_for_path` now recognises
+`Movies/<lang>/Animation-Vintage/` -> `vintage` and `Animation-Classic/` ->
+`classic`. First use: the D-val survey found `wanim-classic` at VMAF target 94
+is *baseline-unfit* for American Pop (1981, Bakshi rotoscope) -- the equal-slope
+allocator baseline came out at 228% of source because the per-shot search
+prices faithfully reproducing heavy film grain that `wanime` never denoises.
+Rerouting the title to `Animation-Classic/` applies the `classic` anchor
+(`film-grain-denoise=1:film-grain=6`), so the per-shot search prices the
+*denoised* signal and AV1 FGS re-synthesizes the grain at playback. No new
+profile, no per-title override -- the compound folder reuses a proven anchor
+(the routing-layer model from the survey-expansion plan). Windows fork in
+lockstep.
+
 ## v6.0.1O — 2026-09-06 (branch `6.x-chunk-redesign`)
 
 **SD "facelift" restoration pre-processor — conservative first increment.**
