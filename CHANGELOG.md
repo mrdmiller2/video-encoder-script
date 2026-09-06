@@ -41,6 +41,17 @@ BPPPF_MAX,COMB_MIN,ANALYZE_WINDOWS,ANALYZE_SECS,PROFILES}`. Windows fork:
 `VesSdRestore.psm1` parity stub (analysis + gate; full parity deferred — the
 Linux fleet runs the survey).
 
+Codex implementation review (`sd_restoration_impl_review_codex_20260906.md`)
+fixes folded in same day: `_sdr_comb_ratio` now reuses the timeout-wrapped
+errexit-safe `_idet_probe_window`, fails closed to 0; all `set -euo pipefail`
+hazards in `sd_restore_analyze` guarded (`is_must_eliminate_format`, `video_codec`
+pipe, `class=telecine||interlaced` compound); `_sdr_space_ok` scratch preflight
+before any FFV1 render; intermediate pixel format follows source bit depth
+(8-bit stays 8-bit — no wasteful 10-bit promotion); `sd_restore_verify`
+preflights `fieldmatch`/`decimate`/`ffv1`; `sd_restore_analyze` telemetry now
+runs unconditionally in `ffmpeg_encode()` (was dry-run only); PowerShell
+analyzer fails closed on ffprobe failure.
+
 ## v6.0.1N — 2026-09-05 (branch `6.x-chunk-redesign`)
 
 **Three new encode profiles: `concert`, `standup`, `learning`.** The library

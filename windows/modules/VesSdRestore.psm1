@@ -80,10 +80,18 @@ function Invoke-VesSdRestoreAnalyze {
     )
     $cfg = Get-VesSdRestoreConfig
 
-    $streamJson = & $FfprobePath -v error -select_streams v:0 `
-        -show_entries stream=width,height,codec_name,avg_frame_rate,bit_rate `
-        -show_entries format=bit_rate -of json $Source 2>$null | ConvertFrom-Json
-    $st = $streamJson.streams[0]
+    # Fail CLOSED: a probe/parse failure must yield a 'skip' verdict, never throw.
+    $st = $null; $streamJson = $null
+    try {
+        $streamJson = & $FfprobePath -v error -select_streams v:0 `
+            -show_entries stream=width,height,codec_name,avg_frame_rate,bit_rate `
+            -show_entries format=bit_rate -of json $Source 2>$null | ConvertFrom-Json
+        $st = $streamJson.streams[0]
+    } catch { $st = $null }
+    if (-not $st) {
+        Write-Host "sd-restore: analyze $([IO.Path]::GetFileName($Source)) -> verdict=skip class=ambiguous reason=`"ffprobe failed`""
+        return [pscustomobject]@{ Verdict='skip'; Class='ambiguous'; Width=0; Height=0; Bpppf=0; Comb=0; MustElim=$false; Reason='ffprobe failed' }
+    }
     $w = [int]$st.width; $h = [int]$st.height
     $codec = ("$($st.codec_name)").ToLower()
     $fps = 0.0

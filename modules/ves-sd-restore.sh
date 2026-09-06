@@ -91,17 +91,17 @@ sd_restore_analyze() {  # src [profile]
   local h_int="${dh%.*}"; [[ "$h_int" =~ ^[0-9]+$ ]] || h_int=0
 
   local mustelim=0
-  is_must_eliminate_format "$src" && mustelim=1
+  if is_must_eliminate_format "$src" 2>/dev/null; then mustelim=1; fi
   # codec-level "must eliminate" (container may be .mkv but stream is DivX/MS-MPEG4)
-  local vcodec; vcodec="$(video_codec "$src" 2>/dev/null | to_lower)"
+  local vcodec=""; vcodec="$(video_codec "$src" 2>/dev/null | to_lower 2>/dev/null || true)"
   case "$vcodec" in mpeg4|msmpeg4v1|msmpeg4v2|msmpeg4v3|rv10|rv20|rv30|rv40|wmv1|wmv2|wmv3|vc1) mustelim=1 ;; esac
 
   # field-mode classification -- reuse the already-reviewed detector.
   local class="ambiguous"
   if declare -F detect_source_traits >/dev/null 2>&1; then
     detect_source_traits "$src" >/dev/null 2>&1 || true
-    class="$(source_traits_field_mode "$src" 2>/dev/null)"
-    [ -n "$class" ] && [ "$class" != unknown ] || class="ambiguous"
+    class="$(source_traits_field_mode "$src" 2>/dev/null || true)"
+    { [ -n "$class" ] && [ "$class" != unknown ]; } || class="ambiguous"
   fi
 
   # combed-frame ratio over a few short windows (idet). Cheap; ~<5s CPU.
@@ -117,12 +117,11 @@ sd_restore_analyze() {  # src [profile]
   fi
 
   local metric_trigger=0
-  awk -v c="$comb" -v t="$RESTORE_SD_COMB_MIN" 'BEGIN{exit !(c>=t)}' && metric_trigger=1
-  [ "$class" = telecine ] || [ "$class" = interlaced ] && metric_trigger=1
+  if awk -v c="$comb" -v t="$RESTORE_SD_COMB_MIN" 'BEGIN{exit !(c>=t)}'; then metric_trigger=1; fi
+  case "$class" in telecine|interlaced) metric_trigger=1 ;; esac
 
-  local verdict reason
-  if [ -f "$(sd_restore_marker_path "$src")" ] && \
-     grep -q '^force' "$(sd_restore_marker_path "$src")" 2>/dev/null; then
+  local verdict reason mk; mk="$(sd_restore_marker_path "$src")"
+  if [ -f "$mk" ] && grep -q '^force' "$mk" 2>/dev/null; then
     verdict="forced"; reason="per-title marker"
   elif [ "$sd_candidate" = 1 ] && [ "$metric_trigger" = 1 ]; then
     verdict="restore"; reason="sd_candidate + metric_trigger (class=$class comb=$comb bpppf=$bpppf)"
@@ -138,29 +137,68 @@ sd_restore_analyze() {  # src [profile]
   printf '%s\n' "$line"
 }
 
-# idet combed-frame ratio: mean of "interlaced" over N short windows / total.
+# idet combed-frame ratio over N short windows. Reuses the already-reviewed,
+# timeout-wrapped, errexit-safe _idet_probe_window() from ves-source-traits.sh
+# (prints "prog interlaced rn rt rb tff bff", non-zero on failure). Fails
+# CLOSED to 0 -- a probe miss must never abort a job or spuriously trigger
+# restoration.
 _sdr_comb_ratio() {  # src -> float 0..1
-  local src="$1" dur start i n="${RESTORE_SD_ANALYZE_WINDOWS:-3}" secs="${RESTORE_SD_ANALYZE_SECS:-12}"
-  dur="$(video_duration "$src" 2>/dev/null)"; dur="${dur%.*}"
-  [[ "$dur" =~ ^[0-9]+$ ]] && [ "$dur" -gt 0 ] || { printf '0'; return; }
-  local total_tff=0 total_bff=0 total_prog=0 total_undet=0
+  local src="$1" dur start i probe prog inter _rn _rt _rb _tff _bff
+  local n="${RESTORE_SD_ANALYZE_WINDOWS:-3}" secs="${RESTORE_SD_ANALYZE_SECS:-12}"
+  local w; w="$(video_width "$src" 2>/dev/null)"; [[ "$w" =~ ^[0-9]+$ ]] || w=640
+  dur="$(video_duration "$src" 2>/dev/null || true)"; dur="${dur%.*}"
+  [[ "$dur" =~ ^[0-9]+$ ]] && [ "$dur" -gt 0 ] || { printf '0'; return 0; }
+  local tot_i=0 tot_all=0
   for ((i=1; i<=n; i++)); do
     start=$(( dur * i / (n + 1) ))
-    local out
-    out="$(run_ffmpeg -hide_banner -nostats -ss "$start" -t "$secs" -i "$src" \
-            -vf idet -an -f null - 2>&1 | grep -E 'Multi frame detection' | tail -1)"
-    local tff bff prog undet
-    tff="$(sed -n 's/.*TFF: *\([0-9]\+\).*/\1/p' <<<"$out")"
-    bff="$(sed -n 's/.*BFF: *\([0-9]\+\).*/\1/p' <<<"$out")"
-    prog="$(sed -n 's/.*Progressive: *\([0-9]\+\).*/\1/p' <<<"$out")"
-    undet="$(sed -n 's/.*Undetermined: *\([0-9]\+\).*/\1/p' <<<"$out")"
-    total_tff=$(( total_tff + ${tff:-0} ))
-    total_bff=$(( total_bff + ${bff:-0} ))
-    total_prog=$(( total_prog + ${prog:-0} ))
-    total_undet=$(( total_undet + ${undet:-0} ))
+    if declare -F _idet_probe_window >/dev/null 2>&1; then
+      probe="$(_idet_probe_window "$src" "$start" "$secs" 2>/dev/null || true)"
+      [ -n "$probe" ] || continue
+      read -r prog inter _rn _rt _rb _tff _bff <<<"$probe"
+      [[ "$prog" =~ ^[0-9]+$ ]] && [[ "$inter" =~ ^[0-9]+$ ]] || continue
+      tot_i=$(( tot_i + inter )); tot_all=$(( tot_all + prog + inter ))
+    fi
   done
-  awk -v i=$(( total_tff + total_bff )) -v tot=$(( total_tff + total_bff + total_prog + total_undet )) \
-    'BEGIN{ if(tot>0) printf "%.3f", i/tot; else printf "0" }'
+  awk -v i="$tot_i" -v tot="$tot_all" 'BEGIN{ if(tot>0) printf "%.3f", i/tot; else printf "0" }'
+}
+
+# Preflight: is there enough scratch for a lossless SD intermediate? Rough
+# upper bound = duration_s * width * height * 3 bytes/px/frame_at_the_fps
+# ... simplified to a generous per-minute SD estimate + headroom. Fails
+# CLOSED (returns 1 = "no") on any uncertainty so restoration never starts
+# a render it can't finish.
+_sdr_space_ok() {  # src
+  local src="$1" dur mins need_bytes free_bytes dir
+  dir="${RAMDISK_JOB_DIR:-${TMPDIR:-/tmp}}"
+  dur="$(video_duration "$src" 2>/dev/null || true)"; dur="${dur%.*}"
+  [[ "$dur" =~ ^[0-9]+$ ]] && [ "$dur" -gt 0 ] || return 1
+  mins=$(( (dur + 59) / 60 ))
+  # ~120 MB / minute is a safe ceiling for FFV1 SD 8-bit (real SD FFV1 runs
+  # 50-100 MB/min); x1.5 for a deblock-rewrite temp briefly coexisting with
+  # its input, + 512 MB slack.
+  need_bytes=$(( (mins * 120 * 3 / 2 + 512) * 1024 * 1024 ))
+  if declare -F _dir_free_bytes >/dev/null 2>&1; then
+    free_bytes="$(_dir_free_bytes "$dir" 2>/dev/null || true)"
+  else
+    free_bytes="$(df -k "$dir" 2>/dev/null | awk 'NR==2{print $4*1024}')"
+  fi
+  [[ "$free_bytes" =~ ^[0-9]+$ ]] || return 1
+  if [ "$free_bytes" -lt "$need_bytes" ]; then
+    _sdr_warn "insufficient scratch in $dir: need ~$(( need_bytes / 1024 / 1024 ))MB, have $(( free_bytes / 1024 / 1024 ))MB -- normal encode"
+    return 1
+  fi
+  return 0
+}
+
+# Pixel format for the intermediate: keep the source's own bit depth. 10-bit
+# FFV1 from an 8-bit SD source preserves nothing extra and just inflates the
+# scratch footprint (Codex review). Only promote to 10-bit for genuinely
+# >8-bit sources.
+_sdr_inter_pixfmt() {  # src
+  local src="$1" depth
+  depth="$(run_ffprobe -v error -select_streams v:0 -show_entries stream=bits_per_raw_sample -of csv=p=0 "$src" 2>/dev/null | head -1 || true)"
+  [[ "$depth" =~ ^[0-9]+$ ]] && [ "$depth" -gt 8 ] && { printf 'yuv420p10le'; return; }
+  printf 'yuv420p'
 }
 
 # ---------------------------------------------------------------------------
@@ -175,8 +213,8 @@ sd_restore_should_restore() {  # src profile
   fi
   _sdr_profile_eligible "$profile" || { _sdr_log "profile '$profile' not restore-eligible"; return 1; }
 
-  local verdict
-  verdict="$(sd_restore_analyze "$src" "$profile" | sed -n 's/^verdict=\([a-z]*\).*/\1/p')"
+  local verdict=""
+  verdict="$(sd_restore_analyze "$src" "$profile" 2>/dev/null | sed -n 's/^verdict=\([a-z]*\).*/\1/p' || true)"
   case "$verdict" in
     restore|forced) return 0 ;;
     *)              return 1 ;;
@@ -191,7 +229,8 @@ sd_restore_should_restore() {  # src profile
 # ---------------------------------------------------------------------------
 sd_restore_to_intermediate() {  # src profile -> prints intermediate path | fail
   local src="$1" profile="${2:-}"
-  local class; class="$(source_traits_field_mode "$src" 2>/dev/null)"
+  _sdr_space_ok "$src" || return 1
+  local class; class="$(source_traits_field_mode "$src" 2>/dev/null || true)"
   [ -n "$class" ] && [ "$class" != unknown ] || class="ambiguous"
 
   # Structural mode selection -- ONLY the two safe modes unless the operator
@@ -243,13 +282,14 @@ _sdr_pinned_deblock_vf() {
 }
 
 _sdr_maybe_deblock() {  # intermediate_path original_src profile -- edits $1 in place if RESTORE_SD_DEBLOCK=light
-  local inter="$1"
+  local inter="$1" osrc="${2:-}"
   [ "$RESTORE_SD_DEBLOCK" = light ] || { printf '%s\n' "$inter"; return 0; }
   local d; d="$(dirname -- "$inter")"
   local tmp="$d/sdrestore-deblocked.mkv"
+  local pf="yuv420p"; [ -n "$osrc" ] && pf="$(_sdr_inter_pixfmt "$osrc")"
   if run_ffmpeg -hide_banner -nostdin -y -i "$inter" \
        -map 0:v:0 -vf "$(_sdr_pinned_deblock_vf)" \
-       -c:v ffv1 -level 3 -pix_fmt yuv420p10le -an -sn \
+       -c:v ffv1 -level 3 -pix_fmt "$pf" -an -sn \
        "$tmp" >/dev/null 2>&1 && [ -s "$tmp" ]; then
     mv -f -- "$tmp" "$inter"
     _sdr_log "applied light deblock to intermediate"
@@ -260,19 +300,25 @@ _sdr_maybe_deblock() {  # intermediate_path original_src profile -- edits $1 in 
   printf '%s\n' "$inter"
 }
 
+# errexit-safe SAR read (Codex FIX): a failed ffprobe|head must not abort.
+_sdr_sar_suffix() {  # src -> ",setsar=N/D"  (empty when square / unknown)
+  local src="$1" sar
+  sar="$(run_ffprobe -v error -select_streams v:0 -show_entries stream=sample_aspect_ratio -of csv=p=0 "$src" 2>/dev/null | head -1 || true)"
+  [[ "$sar" == *:* ]] && [ "$sar" != 0:1 ] && [ "$sar" != 1:1 ] || { printf ''; return 0; }
+  printf ',setsar=%s' "${sar/:/\/}"
+}
+
 _sdr_ivtc_intermediate() {  # src profile -> prints path
   local src="$1" profile="${2:-}"
   local d; d="$(_sdr_stage_dir)" || { _sdr_warn "no stage dir -- normal encode"; return 1; }
   local out="$d/sdrestore-ivtc.mkv"
-  local field_order; field_order="$(source_traits_field_order "$src" 2>/dev/null)"
+  local field_order; field_order="$(source_traits_field_order "$src" 2>/dev/null || true)"
   local order_arg="tff"; [ "$field_order" = bff ] && order_arg="bff"
   local vf="fieldmatch=order=${order_arg}:combmatch=full,decimate"
   [ "$RESTORE_SD_DEBLOCK" = light ] && vf="${vf},$(_sdr_pinned_deblock_vf)"
-  # preserve anamorphic SAR onto the fresh render (same lesson as ves-qtgmc.sh)
-  local sar; sar="$(run_ffprobe -v error -select_streams v:0 -show_entries stream=sample_aspect_ratio -of csv=p=0 "$src" 2>/dev/null | head -1)"
-  [[ "$sar" == *:* ]] && [ "$sar" != 0:1 ] && [ "$sar" != 1:1 ] && vf="${vf},setsar=${sar/:/\/}"
+  vf="${vf}$(_sdr_sar_suffix "$src")"
   if run_ffmpeg -hide_banner -nostdin -y -i "$src" \
-       -map 0:v:0 -vf "$vf" -c:v ffv1 -level 3 -pix_fmt yuv420p10le -an -sn \
+       -map 0:v:0 -vf "$vf" -c:v ffv1 -level 3 -pix_fmt "$(_sdr_inter_pixfmt "$src")" -an -sn \
        "$out" >/dev/null 2>&1 && [ -s "$out" ]; then
     printf '%s\n' "$out"; return 0
   fi
@@ -285,11 +331,9 @@ _sdr_deblock_only_intermediate() {  # src profile -> prints path
   local src="$1"
   local d; d="$(_sdr_stage_dir)" || return 1
   local out="$d/sdrestore-deblock.mkv"
-  local sar; sar="$(run_ffprobe -v error -select_streams v:0 -show_entries stream=sample_aspect_ratio -of csv=p=0 "$src" 2>/dev/null | head -1)"
-  local vf; vf="$(_sdr_pinned_deblock_vf)"
-  [[ "$sar" == *:* ]] && [ "$sar" != 0:1 ] && [ "$sar" != 1:1 ] && vf="${vf},setsar=${sar/:/\/}"
+  local vf; vf="$(_sdr_pinned_deblock_vf)$(_sdr_sar_suffix "$src")"
   if run_ffmpeg -hide_banner -nostdin -y -i "$src" \
-       -map 0:v:0 -vf "$vf" -c:v ffv1 -level 3 -pix_fmt yuv420p10le -an -sn \
+       -map 0:v:0 -vf "$vf" -c:v ffv1 -level 3 -pix_fmt "$(_sdr_inter_pixfmt "$src")" -an -sn \
        "$out" >/dev/null 2>&1 && [ -s "$out" ]; then
     printf '%s\n' "$out"; return 0
   fi
@@ -302,17 +346,24 @@ _sdr_deblock_only_intermediate() {  # src profile -> prints path
 # 0 = ok to attempt; 1 = fall back to normal encode.
 # ---------------------------------------------------------------------------
 sd_restore_verify() {  # [class]
-  local class="${1:-}"
+  local class="${1:-}" filters
   command -v ffmpeg >/dev/null 2>&1 || { _sdr_warn "no ffmpeg"; return 1; }
-  # 'pp' filter present? (needed only when deblock=light)
-  if [ "$RESTORE_SD_DEBLOCK" = light ]; then
-    run_ffmpeg -hide_banner -filters 2>/dev/null | grep -qw pp || {
-      _sdr_warn "ffmpeg built without 'pp' -- disabling deblock for this host"
-      RESTORE_SD_DEBLOCK=off
-    }
+  filters="$(run_ffmpeg -hide_banner -filters 2>/dev/null || true)"
+
+  # 'pp' filter present? (needed only when deblock=light) -- degrade, don't fail.
+  if [ "$RESTORE_SD_DEBLOCK" = light ] && ! grep -qw 'pp' <<<"$filters"; then
+    _sdr_warn "ffmpeg built without 'pp' -- disabling deblock for this host"
+    RESTORE_SD_DEBLOCK=off
   fi
+
   case "$class" in
-    interlaced) qtgmc_available || { _sdr_warn "QTGMC unavailable on this host"; return 1; } ;;
+    telecine)
+      grep -qw 'fieldmatch' <<<"$filters" && grep -qw 'decimate' <<<"$filters" || {
+        _sdr_warn "ffmpeg lacks fieldmatch/decimate -- normal encode"; return 1; }
+      run_ffmpeg -hide_banner -encoders 2>/dev/null | grep -qw 'ffv1' || {
+        _sdr_warn "ffmpeg lacks ffv1 encoder -- normal encode"; return 1; } ;;
+    interlaced)
+      qtgmc_available || { _sdr_warn "QTGMC unavailable on this host -- normal encode"; return 1; } ;;
   esac
   return 0
 }

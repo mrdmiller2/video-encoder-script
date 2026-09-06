@@ -414,11 +414,11 @@ ffmpeg_encode() {
   # contract to the QTGMC substitution (original $src still owns audio /
   # subs / chapters / metadata). Any failure falls through to a normal
   # encode. DRY_RUN only reports.
-  if declare -F sd_restore_should_restore >/dev/null 2>&1 && [ "$video_src" = "$src" ]; then
-    if [ "$DRY_RUN" = true ]; then
-      sd_restore_analyze "$src" "$profile" >/dev/null 2>&1 || true
-    elif sd_restore_should_restore "$src" "$profile"; then
-      local _sdr_class; _sdr_class="$(source_traits_field_mode "$src" 2>/dev/null)"
+  if declare -F sd_restore_analyze >/dev/null 2>&1 && [ "$video_src" = "$src" ]; then
+    # Telemetry always logs (calibration data) -- cheap read-only probe.
+    sd_restore_analyze "$src" "$profile" >/dev/null 2>&1 || true
+    if [ "$DRY_RUN" != true ] && sd_restore_should_restore "$src" "$profile"; then
+      local _sdr_class; _sdr_class="$(source_traits_field_mode "$src" 2>/dev/null || true)"
       if sd_restore_verify "$_sdr_class"; then
         local sd_restore_intermediate=""
         if sd_restore_intermediate="$(sd_restore_to_intermediate "$src" "$profile")" && \
