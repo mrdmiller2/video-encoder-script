@@ -1236,6 +1236,12 @@ EOF
   done
   rmdir -- "$tmpdir" 2>/dev/null
   : >"$mdir/.complete"
+  # Every manifest file world-writable: a shot .status/.meta gets rewritten by
+  # whichever host reclaims that shot, and a restrictive mode from this host's
+  # identity would silently wedge the next one. umask 000 (survey scripts)
+  # already gets us 666; force 0777 here + on the parent so it survives a host
+  # whose umask is wrong. Belt-and-suspenders with ves_perm_sweep.sh on STING.
+  chmod -R 0777 -- "$mdir" 2>/dev/null || true
   log "Shot split: $n shot(s) created for $(basename -- "$src")"
   return 0
 }

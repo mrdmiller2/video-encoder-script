@@ -15,11 +15,15 @@
 # mode (typically 644) still locks a file to one UID on shares without a
 # common identity mapping. Force the most permissive mode meaningful for a
 # regular (non-executable) file, matching this project's own CIFS mount
-# policy of file_mode=0777,dir_mode=0777 elsewhere -- 0666 is "as close to
-# 777 as possible" for a file where the execute bit does nothing.
+# policy of file_mode=0777,dir_mode=0777 elsewhere.
+# 2026-09-06 (user directive): 0777, not the previous 0666 -- the execute bit
+# is a no-op on a data file, but on some NFS/SMB identity-map configs an
+# owner-mismatched 0666 file still can't be rewritten or re-permissioned by
+# the next fleet host, and the goal is ZERO permission-related hangs. STING's
+# ves_perm_sweep.sh is the periodic backstop.
 _restore_default_file_mode() {
   local f="$1"
-  chmod 0666 "$f" 2>/dev/null || true
+  chmod 0777 "$f" 2>/dev/null || true
 }
 
 _job_path_slug() {

@@ -4,6 +4,36 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.1R — 2026-09-06 (branch `6.x-chunk-redesign`)
+
+**Fleet-wide file permission / ownership normalisation** -- so no node ever
+hangs or fails because a shared file was made by a different account or with a
+restrictive mode. The fleet writes as many identities (`docm@mc-enterprises`,
+`worker` [a different numeric uid per host over NFS], `sspade`, stray service
+accounts, `nobody` from NFS root-squash); a shot manifest dir made 2755 by one
+host silently blocks the search worker on the next (hit live 2026-09-06).
+
+- `_restore_default_file_mode` (`ves-cifs-mount.sh`): 0666 -> **0777** (user
+  directive). Used across the whole codebase at every atomic mktemp+mv site.
+- `shot_split_create_manifest` (`ves-per-shot-qp.sh`): `chmod -R 0777` the
+  finished manifest dir (was: dir only).
+- `umask 000` added to the survey scripts that lacked it:
+  `generic_manifest_build.sh` (the important one -- it creates the manifest dir
+  + shot .meta), `ves_fleet_monitor.sh`, `ves-dval-claim-lib.sh`,
+  `dval_dispatch_launch.sh`, `dval_paths.sh`, `dval_titles.sh`.
+- **NEW `ves_perm_sweep.sh`** -- runs on STING (mounts the media datasets as
+  DIRECT ZFS, no root-squash / NFS contention, passwordless sudo):
+  `sudo chown -R 3000:8080` + `sudo chmod -R 0777` + `chmod g+s` on dirs, over
+  the survey shared tree + every `*_WORKING` / `*.shots` dir. Idempotent.
+  Deployed to a STING cron (`*/10`) as the periodic backstop, and callable
+  on-demand via `dval_fix_perms [path...]` (in `dval_paths.sh`, backgrounded,
+  non-fatal). Wired into `dval_searchwalk.sh`: after every manifest build, and
+  once at end-of-pass.
+- `dval_searchwalk.sh` infra guard: a `meta=0` (manifest never built) result
+  no longer accrues a fellshort strike -> quarantine. That mis-attribution
+  (compounding the mkdir-without-p bug) mass-quarantined 17 titles on
+  2026-09-06.
+
 ## v6.0.1Q — 2026-09-06 (branch `6.x-chunk-redesign`)
 
 **`shot_split_create_manifest` mass-quarantine fix.** `mkdir -- "$mdir"` (the
