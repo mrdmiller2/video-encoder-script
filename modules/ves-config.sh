@@ -6,7 +6,7 @@
 # MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
 # bug fix) -- see its own comment.
 
-VERSION="6.0.1N"
+VERSION="6.0.1O"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
 # as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
@@ -92,6 +92,24 @@ MUST_ELIMINATE_AV1_CANDIDATE_SIZE=""
 QTGMC_FINAL_VMAF_SRC=""
 QTGMC_FINAL_VMAF_DST=""
 QTGMC_FINAL_VMAF_VALUE=""
+
+# --- SD "facelift" restoration pre-processor (ves-sd-restore.sh, v6.0.1O) ---
+# Conservative first increment: analysis telemetry always logs; the restore
+# path is OFF by default. When enabled it produces a video-only restored
+# intermediate (IVTC for hard telecine / QTGMC for genuine interlace, plus an
+# optional pinned light deblock) that the encode substitutes as video_src --
+# same mechanism as QTGMC. No automatic denoise / chroma-warp / upscale /
+# ML here (later increments). See
+# orchestration/regional-survey/docs/sd_restoration_*_20260906.md.
+RESTORE_SD_ENABLE="${RESTORE_SD_ENABLE:-false}"          # master switch
+RESTORE_SD_EXPERIMENTAL="${RESTORE_SD_EXPERIMENTAL:-false}"  # allow progressive/ambiguous (non-structural) path
+RESTORE_SD_DEBLOCK="${RESTORE_SD_DEBLOCK:-off}"          # off | light  (ffmpeg 'pp=ha/va/dr')
+RESTORE_SD_MAX_HEIGHT="${RESTORE_SD_MAX_HEIGHT:-576}"    # candidacy: only SD/sub-HD sources
+RESTORE_SD_BPPPF_MAX="${RESTORE_SD_BPPPF_MAX:-0.065}"    # candidacy: low bits/pixel/frame (TELEMETRY LABEL until calibrated on real titles)
+RESTORE_SD_COMB_MIN="${RESTORE_SD_COMB_MIN:-0.05}"       # idet combed-frame ratio that triggers restore
+RESTORE_SD_ANALYZE_WINDOWS="${RESTORE_SD_ANALYZE_WINDOWS:-3}"
+RESTORE_SD_ANALYZE_SECS="${RESTORE_SD_ANALYZE_SECS:-12}"
+RESTORE_SD_PROFILES="${RESTORE_SD_PROFILES:-vintage vtv standup concert canime wanime}"
 # Set by av1_source_reencode_sample_decision() right before its av1/x265
 # return (never for skip/failure -- those don't lead to a real encode, so
 # there's nothing to compare against an eventual actual result). Consumed

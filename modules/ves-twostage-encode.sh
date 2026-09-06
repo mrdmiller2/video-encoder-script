@@ -406,6 +406,32 @@ ffmpeg_encode() {
     fi
   fi
 
+  # SD "facelift" restoration (ves-sd-restore.sh, v6.0.1O). Analysis
+  # telemetry logs unconditionally; the restore path only runs when
+  # RESTORE_SD_ENABLE=true (or a per-title force marker) AND the gate says
+  # so AND QTGMC above didn't already take this title. On success it swaps
+  # in a video-only restored intermediate as video_src -- identical
+  # contract to the QTGMC substitution (original $src still owns audio /
+  # subs / chapters / metadata). Any failure falls through to a normal
+  # encode. DRY_RUN only reports.
+  if declare -F sd_restore_should_restore >/dev/null 2>&1 && [ "$video_src" = "$src" ]; then
+    if [ "$DRY_RUN" = true ]; then
+      sd_restore_analyze "$src" "$profile" >/dev/null 2>&1 || true
+    elif sd_restore_should_restore "$src" "$profile"; then
+      local _sdr_class; _sdr_class="$(source_traits_field_mode "$src" 2>/dev/null)"
+      if sd_restore_verify "$_sdr_class"; then
+        local sd_restore_intermediate=""
+        if sd_restore_intermediate="$(sd_restore_to_intermediate "$src" "$profile")" && \
+           [ -n "$sd_restore_intermediate" ] && [ -s "$sd_restore_intermediate" ]; then
+          video_src="$sd_restore_intermediate"
+          local sd_restore_stage_dir; sd_restore_stage_dir="$(dirname "$sd_restore_intermediate")"
+          trap 'rm -rf -- "$sd_restore_stage_dir" 2>/dev/null || true; trap - RETURN' RETURN
+          log "SD facelift applied: $(basename "$src") -> restored intermediate (class=$_sdr_class)"
+        fi
+      fi
+    fi
+  fi
+
   resolve_upscale_target "$src"
   log "Encoder profile: $profile ($codec) — $(upscale_status_desc)"
   # determine_hdr_mode classifies plain HDR10/HLG AND every Dolby Vision case

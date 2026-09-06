@@ -4,6 +4,43 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.1O — 2026-09-06 (branch `6.x-chunk-redesign`)
+
+**SD "facelift" restoration pre-processor — conservative first increment.**
+New `modules/ves-sd-restore.sh`: a pre-encode restoration stage for heavily
+degraded SD / sub-HD sources (old broadcast TV, classic stand-up specials,
+VHS/DVD-lineage rips — MPEG-4/DivX blocking, ringing, bad prior deinterlace /
+telecine). Researched by AGY (Gemini), reviewed by Codex; docs under
+`orchestration/regional-survey/docs/sd_restoration_*_20260906.md`.
+
+Deliberately the *smallest correct increment*, not the full research chain —
+the biggest risk is wrong automatic classification (one bad IVTC/QTGMC/deblock
+call permanently damages a whole title), so:
+- **Analysis telemetry always logs** (`sd_restore_analyze`: 3-window `idet`
+  comb ratio, bits/pixel/frame, must-eliminate codec/container, field-mode
+  class) — for calibrating the gate against real titles before trusting it.
+- **Restore path OFF by default** (`RESTORE_SD_ENABLE=false`). Opt in globally
+  or per-title via a `.ves-sd-restore` marker containing `force`.
+- **Only two structural modes**: hard telecine → ffmpeg `fieldmatch,decimate`
+  (IVTC); genuine interlace → the existing reviewed `ves-qtgmc.sh` path.
+  Progressive/ambiguous is pass-through unless `RESTORE_SD_EXPERIMENTAL=true`.
+- Optional pinned light deblock (`RESTORE_SD_DEBLOCK=light` → ffmpeg
+  `pp=ha/va/dr`, host-capability-checked). **No** automatic denoise /
+  chroma-warp / znedi3 / ML upscale — later increments, one filter family at
+  a time after A/B results.
+- Output = a video-only restored **intermediate file** swapped in as
+  `video_src` in `ffmpeg_encode()` — identical mechanism/contract to the
+  QTGMC substitution (original source still owns audio/subs/chapters/metadata;
+  RETURN-trap cleanup; any failure falls through to a normal encode).
+- Upscaling stays with the existing `resolve_upscale_target()` on the restored
+  `video_src`. Final VMAF is measured against the restored intermediate (the
+  existing same-representation pattern), never the raw degraded source.
+
+`modules/ves-config.sh`: `RESTORE_SD_{ENABLE,EXPERIMENTAL,DEBLOCK,MAX_HEIGHT,
+BPPPF_MAX,COMB_MIN,ANALYZE_WINDOWS,ANALYZE_SECS,PROFILES}`. Windows fork:
+`VesSdRestore.psm1` parity stub (analysis + gate; full parity deferred — the
+Linux fleet runs the survey).
+
 ## v6.0.1N — 2026-09-05 (branch `6.x-chunk-redesign`)
 
 **Three new encode profiles: `concert`, `standup`, `learning`.** The library
