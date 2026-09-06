@@ -37,7 +37,13 @@ function Invoke-VesProfileFfprobe {
     return $r.StdOut
 }
 
-$CLASSIC_ANIME_YEAR_CUTOFF = 1997
+# <=2002 = classic anime (cel->digital PRODUCTION transition, user 2026-09-06).
+# 1998-2002 titles (Cowboy Bebop, Perfect Blue, the whole 1999-2002 hybrid
+# window) still lean on hand-painted cel -> canime; 2003+ (Fullmetal Alchemist
+# 2003, Astro Boy 2003 were the last big cel-heavy productions) is digital-norm
+# -> anime. Lockstep with modules/ves-config.sh.
+$CLASSIC_ANIME_YEAR_CUTOFF = 2002
+$MODERN_ANIME_YEAR_CUTOFF = 2003
 
 $FIXED_CRF_SVT_HDR = 24
 $FIXED_CRF_X265_HDR = 18
@@ -111,6 +117,15 @@ function Get-VesDetectedProfileForPath {
     $pNorm = $p -replace '\\', '/'
 
     if ($pNorm -match '/Movies/Japanese/Animation/') { return $null }  # ambiguous -- caller must force
+    # Anime library era-folders (2026-09-06): {Vintage,Classic,Modern} like the
+    # western libraries, but Classic/Modern split at 2002/2003 not 1997/1998
+    # (cel->digital PRODUCTION transition). The bucket folder carries the cutoff
+    # years in its name -- Anime/Vintage (<=1958), Anime/Classic (1959-2002),
+    # Anime/Modern (2003+) -- so a human filing new media sees the boundary.
+    # Both parenthesised and bare names match (transition-safe). Folder
+    # authoritative; name-year fallback covers anything not yet moved.
+    if ($pNorm -match '/Anime/(Vintage|Classic)( \([^)]*\))?/') { return 'canime' }
+    if ($pNorm -match '/Anime/Modern( \([^)]*\))?/') { return 'anime' }
     if ($pNorm -match '/Movies/Anime/') { return Get-VesAnimeProfileForPath -Path $pNorm }
     if ($pNorm -match '/Anime/') { return Get-VesAnimeProfileForPath -Path $pNorm }
     # Routing-layer compound buckets (2026-09-06) -- see ves-profile-decision.sh.

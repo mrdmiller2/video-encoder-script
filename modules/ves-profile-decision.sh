@@ -223,6 +223,8 @@ anime_title_year() {
 anime_profile_for_path() {
   local p="$1" year
   year="$(anime_title_year "$p")"
+  # CLASSIC_ANIME_YEAR_CUTOFF is 2002 (cel->digital production transition, user
+  # 2026-09-06). <= cutoff -> canime (flat cel line-art tuning); >=2003 -> anime.
   if [ -n "$year" ] && [ "$year" -le "$CLASSIC_ANIME_YEAR_CUTOFF" ] 2>/dev/null; then
     printf 'canime'
   else
@@ -238,6 +240,18 @@ detect_profile_for_path() {
   fi
   case "$p" in
     */Movies/Japanese/Animation/*) return 2 ;;
+    # Anime library era-folders (2026-09-06): Movies/Anime and BigPoppa/Media/Anime
+    # were flat; now bucketed like the western libraries, BUT with an
+    # anime-specific Classic/Modern split at 2002/2003 not 1997/1998 -- the
+    # cel->digital PRODUCTION transition (see CLASSIC_ANIME_YEAR_CUTOFF). The
+    # bucket folder carries the cutoff years in its NAME so a human filing new
+    # media can see the boundary without consulting the code:
+    #   Anime/Vintage (<=1958)    Anime/Classic (1959-2002)    Anime/Modern (2003+)
+    # Folder is authoritative; the name-year fallback (anime_profile_for_path,
+    # also <=2002) covers anything not yet moved. Both the parenthesised names
+    # and the bare Vintage/Classic/Modern are matched (transition-safe).
+    */Anime/Vintage\ \(*|*/Anime/Vintage/*|*/Anime/Classic\ \(*|*/Anime/Classic/*) printf 'canime'; return 0 ;;
+    */Anime/Modern\ \(*|*/Anime/Modern/*) printf 'anime'; return 0 ;;
     */Movies/Anime/*) anime_profile_for_path "$p"; return 0 ;;
     # Anime TV shows (Japanese/Chinese/Korean anime-styled) live at a
     # top-level Anime/ folder, sibling to Movies/Television at the media

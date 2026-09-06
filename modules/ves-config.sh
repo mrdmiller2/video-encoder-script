@@ -6,7 +6,7 @@
 # MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
 # bug fix) -- see its own comment.
 
-VERSION="6.0.1R"
+VERSION="6.0.1S"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
 # as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
@@ -515,7 +515,7 @@ NVENC_AV1_CQ_VINTAGE=24
 ENCODE_ENGINE="${CONVERT_ENGINE:-auto}"           # auto|ffmpeg|handbrake
 VMAF_TARGET_MOVIE="${CONVERT_VMAF_TARGET:-94.0}"  # 1080p SDR movies (NEG model; ~= default-model 95.5)
 VMAF_TARGET_ANIME="${CONVERT_VMAF_TARGET_ANIME:-94.0}"
-# Classic anime (<=1997, see CLASSIC_ANIME_YEAR_CUTOFF) targets a couple
+# Classic anime (<=2002, see CLASSIC_ANIME_YEAR_CUTOFF) targets a couple
 # points higher -- VMAF alone under-penalizes soft line art, so the CRF
 # search is biased toward more bits than the modern-anime target.
 VMAF_TARGET_CANIME="${CONVERT_VMAF_TARGET_CANIME:-95.0}"
@@ -863,10 +863,10 @@ SVT_PARAMS_WANIME='enable-qm=1:qm-min=0:keyint=15s:scd=1:aq-mode=2:sharpness=2'
 # bits-for-quality tradeoff, not the ~15% BD-rate win the changelog
 # claimed for this content. Reverted per that real result.
 SVT_PARAMS_ANIME='enable-qm=1:film-grain-denoise=1:film-grain=6:qm-min=0:scd=1:enable-tf=0:keyint=15s:aq-mode=2:enable-variance-boost=1:variance-boost-strength=3:variance-octile=4:enable-overlays=1:tune=0:sharpness=2'
-# Classic/heavily-lined anime (<=1997 -- see CLASSIC_ANIME_YEAR_CUTOFF): a
+# Classic/heavily-lined anime (<=2002 -- see CLASSIC_ANIME_YEAR_CUTOFF): a
 # line-art preservation problem, not a photochemical-grain problem (team
 # review + user confirmation, 2026-07-20). No film-grain-denoise/film-grain
-# at all -- pre-1998 cel paint is flat, hard-segmented color blocks with no
+# at all -- cel paint is flat, hard-segmented color blocks with no
 # soft gradients to band, so grain synthesis only adds unwanted texture over
 # clean fills without buying any real anti-banding protection; aq-mode=2 +
 # qm-min=0 + 10-bit already cover that. No tune=0 (the v5.0.4 lesson that
@@ -875,14 +875,29 @@ SVT_PARAMS_ANIME='enable-qm=1:film-grain-denoise=1:film-grain=6:qm-min=0:scd=1:e
 # variance-boost-strength than modern anime (high variance-boost starves
 # flat regions of bits, the opposite of what hard-edged flat cel color needs).
 SVT_PARAMS_CANIME='enable-qm=1:qm-min=0:scd=1:enable-tf=0:keyint=15s:aq-mode=2:enable-variance-boost=1:variance-boost-strength=1:variance-octile=4:enable-overlays=1:sharpness=3'
-# The <=1997 boundary that anime_profile_for_path() uses to pick canime vs anime.
+# The anime era boundary that anime_profile_for_path() uses to pick canime vs
+# anime (also the Anime/{Vintage,Classic,Modern} library-folder split). It
+# tracks the cel->digital PRODUCTION transition, not a round decade (user,
+# researched 2026-09-06):
+#   Fujifilm stopped cel stock 1995; first fully digitally-coloured TV anime
+#   1999; Ghibli/Sunrise/Toei switched 1999-2002; 2003 was the LAST year major
+#   productions still leaned heavily on cel (Fullmetal Alchemist 2003, Astro Boy
+#   2003 ~30% cel), and from ~2003 digital was the norm rather than the
+#   exception. Putting the whole hybrid 1999-2002 window in the classic bucket
+#   is deliberate -- those studios were mixing cel + digital, and canime's flat
+#   line-art tuning (no grain synth) is right for that look.
+#   year <= 2002  -> canime      year >= 2003 -> anime
+# (contiguous -- no gap year -- so CLASSIC_ANIME_YEAR_CUTOFF alone drives the
+#  profile pick; MODERN_ANIME_YEAR_CUTOFF is the symmetric marker the library
+#  folder-bucket tooling reads.)
 # Historically defined only in the convert-vX.Y.Z.sh wrapper (after it sources
 # this module), so every MODULAR consumer -- the regional survey's
 # dval_worker_encode.sh, the Windows fork, any standalone module sourcing -- saw
 # it empty and silently fell through to the modern `anime` profile (film-grain=6
 # grain synth on flat cel art). Found 2026-09-01 on Akira (1988): base encode
 # 142% of source at VMAF 88.7. Defined here so it travels with the profile logic.
-CLASSIC_ANIME_YEAR_CUTOFF="${CONVERT_CLASSIC_ANIME_YEAR_CUTOFF:-1997}"
+CLASSIC_ANIME_YEAR_CUTOFF="${CONVERT_CLASSIC_ANIME_YEAR_CUTOFF:-2002}"
+MODERN_ANIME_YEAR_CUTOFF="${CONVERT_MODERN_ANIME_YEAR_CUTOFF:-2003}"
 SVT_PARAMS_MOVIES='enable-qm=1:qm-min=0:keyint=15s:scd=1:aq-mode=2'
 SVT_PARAMS_CLASSIC='enable-qm=1:film-grain-denoise=1:film-grain=6:qm-min=0:scd=1:enable-tf=1:keyint=15s:aq-mode=2:enable-variance-boost=1:variance-boost-strength=1:variance-octile=4:sharpness=1'
 SVT_PARAMS_VINTAGE='enable-qm=1:film-grain-denoise=1:film-grain=12:qm-min=0:scd=1:enable-tf=1:keyint=15s:aq-mode=2:enable-variance-boost=1:variance-boost-strength=2:variance-octile=4:sharpness=1'

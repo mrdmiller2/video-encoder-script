@@ -4,6 +4,39 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.1S — 2026-09-06 (branch `6.x-chunk-redesign`)
+
+**Classic-anime cutoff 1997 → 2002** (`CLASSIC_ANIME_YEAR_CUTOFF`; new symmetric
+`MODERN_ANIME_YEAR_CUTOFF=2003` for the library-folder tooling). The boundary
+between `canime` (flat cel line-art tuning: no grain synth, low variance-boost,
+higher VMAF target) and `anime` tracks the **cel → digital production
+transition**, not a round decade (user, researched 2026-09-06): Fujifilm ceased
+cel-stock production in 1995; the first fully digitally-coloured TV anime shipped
+in 1999; Ghibli / Sunrise / Toei switched 1999–2002; **2003 was the last year
+major productions still leaned heavily on cel** (Fullmetal Alchemist 2003, Astro
+Boy 2003 ≈ 30 % cel), and from ~2003 digital was the norm rather than the
+exception. Keeping the whole hybrid 1999–2002 window in the classic bucket is
+deliberate — those studios mixed cel + digital, and `canime`'s tuning suits that
+look. 1998–2002 titles (Cowboy Bebop, Perfect Blue, Serial Experiments Lain, …)
+now route to `canime`. Updated `modules/ves-config.sh`,
+`modules/ves-profile-decision.sh`, `windows/modules/VesProfileDecision.psm1` in
+lockstep.
+
+**Anime libraries gain era sub-folders, with the cutoff years in the folder
+name.** `Movies/Anime/` and `BigPoppa/Media/Anime/` were flat; both are bucketed
+like the western libraries but with the boundary spelled out so a human filing
+new media can see it without reading the code:
+
+    Anime/Vintage (<=1958)/      Anime/Classic (1959-2002)/      Anime/Modern (2003+)/
+
+`detect_profile_for_path` / `Get-VesDetectedProfileForPath` treat the era-folder
+as **authoritative** (`Anime/{Vintage,Classic}…` → `canime`, `Anime/Modern…` →
+`anime`), matching both the parenthesised names and the bare
+`Vintage`/`Classic`/`Modern` (transition-safe), with the name-year heuristic as
+the fallback for titles not yet moved. (`Television/Anime` does not exist — anime
+TV lives at `BigPoppa/Media/Anime`; `BigPoppa/Media/Movies/Anime` is the deferred
+malformed-organize tree and is left untouched.)
+
 ## v6.0.1R — 2026-09-06 (branch `6.x-chunk-redesign`)
 
 **Fleet-wide file permission / ownership normalisation** -- so no node ever
