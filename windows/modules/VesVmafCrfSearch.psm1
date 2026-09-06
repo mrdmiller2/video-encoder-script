@@ -266,6 +266,9 @@ function Get-VesVmafTargetForSource {
         'vintage' { return [double]($env:CONVERT_VMAF_TARGET_VINTAGE ? $env:CONVERT_VMAF_TARGET_VINTAGE : $def) }
         'mtv'     { return [double]($env:CONVERT_VMAF_TARGET_MTV     ? $env:CONVERT_VMAF_TARGET_MTV     : $def) }
         'vtv'     { return [double]($env:CONVERT_VMAF_TARGET_VTV     ? $env:CONVERT_VMAF_TARGET_VTV     : $def) }
+        'concert' { return [double]($env:CONVERT_VMAF_TARGET_CONCERT ? $env:CONVERT_VMAF_TARGET_CONCERT : 95.0) }
+        'standup' { return [double]($env:CONVERT_VMAF_TARGET_STANDUP ? $env:CONVERT_VMAF_TARGET_STANDUP : $def) }
+        'learning' { return [double]($env:CONVERT_VMAF_TARGET_LEARNING ? $env:CONVERT_VMAF_TARGET_LEARNING : $def) }
         default   { return [double]$def }
     }
 }

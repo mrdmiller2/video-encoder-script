@@ -245,6 +245,16 @@ detect_profile_for_path() {
     # profile exists (matches Movies/Anime's tuning; MTV/VTV only split
     # western live-action TV, not anime).
     */Anime/*) anime_profile_for_path "$p"; return 0 ;;
+    # Concerts / Stand-Up Comedy / Learning Series (2026-09-05): own libraries,
+    # own profiles. Single encode profile each -- the era subfolders
+    # (Vintage/Classic/Modern) exist for library organisation + the D-val
+    # budget-fraction survey's per-era measurement, but do not (yet) split the
+    # encode profile the way live-action movie eras do. Learning Series is flat
+    # by design (instructional talking-heads -- no era dimension). Checked before
+    # */Animation/* so an animated concert film still routes to concert.
+    */Concerts/*) printf 'concert'; return 0 ;;
+    */Stand-Up\ Comedy/*) printf 'standup'; return 0 ;;
+    */Learning\ Series/*) printf 'learning'; return 0 ;;
     */Animation/*) printf 'wanime'; return 0 ;;
     */Movies/*/Modern/*) printf 'movies'; return 0 ;;
     */Movies/*/Classic/*) printf 'classic'; return 0 ;;

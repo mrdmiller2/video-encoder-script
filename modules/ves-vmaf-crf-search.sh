@@ -507,6 +507,9 @@ profile_svt_params() {
     vintage) params="$SVT_PARAMS_VINTAGE" ;;
     mtv) params="$SVT_PARAMS_MTV" ;;
     vtv) params="$SVT_PARAMS_VTV" ;;
+    concert) params="$SVT_PARAMS_CONCERT" ;;
+    standup) params="$SVT_PARAMS_STANDUP" ;;
+    learning) params="$SVT_PARAMS_LEARNING" ;;
     *) return 1 ;;
   esac
   # (#4/#5) per-title enhancement override -- set only by
@@ -563,6 +566,9 @@ profile_x265_params() {
     vintage) printf '%s' "$X265_PARAMS_VINTAGE" ;;
     mtv) printf '%s' "$X265_PARAMS_MTV" ;;
     vtv) printf '%s' "$X265_PARAMS_VTV" ;;
+    concert) printf '%s' "$X265_PARAMS_CONCERT" ;;
+    standup) printf '%s' "$X265_PARAMS_STANDUP" ;;
+    learning) printf '%s' "$X265_PARAMS_LEARNING" ;;
     *) return 1 ;;
   esac
 }
@@ -593,8 +599,10 @@ profile_fixed_crf() {
   case "$codec:$profile" in
     av1:wanime) printf 26 ;; av1:anime) printf 26 ;; av1:canime) printf "$FIXED_CRF_SVT_CANIME" ;; av1:movies) printf 26 ;;
     av1:classic) printf 25 ;; av1:vintage) printf 24 ;; av1:mtv) printf 26 ;; av1:vtv) printf 25 ;;
+    av1:concert) printf "$FIXED_CRF_SVT_CONCERT" ;; av1:standup) printf "$FIXED_CRF_SVT_STANDUP" ;; av1:learning) printf "$FIXED_CRF_SVT_LEARNING" ;;
     hevc:wanime) printf 20 ;; hevc:anime) printf 22 ;; hevc:canime) printf "$FIXED_CRF_X265_CANIME" ;; hevc:movies) printf 20 ;;
     hevc:classic) printf 20 ;; hevc:vintage) printf 20 ;; hevc:mtv) printf 20 ;; hevc:vtv) printf 21 ;;
+    hevc:concert) printf "$FIXED_CRF_X265_CONCERT" ;; hevc:standup) printf "$FIXED_CRF_X265_STANDUP" ;; hevc:learning) printf "$FIXED_CRF_X265_LEARNING" ;;
     *) return 1 ;;
   esac
 }
@@ -1246,6 +1254,9 @@ vmaf_target_for_source() {
     movies) printf '%s' "$VMAF_TARGET_MOVIE" ;; classic) printf '%s' "$VMAF_TARGET_CLASSIC" ;;
     vintage) printf '%s' "$VMAF_TARGET_VINTAGE" ;; mtv) printf '%s' "$VMAF_TARGET_MTV" ;;
     vtv) printf '%s' "$VMAF_TARGET_VTV" ;;
+    concert) printf '%s' "$VMAF_TARGET_CONCERT" ;;
+    standup) printf '%s' "$VMAF_TARGET_STANDUP" ;;
+    learning) printf '%s' "$VMAF_TARGET_LEARNING" ;;
   esac
 }
 

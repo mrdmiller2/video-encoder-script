@@ -43,6 +43,13 @@ $FIXED_CRF_SVT_HDR = 24
 $FIXED_CRF_X265_HDR = 18
 $FIXED_CRF_SVT_CANIME = 24
 $FIXED_CRF_X265_CANIME = 20
+# v6.0.1N -- seed values, refined by the D-val budget-fraction survey
+$FIXED_CRF_SVT_CONCERT = 25
+$FIXED_CRF_SVT_STANDUP = 28
+$FIXED_CRF_SVT_LEARNING = 30
+$FIXED_CRF_X265_CONCERT = 20
+$FIXED_CRF_X265_STANDUP = 22
+$FIXED_CRF_X265_LEARNING = 23
 
 $SVT_PARAMS = @{
     wanime  = 'enable-qm=1:qm-min=0:keyint=15s:scd=1:aq-mode=2:sharpness=2'
@@ -52,8 +59,13 @@ $SVT_PARAMS = @{
     classic = 'enable-qm=1:film-grain-denoise=1:film-grain=6:qm-min=0:scd=1:enable-tf=1:keyint=15s:aq-mode=2:enable-variance-boost=1:variance-boost-strength=1:variance-octile=4:sharpness=1'
     vintage = 'enable-qm=1:film-grain-denoise=1:film-grain=12:qm-min=0:scd=1:enable-tf=1:keyint=15s:aq-mode=2:enable-variance-boost=1:variance-boost-strength=2:variance-octile=4:sharpness=1'
     vtv     = 'enable-qm=1:film-grain-denoise=1:film-grain=5:qm-min=0:scd=1:enable-tf=1:keyint=15s:aq-mode=2:enable-variance-boost=1:variance-boost-strength=2:variance-octile=4:sharpness=1'
+    # Concerts / Stand-Up / Learning Series (v6.0.1N): digital capture, no
+    # film-grain synthesis. See modules/ves-config.sh for the reasoning.
+    concert  = 'enable-qm=1:qm-min=0:keyint=15s:scd=1:aq-mode=2:enable-variance-boost=1:variance-boost-strength=2:variance-octile=4'
+    learning = 'enable-qm=1:qm-min=0:keyint=15s:scd=1:aq-mode=2:sharpness=1'
 }
 $SVT_PARAMS['mtv'] = $SVT_PARAMS['movies']
+$SVT_PARAMS['standup'] = $SVT_PARAMS['movies']
 
 $X265_PARAMS = @{
     wanime  = 'log-level=error:keyint=240:min-keyint=24:bframes=8:ref=4:rc-lookahead=30:aq-mode=2:psy-rd=1.0:psy-rdoq=0.8'
@@ -63,8 +75,11 @@ $X265_PARAMS = @{
     classic = 'log-level=error:keyint=240:min-keyint=24:bframes=8:ref=5:rc-lookahead=40:aq-mode=3:psy-rd=2.0:psy-rdoq=1.5:deblock=-1,-1'
     vintage = 'log-level=error:keyint=240:min-keyint=24:bframes=6:ref=4:rc-lookahead=30'
     vtv     = 'log-level=error:keyint=240:min-keyint=24:bframes=8:b-adapt=2:ref=5:rc-lookahead=50:aq-mode=3:no-sao=1:psy-rd=1.5:psy-rdoq=1.0'
+    standup  = 'log-level=error:keyint=240:min-keyint=24:bframes=8:ref=4:rc-lookahead=30:aq-mode=3:psy-rd=1.5:psy-rdoq=1.0'
+    learning = 'log-level=error:keyint=240:min-keyint=24:bframes=8:b-adapt=2:ref=4:rc-lookahead=40:aq-mode=3:no-sao=1:psy-rd=1.0:psy-rdoq=1.0'
 }
 $X265_PARAMS['mtv'] = $X265_PARAMS['movies']
+$X265_PARAMS['concert'] = $X265_PARAMS['movies']
 
 $GRAIN_SYNTHESIS_PROFILES = @('anime', 'classic', 'vintage', 'vtv')
 
@@ -98,6 +113,9 @@ function Get-VesDetectedProfileForPath {
     if ($pNorm -match '/Movies/Japanese/Animation/') { return $null }  # ambiguous -- caller must force
     if ($pNorm -match '/Movies/Anime/') { return Get-VesAnimeProfileForPath -Path $pNorm }
     if ($pNorm -match '/Anime/') { return Get-VesAnimeProfileForPath -Path $pNorm }
+    if ($pNorm -match '/Concerts/') { return 'concert' }
+    if ($pNorm -match '/Stand-Up Comedy/') { return 'standup' }
+    if ($pNorm -match '/Learning Series/') { return 'learning' }
     if ($pNorm -match '/Animation/') { return 'wanime' }
     if ($pNorm -match '/Movies/[^/]+/Modern/') { return 'movies' }
     if ($pNorm -match '/Movies/[^/]+/Classic/') { return 'classic' }
@@ -216,8 +234,10 @@ function Get-VesProfileFixedCrf {
     $table = @{
         'av1:wanime' = 26; 'av1:anime' = 26; 'av1:canime' = $FIXED_CRF_SVT_CANIME; 'av1:movies' = 26
         'av1:classic' = 25; 'av1:vintage' = 24; 'av1:mtv' = 26; 'av1:vtv' = 25
+        'av1:concert' = $FIXED_CRF_SVT_CONCERT; 'av1:standup' = $FIXED_CRF_SVT_STANDUP; 'av1:learning' = $FIXED_CRF_SVT_LEARNING
         'hevc:wanime' = 20; 'hevc:anime' = 22; 'hevc:canime' = $FIXED_CRF_X265_CANIME; 'hevc:movies' = 20
         'hevc:classic' = 20; 'hevc:vintage' = 20; 'hevc:mtv' = 20; 'hevc:vtv' = 21
+        'hevc:concert' = $FIXED_CRF_X265_CONCERT; 'hevc:standup' = $FIXED_CRF_X265_STANDUP; 'hevc:learning' = $FIXED_CRF_X265_LEARNING
     }
     $key = "${Codec}:${Profile}"
     if ($table.ContainsKey($key)) { return $table[$key] }

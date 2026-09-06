@@ -4,6 +4,51 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.1N — 2026-09-05 (branch `6.x-chunk-redesign`)
+
+**Three new encode profiles: `concert`, `standup`, `learning`.** The library
+gained first-class Concerts, Stand-Up Comedy and Learning Series trees, aligned
+to the same `Vintage/Classic/Modern` era subfolders as the rest of the content
+(Learning Series is flat by design — instructional talking-heads have no era
+dimension). Before this, `profile_for_source` on those paths returned "cannot
+auto-detect" and the encoder aborted.
+
+*`modules/ves-profile-decision.sh`* — `detect_profile_for_path` routes
+`*/Concerts/*` → `concert`, `*/Stand-Up Comedy/*` → `standup`,
+`*/Learning Series/*` → `learning`. One encode profile per library; the era
+subfolders drive library organisation + the D-val budget-fraction survey's
+per-era fraction measurement, not (yet) an encode-param split (same pattern as
+`wanime` covering both animation eras). Checked before `*/Animation/*` so an
+animated concert film still routes to `concert`.
+
+*`modules/ves-config.sh`* — digital-video capture, so **no film-grain
+synthesis** (unlike the photochemical `classic`/`vintage`/`vtv` profiles):
+- `SVT_PARAMS_CONCERT` = movies base + variance-boost (`strength=2`,
+  `octile=4`) for the black-stage / blown-spotlight in-frame dynamic range.
+- `SVT_PARAMS_STANDUP` = movies base as-is (locked camera, stable spot — the
+  leanness is in the fixed CRF / survey fraction, not the params).
+- `SVT_PARAMS_LEARNING` = movies base + `sharpness=1` so slide text / lower
+  thirds stay legible at the leaner CRF.
+- Seed fixed CRFs: SVT av1 concert 25 / standup 28 / learning 30; x265
+  concert 20 / standup 22 / learning 23. **Seeds only** — the D-val
+  budget-fraction survey refines each profile's fraction (survey title-list
+  expansion to N=5 per profile, incl. these three, is tracked separately in
+  `orchestration/regional-survey/` and does not ship in this commit).
+- `VMAF_TARGET_{CONCERT,STANDUP,LEARNING}` (concert biased to 95.0 like classic
+  anime — VMAF under-penalizes stage-strobe/fast-cut temporal artifacts; the
+  other two at the standard 94.0). `X265_PARAMS_{CONCERT,STANDUP,LEARNING}`
+  fallbacks added.
+
+*`modules/ves-vmaf-crf-search.sh`* — `profile_svt_params`, `profile_x265_params`,
+`profile_fixed_crf` and `vmaf_target_for_source` all learn the three new keys
+(the last one previously fell through to an empty target → silent fixed-CRF /
+neutered VMAF gate for these paths). `profile_x265_tune` and
+`profile_uses_grain_synthesis` deliberately unchanged (no tune, no grain synth).
+
+*Windows fork* — `windows/modules/VesProfileDecision.psm1` updated in lockstep.
+
+Advisory peer review (Gemini / Codex / Cursor) per the multi-tool gate.
+
 ## v6.0.1M — 2026-09-05 (branch `6.x-chunk-redesign`)
 
 **Class-F degenerate survey titles — per-shot search that permanently fails

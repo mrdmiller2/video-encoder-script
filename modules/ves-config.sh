@@ -6,7 +6,7 @@
 # MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
 # bug fix) -- see its own comment.
 
-VERSION="6.0.1M"
+VERSION="6.0.1N"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
 # as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
@@ -37,7 +37,8 @@ SKIP_X265=false
 # Bypasses the VES-processed tag skip-check for this run. Set by --force-reprocess,
 # or interactively when SINGLE_FILE_MODE targets an already-tagged file (see below).
 FORCE_REPROCESS_TAGGED=false
-# Optional override for the eight path-detected profiles. Empty means auto.
+# Optional override for the path-detected profiles (wanime/anime/canime/movies/
+# classic/vintage/mtv/vtv/concert/standup/learning). Empty means auto.
 # Movies/Japanese/Animation is deliberately ambiguous and requires this flag.
 FORCE_PROFILE=""
 # Carries the source's resolved profile into private /tmp sample clips.
@@ -505,6 +506,14 @@ VMAF_TARGET_VINTAGE="${CONVERT_VMAF_TARGET_VINTAGE:-94.0}"
 VMAF_TARGET_WANIME="${CONVERT_VMAF_TARGET_WANIME:-94.0}"
 VMAF_TARGET_MTV="${CONVERT_VMAF_TARGET_MTV:-94.0}"
 VMAF_TARGET_VTV="${CONVERT_VMAF_TARGET_VTV:-94.0}"
+# concert = the hardest content in the library (stage strobes + fast cuts +
+# in-frame black/blown dynamic range): biased a point high like classic anime,
+# VMAF under-penalizes the temporal artifacts it produces. standup / learning =
+# easy, near-static; the standard target, with leanness coming from the fixed
+# CRF / survey fraction. All three refined by the D-val budget-fraction survey.
+VMAF_TARGET_CONCERT="${CONVERT_VMAF_TARGET_CONCERT:-95.0}"
+VMAF_TARGET_STANDUP="${CONVERT_VMAF_TARGET_STANDUP:-94.0}"
+VMAF_TARGET_LEARNING="${CONVERT_VMAF_TARGET_LEARNING:-94.0}"
 VMAF_TARGET_4K="${CONVERT_VMAF_TARGET_4K:-95.0}"  # scored with the 4K model
 VMAF_SAMPLES="${CONVERT_VMAF_SAMPLES:-3}"
 VMAF_SAMPLE_SECS="${CONVERT_VMAF_SAMPLE_SECS:-20}"
@@ -742,6 +751,14 @@ FIXED_CRF_SVT_WANIME=26
 FIXED_CRF_SVT_VINTAGE=24
 FIXED_CRF_SVT_MTV=26
 FIXED_CRF_SVT_VTV=25
+# concert = live stage capture (lighting extremes + motion + fast cuts): richer
+# than movies. standup = one static performer, locked camera, ~0 cuts: leaner.
+# learning = instructional talking-heads / screencasts / slides, near-static,
+# text legibility is the only real constraint: leanest. All three are SEED
+# values -- the D-val budget-fraction survey refines each profile's fraction.
+FIXED_CRF_SVT_CONCERT=25
+FIXED_CRF_SVT_STANDUP=28
+FIXED_CRF_SVT_LEARNING=30
 FIXED_CRF_SVT_HDR=24
 FIXED_CRF_X265_MOVIE=20
 FIXED_CRF_X265_ANIME=22
@@ -751,6 +768,9 @@ FIXED_CRF_X265_WANIME=20
 FIXED_CRF_X265_VINTAGE=20
 FIXED_CRF_X265_MTV=20
 FIXED_CRF_X265_VTV=21
+FIXED_CRF_X265_CONCERT=20
+FIXED_CRF_X265_STANDUP=22
+FIXED_CRF_X265_LEARNING=23
 FIXED_CRF_X265_HDR=18
 SVT_PRESET_FINAL="${CONVERT_SVT_PRESET:-5}"       # full-file encode preset
 SVT_PRESET_SEARCH=8                               # sample-search preset (faster; scores track final closely)
@@ -844,6 +864,16 @@ SVT_PARAMS_CLASSIC='enable-qm=1:film-grain-denoise=1:film-grain=6:qm-min=0:scd=1
 SVT_PARAMS_VINTAGE='enable-qm=1:film-grain-denoise=1:film-grain=12:qm-min=0:scd=1:enable-tf=1:keyint=15s:aq-mode=2:enable-variance-boost=1:variance-boost-strength=2:variance-octile=4:sharpness=1'
 SVT_PARAMS_MTV="$SVT_PARAMS_MOVIES"
 SVT_PARAMS_VTV='enable-qm=1:film-grain-denoise=1:film-grain=5:qm-min=0:scd=1:enable-tf=1:keyint=15s:aq-mode=2:enable-variance-boost=1:variance-boost-strength=2:variance-octile=4:sharpness=1'
+# Concerts/Stand-Up/Learning Series (2026-09-05). Digital-video capture -- NO
+# film-grain synthesis (unlike classic/vintage/vtv photochemical profiles).
+# concert: movies base + variance-boost for the black-stage / blown-spotlight
+# in-frame dynamic range that stage lighting produces. standup: movies base as-is
+# (locked camera, stable spot -- the content is easy; leanness comes from the
+# higher fixed CRF / survey fraction, not the params). learning: movies base +
+# mild sharpness so slide text and lower-thirds stay legible at the leaner CRF.
+SVT_PARAMS_CONCERT='enable-qm=1:qm-min=0:keyint=15s:scd=1:aq-mode=2:enable-variance-boost=1:variance-boost-strength=2:variance-octile=4'
+SVT_PARAMS_STANDUP="$SVT_PARAMS_MOVIES"
+SVT_PARAMS_LEARNING='enable-qm=1:qm-min=0:keyint=15s:scd=1:aq-mode=2:sharpness=1'
 # Per-machine SVT-AV1 parallelism override (2026-08-21) -- see
 # profile_svt_params()'s own comment in ves-vmaf-crf-search.sh for the
 # full reasoning. Unset by default everywhere (zero behavior change); set
@@ -877,6 +907,10 @@ X265_PARAMS_CLASSIC='log-level=error:keyint=240:min-keyint=24:bframes=8:ref=5:rc
 X265_PARAMS_VINTAGE='log-level=error:keyint=240:min-keyint=24:bframes=6:ref=4:rc-lookahead=30'
 X265_PARAMS_MTV="$X265_PARAMS_MOVIES"
 X265_PARAMS_VTV='log-level=error:keyint=240:min-keyint=24:bframes=8:b-adapt=2:ref=5:rc-lookahead=50:aq-mode=3:no-sao=1:psy-rd=1.5:psy-rdoq=1.0'
+# x265 fallback params for the digital-capture profiles (see the SVT block).
+X265_PARAMS_CONCERT="$X265_PARAMS_MOVIES"
+X265_PARAMS_STANDUP='log-level=error:keyint=240:min-keyint=24:bframes=8:ref=4:rc-lookahead=30:aq-mode=3:psy-rd=1.5:psy-rdoq=1.0'
+X265_PARAMS_LEARNING='log-level=error:keyint=240:min-keyint=24:bframes=8:b-adapt=2:ref=4:rc-lookahead=40:aq-mode=3:no-sao=1:psy-rd=1.0:psy-rdoq=1.0'
 
 NVENC_AV1_TUNE=hq
 

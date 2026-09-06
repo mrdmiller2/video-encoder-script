@@ -306,8 +306,9 @@ Options:
   --force-reprocess       Bypass the VES-processed tag skip-check without prompting
                           (batch scans always skip tagged files; a single-file target
                           that's already tagged prompts interactively unless this is set)
-  --profile MODE          Force profile: wanime|anime|canime|movies|classic|vintage|mtv|vtv,
-                          overriding path-based auto-detection for this whole run.
+  --profile MODE          Force profile: wanime|anime|canime|movies|classic|vintage|
+                          mtv|vtv|concert|standup|learning, overriding path-based
+                          auto-detection for this whole run.
                           (canime = classic/heavily-lined anime, auto-detected for
                           "(YYYY)" <= 1997 under Anime paths; force it explicitly for
                           undated titles or to override the year cutoff.)
@@ -567,8 +568,8 @@ while [ $# -gt 0 ]; do
     --force-reprocess) FORCE_REPROCESS_TAGGED=true; shift ;;
     --profile)
       case "$2" in
-        wanime|anime|canime|movies|classic|vintage|mtv|vtv) FORCE_PROFILE="$2" ;;
-        *) err "--profile must be wanime, anime, canime, movies, classic, vintage, mtv, or vtv (got: $2)"; exit 1 ;;
+        wanime|anime|canime|movies|classic|vintage|mtv|vtv|concert|standup|learning) FORCE_PROFILE="$2" ;;
+        *) err "--profile must be one of: wanime anime canime movies classic vintage mtv vtv concert standup learning (got: $2)"; exit 1 ;;
       esac
       shift 2 ;;
     --organize-only) DO_ORGANIZE=true; DO_CONVERT=false; shift ;;
