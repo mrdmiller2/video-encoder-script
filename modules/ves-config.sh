@@ -532,6 +532,12 @@ VMAF_TARGET_VTV="${CONVERT_VMAF_TARGET_VTV:-94.0}"
 VMAF_TARGET_CONCERT="${CONVERT_VMAF_TARGET_CONCERT:-95.0}"
 VMAF_TARGET_STANDUP="${CONVERT_VMAF_TARGET_STANDUP:-94.0}"
 VMAF_TARGET_LEARNING="${CONVERT_VMAF_TARGET_LEARNING:-94.0}"
+# Routing-layer compound `Movies/<lang>/Animation-Grain/` (v6.0.1P): wanime
+# params + this relaxed target. For western animation whose film grain makes
+# VMAF 94 cost more bits than the source (measured: American Pop 1981 wanime
+# @VMAF94 = 131% of source on grain-heavy reels). VMAF over-penalizes grain,
+# so ~92 is playback-equivalent to ~94 on clean content.
+VMAF_TARGET_ANIMATION_GRAIN="${CONVERT_VMAF_TARGET_ANIMATION_GRAIN:-92.0}"
 VMAF_TARGET_4K="${CONVERT_VMAF_TARGET_4K:-95.0}"  # scored with the 4K model
 VMAF_SAMPLES="${CONVERT_VMAF_SAMPLES:-3}"
 VMAF_SAMPLE_SECS="${CONVERT_VMAF_SAMPLE_SECS:-20}"

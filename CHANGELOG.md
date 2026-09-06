@@ -6,18 +6,20 @@ has the full story — what was wrong, why it mattered, and how it was fixed.
 
 ## v6.0.1P — 2026-09-06 (branch `6.x-chunk-redesign`)
 
-**Routing-layer compound buckets.** `detect_profile_for_path` now recognises
-`Movies/<lang>/Animation-Vintage/` -> `vintage` and `Animation-Classic/` ->
-`classic`. First use: the D-val survey found `wanim-classic` at VMAF target 94
-is *baseline-unfit* for American Pop (1981, Bakshi rotoscope) -- the equal-slope
-allocator baseline came out at 228% of source because the per-shot search
-prices faithfully reproducing heavy film grain that `wanime` never denoises.
-Rerouting the title to `Animation-Classic/` applies the `classic` anchor
-(`film-grain-denoise=1:film-grain=6`), so the per-shot search prices the
-*denoised* signal and AV1 FGS re-synthesizes the grain at playback. No new
-profile, no per-title override -- the compound folder reuses a proven anchor
-(the routing-layer model from the survey-expansion plan). Windows fork in
-lockstep.
+**Routing-layer compound bucket: `Animation-Grain/`.** `detect_profile_for_path`
+recognises `Movies/<lang>/Animation-Grain/` -> `wanime` params, and
+`vmaf_target_for_source` gives that path a relaxed target
+(`VMAF_TARGET_ANIMATION_GRAIN`, default 92.0). First use: the D-val survey found
+`wanim-classic` at VMAF target 94 is *baseline-unfit* for American Pop (1981,
+Bakshi rotoscope) -- the equal-slope allocator baseline hit 228% of source
+because the per-shot search prices faithfully reproducing heavy film grain.
+A/B measurement (grain-heavy reels): `wanime`@VMAF94 = 131% of source,
+`wanime`@VMAF~92 = ~65-70%; `classic`/`vintage` grain-synth profiles measured
+*worse* (159%/159%), so the reroute keeps the `wanime` line-art params and only
+relaxes the target -- VMAF over-penalizes heavy grain, ~92 there is
+playback-equivalent to ~94 on clean content, still inside the project fidelity
+ceiling. One carried adjustment, not a scattered per-title override. Windows
+fork in lockstep.
 
 ## v6.0.1O — 2026-09-06 (branch `6.x-chunk-redesign`)
 

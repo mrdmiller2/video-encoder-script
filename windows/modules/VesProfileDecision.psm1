@@ -114,8 +114,9 @@ function Get-VesDetectedProfileForPath {
     if ($pNorm -match '/Movies/Anime/') { return Get-VesAnimeProfileForPath -Path $pNorm }
     if ($pNorm -match '/Anime/') { return Get-VesAnimeProfileForPath -Path $pNorm }
     # Routing-layer compound buckets (2026-09-06) -- see ves-profile-decision.sh.
-    if ($pNorm -match '/Animation-Vintage/') { return 'vintage' }
-    if ($pNorm -match '/Animation-Classic/') { return 'classic' }
+    # Animation-Grain keeps wanime params + a relaxed VMAF target (carried in
+    # Get-VesVmafTargetForSource).
+    if ($pNorm -match '/Animation-Grain/') { return 'wanime' }
     if ($pNorm -match '/Concerts/') { return 'concert' }
     if ($pNorm -match '/Stand-Up Comedy/') { return 'standup' }
     if ($pNorm -match '/Learning Series/') { return 'learning' }

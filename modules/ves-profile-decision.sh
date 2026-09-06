@@ -247,16 +247,20 @@ detect_profile_for_path() {
     */Anime/*) anime_profile_for_path "$p"; return 0 ;;
     # Routing-layer compound buckets (2026-09-06): a title whose per-shot-search
     # BEHAVIOUR matches a different anchor than its metadata era gets moved to a
-    # "<container>-<anchor>" folder that reuses an existing proven profile -- no
-    # new numbers, no per-title override. `Animation-Classic` = animation whose
-    # encode problem is classic-era film grain (e.g. American Pop 1981, Bakshi
-    # rotoscope): the `classic` anchor's film-grain-denoise=1 lets the per-shot
-    # search price the DENOISED signal, then AV1 FGS re-synthesizes the grain --
-    # instead of `wanime` spending 2.3x source faithfully reproducing it.
-    # Checked before */Animation/* (which would otherwise never see these, but
-    # order-safe regardless -- "/Animation-Classic/" is not "/Animation/").
-    */Animation-Vintage/*) printf 'vintage'; return 0 ;;
-    */Animation-Classic/*) printf 'classic'; return 0 ;;
+    # "<container>-<modifier>" folder that reuses an existing proven profile plus
+    # ONE carried adjustment -- no scattered per-title overrides.
+    #
+    # `Animation-Grain` = western animation whose film grain makes VMAF target 94
+    # cost MORE bits than the source (e.g. American Pop 1981, Bakshi rotoscope --
+    # measured: wanime@VMAF94 = 131% of source on grain-heavy reels, allocator
+    # baseline-unfit). It keeps the `wanime` encode params (line-art tuning is
+    # still right; `classic`/`vintage` grain-synth measured *worse* here) but
+    # carries a relaxed VMAF target via vmaf_target_for_source() -- VMAF
+    # over-penalizes heavy grain, so ~92 there is playback-equivalent to ~94 on
+    # clean content and stays inside the project fidelity ceiling.
+    # Checked before */Animation/* (order-safe regardless -- "/Animation-Grain/"
+    # is not "/Animation/").
+    */Animation-Grain/*)   printf 'wanime';  return 0 ;;
     # Concerts / Stand-Up Comedy / Learning Series (2026-09-05): own libraries,
     # own profiles. Single encode profile each -- the era subfolders
     # (Vintage/Classic/Modern) exist for library organisation + the D-val

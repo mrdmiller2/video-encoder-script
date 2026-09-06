@@ -1247,6 +1247,13 @@ vmaf_target_for_source() {
   local src="$1"
   local profile
   if _source_is_uhd "$src"; then printf '%s' "$VMAF_TARGET_4K"; return; fi
+  # Routing-layer compound: `Animation-Grain/` carries a relaxed target on top
+  # of the wanime anchor (see detect_profile_for_path). VMAF over-penalizes
+  # heavy film grain, so ~92 here is playback-equivalent to ~94 on clean
+  # content. This is the one adjustment the compound bucket carries.
+  case "/${src#/}/" in
+    */Animation-Grain/*) printf '%s' "${VMAF_TARGET_ANIMATION_GRAIN:-92.0}"; return ;;
+  esac
   profile="$(profile_for_source "$src")" || return $?
   case "$profile" in
     wanime) printf '%s' "$VMAF_TARGET_WANIME" ;; anime) printf '%s' "$VMAF_TARGET_ANIME" ;;
