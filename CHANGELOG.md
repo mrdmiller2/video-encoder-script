@@ -4,6 +4,16 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.1Q — 2026-09-06 (branch `6.x-chunk-redesign`)
+
+**`shot_split_create_manifest` mass-quarantine fix.** `mkdir -- "$mdir"` (the
+atomic build-claim on `<base>_WORKING/shots`) has no `-p`, so a title whose
+`<base>_WORKING/` parent was never created fails the manifest build forever:
+exit 1 -> census sees 0 shots -> searchwalk quarantines it after 3 FELL SHORT
+(meta=0) rounds. The 60-title survey expansion mass-quarantined 17 titles in
+~3h. Fix: `mkdir -p` the PARENT dir first; the atomic claim on $mdir is
+unchanged.
+
 ## v6.0.1P — 2026-09-06 (branch `6.x-chunk-redesign`)
 
 **Routing-layer compound bucket: `Animation-Grain/`.** `detect_profile_for_path`

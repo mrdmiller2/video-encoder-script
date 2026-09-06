@@ -1077,6 +1077,17 @@ shot_split_create_manifest() {
   local mdir tmpdir dur target model n=0 prev="0.0" ts
   mdir="$(shot_manifest_dir "$src")"
   [ -f "$mdir/.complete" ] && return 0
+  # Ensure the <base>_WORKING/ parent exists. The working-set migration
+  # (dval_migrate_working.sh / prestage) normally creates it, but a title
+  # that reaches the per-shot search without that step (e.g. added straight
+  # to the D-val survey TITLES array) would otherwise fail here forever:
+  # `mkdir -- "$mdir"` has no -p, so with the parent absent it returns 1,
+  # the census sees 0 shots, and searchwalk quarantines the title after 3
+  # "FELL SHORT (meta=0)" rounds. Found live 2026-09-06: the 60-title survey
+  # expansion mass-quarantined (17 titles in 3h) for exactly this. `mkdir -p`
+  # on the PARENT only -- the `mkdir -- "$mdir"` below stays the atomic
+  # build-claim.
+  mkdir -p -- "$(dirname -- "$mdir")" 2>/dev/null || true
   if ! mkdir -- "$mdir" 2>/dev/null; then
     # Stale-build reclaim: mkdir is the atomic claim, but a builder that
     # crashes or is killed mid-scan (this is a full-file scene-detect
