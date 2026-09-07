@@ -4,6 +4,45 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.2C — 2026-09-07 (branch `6.x-chunk-redesign`)
+
+**D-val search fleet — redis admission tracker (Stage 2), shipped as an EPOCH
+cutover.** Completes the rework: the coordinator no longer counts
+`worker_loop_discovery_multi` processes over ssh *at all*. Deployed as a hard
+cutover (survey stopped, all workers/locks/caches/redis purged, whole fleet
+re-synced, then restarted) so no component runs a mix of old and new.
+
+- **Admission registry (`ves-dval-claim-lib.sh`).** New `dval_admit()` runs an
+  atomic Lua CAS on redis: prune stale registrations for `(slug,host)`, read
+  `dval:target:<slug>:<host>`, order live members by registration epoch, and
+  return **GO** (register / refresh heartbeat) or **STOP** (bow out — we are
+  past the target, youngest-first) — or **WAIT** when redis is unreachable
+  (8 s hard timeout on the `/dev/tcp` call). `dval_wreg_count()` prunes + counts.
+- **Worker (`worker_loop_discovery_multi.sh`).** Startup: `dval_admit` → STOP or
+  WAIT ⇒ `exit 0` (never run unmanaged). A 90 s beat re-asks; STOP ⇒ SIGTERM the
+  loop. A pgrep-ceiling check stays as a pre-registration / redis-blip backstop.
+- **Worker loop (`modules/ves-per-shot-qp.sh`).** `shot_search_worker_loop` now
+  re-checks admission **between shots** (≤ once/`DVAL_ADMIT_CHECK_SECS`, 60 s):
+  STOP ⇒ break cleanly, zero partial work lost. This is the graceful path; the
+  wrapper's SIGTERM beat is the backstop for a worker wedged mid-shot.
+- **Coordinator (`dval_research.sh`).** `reconcile_host()` now (1) publishes
+  `dval:target:<slug>:<host>` (self-expiring, `EX 1800`), (2) reads the live
+  **registered** count from redis — local to RANDYJ, no ssh — and (3) launches
+  only the deficit. Scale-down is just the lowered target key; excess workers
+  self-exit within a beat (`_kill_n_oldest` kept as a rare nudge). Canonical host
+  key is forwarded as `DVAL_WREG_HOST` (workers must not use `hostname -s` —
+  it's lowercase on some nodes).
+- **Reaper (`dval_claim_reaper.sh`).** Also drops `dval:target:*` / `dval:wreg:*`
+  for titles that reached a terminal gate (`searched/`, `searched-degraded/`,
+  `quarantine/`).
+- redis-ves hardening from v6.0.2B (own dir, AOF, OOM protection, watchdog
+  auto-restart) is what makes gating admission on redis safe.
+
+Cutover tooling: `dval_epoch_cutover.sh` (gitignored) — stop, purge (redis
+FLUSHALL on :6380, `*.claim`/`*.lock*`, `<base>_WORKING` local dirs, `/tmp/ves-*`
+scratch, stale `$RSCRATCH` scripts), redeploy `modules/` + survey scripts to all
+7 nodes, verify every node reports `VERSION=6.0.2C` + matching sha256s.
+
 ## v6.0.2B — 2026-09-07 (branch `6.x-chunk-redesign`)
 
 **D-val search-worker fleet management — coordinator-side safe reconcile + redis
