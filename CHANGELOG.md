@@ -4,6 +4,52 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.2B — 2026-09-07 (branch `6.x-chunk-redesign`)
+
+**D-val search-worker fleet management — coordinator-side safe reconcile + redis
+hardening (Track B Stage 0+1).** Two prior passes (v6.0.1Z, v6.0.2A) patched the
+ssh-count / kill / relaunch model and hosts *still* reached 9–19
+`worker_loop_discovery_multi.sh` for a 3–4 target. Root causes fixed here:
+
+- **Fail-open counting → fail-SAFE.** `dval_research.sh` `_launch_host_workers`
+  read the remote worker count as `_have="${_have:-0}"` — an ssh-mux blip or a
+  loaded box returned `""` → treated as **0** → a full fresh batch launched on
+  top of whatever was already running. New `_rs_count_host()` returns the integer
+  only on a clean read and **rc 1 (unknown)** on any doubt; callers then launch
+  **zero**. Worst case is "search a little slower for one tick," never a pileup.
+- **One reconcile path.** New `reconcile_host()` replaces the three independent
+  launch sites (initial loop / 18-min dynamic resize / 90-min stall relaunch),
+  each of which re-derived a target and could stack a batch when a kill silently
+  no-op'd. It is idempotent: at-target → nothing; under → top up the deficit
+  (verify + one retry); over target+1 → `_kill_n_oldest_host_workers()` trims
+  only the excess (oldest PIDs, so the current pass's fresh set survives). The
+  main loop now runs it for every host every `DVAL_RECONCILE_TICKS` (~10 min).
+  The 90-min-stall clean-slate kill is kept as a once-off safety valve.
+- **Worker self-defense on a beat, not just at startup.**
+  `worker_loop_discovery_multi.sh`'s sibling-count guard ran **once**, after ~20
+  module sources + a `find /tmp` — a 1s-staggered launch burst all passed it.
+  Now `_wl_over_ceiling()` (oldest-first seniority: keep the `DVAL_MAX_WORKERS_
+  PER_HOST` oldest, everyone past that bows out) runs at startup **and** on a
+  `DVAL_WL_SELFCHECK_SECS` (90s) background beat that SIGTERMs the worker if it
+  becomes one of the excess. Any host over ceiling — from any cause — drains
+  itself within ~90s with no coordinator ssh involved.
+- **redis-ves hardened (RANDYJ).** It had `Restart=always` but **zero
+  persistence** (`save ""`, `appendonly no`) and no OOM protection. Added: own
+  data dir `/var/lib/redis-ves` (no collision with the system redis on :6379),
+  `appendonly yes` / `appendfsync everysec` + RDB, `maxmemory 512mb` (still
+  `noeviction`); systemd drop-in `OOMScoreAdjust=-900`, `RestartSec=1`,
+  `StartLimitIntervalSec=0`, `MemoryMin=256M`. `dval_watchdog.sh` §7 now
+  `systemctl restart redis-ves` on a failed PING when it runs on the redis host
+  and only alerts a human if that did not recover it. Verified: a bounce replays
+  in-flight claims from the AOF; a running search rides it out via the existing
+  `_ves_redis`→`WAIT`→60s-retry path.
+
+`worker_loop_discovery_multi.sh` + `dval_research.sh` + `dval_watchdog.sh` are
+gitignored `orchestration/` scripts (deployed to RANDYJ + auto-scp'd to workers
+on each research launch); this commit carries version + changelog. Redis admission
+control (Stage 2) — workers self-register in an atomic redis CAS and the
+coordinator stops counting processes over ssh entirely — is the follow-up.
+
 ## v6.0.2A — 2026-09-07 (branch `6.x-chunk-redesign`)
 
 **Search-worker fork-pileup — worker-side self-defense + coordinator pre-launch
