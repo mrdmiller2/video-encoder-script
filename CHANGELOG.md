@@ -4,6 +4,26 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.2A — 2026-09-07 (branch `6.x-chunk-redesign`)
+
+**Search-worker fork-pileup — worker-side self-defense + coordinator pre-launch
+sweep.** The v6.0.1Z `dval_research.sh` hardening was not enough: hosts still
+reached 10–13 `worker_loop_discovery_multi.sh` for a 3–4 target (kill-by-pattern
+still no-ops on a flaky ssh mux; and a research killed without cleanup leaves a
+prior title's workers inflating the deficit count so the *next* title gets zero
+workers on that host and the orphans idle-loop for hours).
+
+- **`worker_loop_discovery_multi.sh`**: at startup, if `DVAL_MAX_WORKERS_PER_HOST`
+  (8) siblings are already running, exit immediately. Self-contained — no
+  dependence on the coordinator getting the kill right.
+- **`dval_research.sh`**: `kill_workers` now also runs *before* the initial
+  launch (a survey host searches one title at a time, so any worker already up
+  is a stale batch), and its kill/count use a self-match-proof `discovery''_multi`
+  split pattern + PID-loop instead of `pkill -f`.
+- Stale pre-scdet `.complete` shot manifests (Streetcar: 50 shots / 2h05m) are
+  wiped so the v6.0.1W scene-detect fix actually takes effect on re-search
+  rather than the builder short-circuiting on the old manifest.
+
 ## v6.0.1Z — 2026-09-07 (branch `6.x-chunk-redesign`)
 
 **Search-worker fork-pileup hardening (`dval_research.sh`).** The recurring
