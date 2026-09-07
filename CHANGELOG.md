@@ -4,6 +4,22 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.2H — 2026-09-07 (branch `6.x-chunk-redesign`)
+
+**The redis registration had no heartbeat -> 8+ workers/host, loadavg 80-90.**
+v6.0.2F removed `_sw_admit_ok` (the per-shot admission re-check) to stop a
+subshell hang -- but the GO path of `dval_admit` is the ONLY thing that HSETs
+`hb_epoch`. With no periodic caller, `reconcile_host`'s count-Lua evicted every
+worker after `DVAL_WREG_TTL` (240s) and relaunched a full batch every ~10-min
+sweep. Old workers never exited (nothing re-checked them). Result: TITOJ/
+JJACKSON at 8 real search workers for a target of 3, loadavg 80-90.
+
+- `modules/ves-per-shot-qp.sh` -- `_sw_admit_ok` is BACK. The 6.0.2F hang was
+  the old `$(timeout N bash -c '. lib; ...')` shape; 6.0.2F also made
+  `dval_admit` forkless (~0.12s, direct `_ves_redis` after a bounded reach
+  test), so a between-shot call (<=1/`DVAL_ADMIT_CHECK_SECS`, 60s) is cheap and
+  safe. GO refreshes the heartbeat; STOP exits a de-piled worker cleanly.
+
 ## v6.0.2G — 2026-09-07 (branch `6.x-chunk-redesign`)
 
 **Real-worker detection, done right this time: `pid == sid`.** v6.0.2E/F tried
