@@ -4,6 +4,24 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.1Z — 2026-09-07 (branch `6.x-chunk-redesign`)
+
+**Search-worker fork-pileup hardening (`dval_research.sh`).** The recurring
+9–19× `worker_loop_discovery_multi.sh` stack on a single host for one title
+(3–4 target) — reaped every pass by `dval_worker_reap.sh`'s forktree sweep but
+churning + spamming forensics — traced to the resize/kill path:
+
+- The `pkill -9 -f 'worker_loop_discovery_multi\.sh '` kill and its `pgrep -c`
+  verify are now a self-match-proof PID loop with a `discovery''_multi` split
+  pattern (+ `$$`/`$PPID` filter) — a bare `pkill -f` over ssh could match and
+  kill its own shell mid-sweep, leaving the old batch to stack under the next
+  launch. Shared `$_RS_KILL_SH` / `$_RS_COUNT_SH` snippets, used by
+  `kill_workers`, `_kill_host_workers_for_title`, and the `_launch_host_workers`
+  deficit check.
+- Resize hysteresis: a dynamic host only resizes on a worker-count delta ≥ 2,
+  so a 1-worker wobble as loadavg drifts across a threshold no longer churns
+  kill+relaunch every 18 min.
+
 ## v6.0.1Y — 2026-09-07 (branch `6.x-chunk-redesign`)
 
 **New routing-layer compound bucket `Anime/Animation-Detail/`.** Second instance
