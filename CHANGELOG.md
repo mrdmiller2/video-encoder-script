@@ -4,6 +4,34 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.2F — 2026-09-07 (branch `6.x-chunk-redesign`)
+
+**Per-shot `dval_admit` in the hot loop stranded nested command-sub subshells;
+2 more pgrep counters and the watchdog alert-key were still wrong.** v6.0.2E
+fixed the reaper and the worker's own ceiling check, but:
+
+- **`modules/ves-per-shot-qp.sh`** — the v6.0.2C per-shot admission re-check
+  (`_sw_admit_ok`) is **removed**. It ran `$(dval_admit)` →
+  `$(timeout N bash -c '. lib; _ves_redis …')` inside the shot loop; a single
+  flaky redis connect (bash `/dev/tcp` has no connect timeout, and `timeout`
+  without `-k` won't SIGKILL a stuck child) left a growing nest of
+  `bash worker_loop` command-substitution subshells (12–26/host). Scale-down
+  needs no hot-loop call: startup `_wl_admit` registers-or-exits, and
+  `reconcile_host` kills the oldest excess when `registered > target+1`.
+- **`ves-dval-claim-lib.sh`** — `dval_admit` / `dval_wreg_count` no longer fork
+  `bash -c '. lib; …'`; they gate on a bounded throwaway connect test
+  (`timeout 2 bash -c 'exec 9<>/dev/tcp/…'`) then call `_ves_redis` **directly**
+  in the current shell. ~0.12 s on success, ~0.12 s to WAIT when redis is down.
+- **`ves_fleet_monitor.sh`** — its `SWK` "stacked search workers" count was
+  `ps … && $1(ppid)==1` — an orphaned heartbeat subshell (reparented to init)
+  passed it. Now filters on `DVAL_WORKER_PID` too; `VESM_MAX_WORKERS_PER_HOST`
+  raised 6 → 12 (genuine-runaway backstop only — redis admission holds the line).
+- **`dval_watchdog.sh`** — §9b/§9c called `_alert` with `ves_fleet_monitor.sh`'s
+  `(KEY, message)` arg order; this watchdog's `_alert` is `(message, KEY)`, so
+  the changing sentence ("N worker crash bundles…") became the filename → a new
+  uncleared `ALERT.N_worker_crash_abort…` every distinct N. Fixed both calls;
+  `worker-crash-rate` / `worker-forensics-backlog` added to `_wd_owned`.
+
 ## v6.0.2E — 2026-09-07 (branch `6.x-chunk-redesign`)
 
 **`forktree_Nx` false positives — stop counting a worker's own subshells as
