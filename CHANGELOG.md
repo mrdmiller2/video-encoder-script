@@ -4,6 +4,25 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.2I — 2026-09-07 (branch `6.x-chunk-redesign`)
+
+**Grain encodes: 24 h cap, but stall-gated.** Film-grain synthesis
+(`film-grain=N>0` / `film-grain-denoise`) is 5-20x slower than a plain encode;
+a single grain variant over a feature runs 6-14 h and a full 8-variant title
+24 h+ (American Pop, An American in Paris kept hitting the old 4 h wall). The
+fix is not a bigger blind wall -- it is progress-gating.
+
+- `dval_worker_encode.sh`: detect grain (CAT `*grain*` or svtp `film-grain=[1-9]`).
+  Grain -> `_WORKER_MAX_SECS` 24 h (non-grain raised 4 h -> 6 h), per-variant cap
+  `min(dur*30, 43200)` (was `min(dur*8, 14400)`). NEW **STALL detector** in the
+  heartbeat: real progress = the current variant's `.ivf` growing OR a new
+  scored variant line; no movement for `DVAL_ENCODE_STALL_MIN` (45 min) => hung
+  encoder => TERM regardless of the cap.
+- `dval_worker_reap.sh`: `ENCODE_MAX_HRS` 10->12, grain 27 h; the
+  `encode_hard_overage` (6 h) reap now exempts grain and requires
+  `! _encode_progressing`. `_encode_progressing` also checks `.ivf` mtime
+  (a grain variant touches nothing else for hours).
+
 ## v6.0.2H — 2026-09-07 (branch `6.x-chunk-redesign`)
 
 **The redis registration had no heartbeat -> 8+ workers/host, loadavg 80-90.**
