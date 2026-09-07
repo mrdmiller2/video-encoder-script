@@ -4,6 +4,30 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.2J — 2026-09-07 (branch `6.x-chunk-redesign`)
+
+**Dynamic per-title encode-time budget.** The flat "grain=24h / else 6h" split
+(v6.0.2I) is replaced by `estimate_encode_budget()` (in
+`modules/ves-vmaf-crf-search.sh`), which models the actual cost drivers:
+
+    per_variant ~= duration x effort / effective_parallelism
+    effort  = base x grain_factor(film-grain=N, denoise) x resolution
+                   x detail_factor x motion_factor   (from the search-phase
+                   shot .meta -- cx_detail / cx_motion, already measured)
+                   x profile_factor  (anime/learning 0.55-0.7, vintage 1.15, ...)
+    eff_par = min(nproc, svt_lp) x clamp(1 - load1/nproc, 0.15, 1)
+
+    worker_cap  = clamp(per_variant x n_variants x 1.15 x 2.0,  2h, 30h)
+    variant_cap = clamp(per_variant x 3,                        30m, 14h)
+
+Examples: modern anime episode ~1.5h, clean 1080p movie ~3-5h, light-grain
+vintage (`film-grain=6`) ~8h, heavy-grain feature (`film-grain=12`) ~30h, and a
+slammed host stretches all of them. Env `DVAL_ENCODE_WORKER_MAX_SECS` /
+`DVAL_VARIANT_MAX_SECS` still override. `dval_worker_encode.sh` computes it once
+at launch; the STALL detector (no `.ivf` growth for 45 min) remains the real
+hang guard. `dval_worker_reap.sh` age backstops raised to sit above the 30h
+worker ceiling.
+
 ## v6.0.2I — 2026-09-07 (branch `6.x-chunk-redesign`)
 
 **Grain encodes: 24 h cap, but stall-gated.** Film-grain synthesis

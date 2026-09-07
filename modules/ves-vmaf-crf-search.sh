@@ -1274,6 +1274,65 @@ fixed_crf_for() {
   profile_fixed_crf "$1" "$2" "$3"
 }
 
+# estimate_encode_budget -- dynamic per-title wall-clock budget for the D-val
+# final-encode worker. Replaces the flat "grain=24h / else 6h" split. Models
+# the dominant cost drivers and clamps hard; the encode worker's STALL detector
+# (no .ivf growth for N min) is the real hang guard -- this is just "no sane
+# estimate is anywhere near this long".
+#
+#   $1 src  $2 dur_sec  $3 profile  $4 svtp  $5 nproc  $6 load1  $7 manifest_dir  $8 n_variants
+#   -> "<worker_max_secs> <variant_max_secs> <one-line rationale>"
+estimate_encode_budget() {
+  local src="$1" dur="${2:-3600}" prof="$3" svtp="$4" ncpu="${5:-8}" load="${6:-0}" mdir="$7" nvar="${8:-8}"
+  [ "$ncpu" -ge 1 ] 2>/dev/null || ncpu=8
+  local base_rt="${DVAL_ENCODE_BASE_RT:-2.0}"   # CPU-wall sec / video sec, preset-5 1080p clean, per lp-core
+
+  # grain synthesis -- the biggest lever
+  local fg fgd gfac
+  fg="$(printf '%s' "$svtp" | sed -nE 's/.*film-grain=([0-9]+).*/\1/p')"; fg="${fg:-0}"
+  fgd=0; case "$svtp" in *film-grain-denoise=1*) fgd=1 ;; esac
+  gfac="$(awk -v n="$fg" -v d="$fgd" 'BEGIN{f=1+n*0.28; if(d)f*=1.4; printf "%.2f", f}')"
+
+  # resolution
+  local rfac=1.0
+  if declare -F _source_is_uhd >/dev/null 2>&1 && _source_is_uhd "$src" 2>/dev/null; then rfac=3.0; fi
+
+  # content complexity from the search-phase shot .meta (already computed once,
+  # per title). detail ~ grain/texture load; motion ~ inter-frame work.
+  local cx cxd cxm dfac mfac
+  cx="$(awk -F= '/^cx_detail=/{d+=$2;nd++} /^cx_motion=/{m+=$2;nm++}
+        END{printf "%.3f %.3f",(nd?d/nd:5.5),(nm?m/nm:3.0)}' "$mdir"/shot-*.meta 2>/dev/null)"
+  cxd="${cx%% *}"; cxm="${cx##* }"
+  dfac="$(awk -v x="${cxd:-5.5}" 'BEGIN{f=x/5.5; if(f<0.6)f=0.6; if(f>2.0)f=2.0; printf "%.2f", f}')"
+  mfac="$(awk -v x="${cxm:-3.0}" 'BEGIN{f=x/3.0; if(f<0.7)f=0.7; if(f>1.8)f=1.8; printf "%.2f", f}')"
+
+  # profile effort tier
+  local pfac=1.0
+  case "$prof" in
+    anime|wanime|canime) pfac=0.7 ;;
+    vintage|classic)     pfac=1.15 ;;
+    concert|standup)     pfac=0.90 ;;
+    learning)            pfac=0.55 ;;
+  esac
+
+  # effective parallel throughput -- SVT tile parallelism tops out; a loaded
+  # host delivers less.
+  local lp derate
+  lp="${DVAL_SVT_LP:-$ncpu}"; [ "$lp" -gt "$ncpu" ] 2>/dev/null && lp="$ncpu"
+  [ "$lp" -ge 1 ] 2>/dev/null || lp=4
+  derate="$(awk -v l="$load" -v n="$ncpu" 'BEGIN{d=1-l/n; if(d<0.15)d=0.15; if(d>1)d=1; printf "%.3f", d}')"
+
+  local per_var total wmax vmax mult par
+  mult="$(awk -v b="$base_rt" -v g="$gfac" -v r="$rfac" -v df="$dfac" -v mf="$mfac" -v pf="$pfac" 'BEGIN{printf "%.2f", b*g*r*df*mf*pf}')"
+  par="$(awk -v lp="$lp" -v de="$derate" 'BEGIN{p=lp*de; if(p<1)p=1; printf "%.2f", p}')"
+  per_var="$(awk -v dur="$dur" -v m="$mult" -v p="$par" 'BEGIN{printf "%d", dur*m/p}')"
+  total="$(awk -v pv="$per_var" -v nv="$nvar" 'BEGIN{printf "%d", pv*nv*1.15}')"     # +vmaf/mux
+  wmax="$(awk -v t="$total" -v s="${DVAL_ENCODE_BUDGET_SAFETY:-2.0}" 'BEGIN{w=t*s; if(w<7200)w=7200; if(w>108000)w=108000; printf "%d", w}')"   # 2h .. 30h
+  vmax="$(awk -v pv="$per_var" 'BEGIN{v=pv*3; if(v<1800)v=1800; if(v>50400)v=50400; printf "%d", v}')"                                          # 30m .. 14h
+  printf '%s %s [dur=%ss mult=%s(g%s r%s d%s m%s p%s) par=%s -> per_var~%ss total~%ss]\n' \
+    "$wmax" "$vmax" "${dur%.*}" "$mult" "$gfac" "$rfac" "$dfac" "$mfac" "$pfac" "$par" "$per_var" "$total"
+}
+
 # One sample-encode + VMAF score. Prints "vmaf bytes". Messages go to stderr.
 # v5.0.29: encodes the probe with the SAME profile-specific svtav1-params /
 # x265-params the final encode will use (via svtav1_profile_extras), not just
