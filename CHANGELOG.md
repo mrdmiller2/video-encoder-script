@@ -4,6 +4,23 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.1Y — 2026-09-07 (branch `6.x-chunk-redesign`)
+
+**New routing-layer compound bucket `Anime/Animation-Detail/`.** Second instance
+of the `Animation-Grain` pattern: an anime title whose per-shot search proves it
+cannot beat its source efficiently — base encode already at/under the anime VMAF
+target (94), every equal-slope FRACTION baseline-unfit, VMAF-vs-size curve
+near-vertical. Clean flat digital animation with fine gradients is where VMAF is
+pessimistic (banding penalty), the same over-penalty class grain sits in. Keeps
+the `anime` encode anchor; carries one adjustment — a relaxed target
+`VMAF_TARGET_ANIMATION_DETAIL` (92.0). Wired in `ves-profile-decision.sh`,
+`ves-vmaf-crf-search.sh`, `VesProfileDecision.psm1`, `VesVmafCrfSearch.psm1`.
+Seed / first occupant: **A Few Moments of Cheers (2024)** — base VMAF 91.44 @
+23 % of source, A_pershot 92.57 @ 56 % — moved out of `Anime/Modern (2003+)/` and
+its D-val cohort retagged `anime-modern` → `anime-detail` (mirrors the
+`wanim-classic` → `grain-wanim` reroute of American Pop; source cohort left at
+N=4, backfill deferred).
+
 ## v6.0.1X — 2026-09-07 (branch `6.x-chunk-redesign`)
 
 **D-val survey worker garbage-collection / termination overhaul.** Fleet hosts

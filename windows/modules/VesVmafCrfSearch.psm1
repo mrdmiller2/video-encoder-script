@@ -255,9 +255,13 @@ function Get-VesVmafTargetForSource {
     if (Test-VesSourceIsUhd -Source $Source -FfprobePath $FfprobePath) {
         return [double]($env:CONVERT_VMAF_TARGET_4K    ? $env:CONVERT_VMAF_TARGET_4K    : 95.0)
     }
-    # Routing-layer compound: Animation-Grain carries a relaxed target on wanime.
+    # Routing-layer compounds: Animation-Grain (wanime) / Animation-Detail (anime)
+    # each carry a relaxed target on top of their anchor.
     if (($Source -replace '\\','/') -match '/Animation-Grain/') {
         return [double]($env:CONVERT_VMAF_TARGET_ANIMATION_GRAIN ? $env:CONVERT_VMAF_TARGET_ANIMATION_GRAIN : 92.0)
+    }
+    if (($Source -replace '\\','/') -match '/Animation-Detail/') {
+        return [double]($env:CONVERT_VMAF_TARGET_ANIMATION_DETAIL ? $env:CONVERT_VMAF_TARGET_ANIMATION_DETAIL : 92.0)
     }
     if (-not $Profile) { $Profile = Get-VesDetectedProfileForPath -Path $Source }
     $def = 94.0

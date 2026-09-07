@@ -124,6 +124,10 @@ function Get-VesDetectedProfileForPath {
     # Anime/Modern (2003+) -- so a human filing new media sees the boundary.
     # Both parenthesised and bare names match (transition-safe). Folder
     # authoritative; name-year fallback covers anything not yet moved.
+    # Routing-layer compound (2026-09-07): Anime/Animation-Detail = anime that
+    # can't beat its source; keeps 'anime' params + a relaxed VMAF target
+    # (Get-VesVmafTargetForSource). See ves-profile-decision.sh.
+    if ($pNorm -match '/Anime/Animation-Detail/') { return 'anime' }
     if ($pNorm -match '/Anime/(Vintage|Classic)( \([^)]*\))?/') { return 'canime' }
     if ($pNorm -match '/Anime/Modern( \([^)]*\))?/') { return 'anime' }
     if ($pNorm -match '/Movies/Anime/') { return Get-VesAnimeProfileForPath -Path $pNorm }

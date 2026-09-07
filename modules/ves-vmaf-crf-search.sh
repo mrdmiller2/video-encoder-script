@@ -1252,7 +1252,10 @@ vmaf_target_for_source() {
   # heavy film grain, so ~92 here is playback-equivalent to ~94 on clean
   # content. This is the one adjustment the compound bucket carries.
   case "/${src#/}/" in
-    */Animation-Grain/*) printf '%s' "${VMAF_TARGET_ANIMATION_GRAIN:-92.0}"; return ;;
+    */Animation-Grain/*)  printf '%s' "${VMAF_TARGET_ANIMATION_GRAIN:-92.0}";  return ;;
+    # anime that can't beat its source (see detect_profile_for_path): VMAF
+    # over-penalizes clean flat digital animation the way it does grain.
+    */Animation-Detail/*) printf '%s' "${VMAF_TARGET_ANIMATION_DETAIL:-92.0}"; return ;;
   esac
   profile="$(profile_for_source "$src")" || return $?
   case "$profile" in

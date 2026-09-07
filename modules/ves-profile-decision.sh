@@ -250,6 +250,16 @@ detect_profile_for_path() {
     # Folder is authoritative; the name-year fallback (anime_profile_for_path,
     # also <=2002) covers anything not yet moved. Both the parenthesised names
     # and the bare Vintage/Classic/Modern are matched (transition-safe).
+    # Routing-layer compound (2026-09-07): `Anime/Animation-Detail/` = anime that
+    # per-shot search proves cannot beat its source efficiently -- base encode is
+    # already at/under target and every equal-slope FRACTION is baseline-unfit
+    # (VMAF-vs-size curve near-vertical). Clean flat digital animation with fine
+    # gradients is where VMAF is pessimistic (banding penalty), the same class of
+    # over-penalty `Animation-Grain` carries for grain. Keeps the `anime` encode
+    # anchor; the one carried adjustment is a relaxed VMAF target (see
+    # vmaf_target_for_source). Checked before the era buckets. Seed: A Few
+    # Moments of Cheers (2024) -- base VMAF 91.44 @ 23% src, A_pershot 92.57 @ 56%.
+    */Anime/Animation-Detail/*) printf 'anime'; return 0 ;;
     */Anime/Vintage\ \(*|*/Anime/Vintage/*|*/Anime/Classic\ \(*|*/Anime/Classic/*) printf 'canime'; return 0 ;;
     */Anime/Modern\ \(*|*/Anime/Modern/*) printf 'anime'; return 0 ;;
     */Movies/Anime/*) anime_profile_for_path "$p"; return 0 ;;

@@ -6,7 +6,7 @@
 # MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
 # bug fix) -- see its own comment.
 
-VERSION="6.0.1X"
+VERSION="6.0.1Y"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
 # as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
@@ -553,6 +553,13 @@ VMAF_TARGET_LEARNING="${CONVERT_VMAF_TARGET_LEARNING:-94.0}"
 # @VMAF94 = 131% of source on grain-heavy reels). VMAF over-penalizes grain,
 # so ~92 is playback-equivalent to ~94 on clean content.
 VMAF_TARGET_ANIMATION_GRAIN="${CONVERT_VMAF_TARGET_ANIMATION_GRAIN:-92.0}"
+# Routing-layer compound `Anime/Animation-Detail/` (v6.0.1X): `anime` params +
+# this relaxed target. For anime that per-shot search proves cannot beat its
+# source -- base already at/under target, every equal-slope FRACTION baseline-
+# unfit (VMAF-vs-size near-vertical). Clean flat digital animation with fine
+# gradients is where VMAF is pessimistic (banding penalty), same over-penalty
+# class as grain. Seed: A Few Moments of Cheers (2024), base VMAF 91.44 @ 23% src.
+VMAF_TARGET_ANIMATION_DETAIL="${CONVERT_VMAF_TARGET_ANIMATION_DETAIL:-92.0}"
 VMAF_TARGET_4K="${CONVERT_VMAF_TARGET_4K:-95.0}"  # scored with the 4K model
 VMAF_SAMPLES="${CONVERT_VMAF_SAMPLES:-3}"
 VMAF_SAMPLE_SECS="${CONVERT_VMAF_SAMPLE_SECS:-20}"
