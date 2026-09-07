@@ -4,6 +4,43 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.2D — 2026-09-07 (branch `6.x-chunk-redesign`)
+
+**Capacity-aware fleet host selection.** The post-cutover All About Eve scdet
+manifest build landed on **TITOJ** (i9-9980HK laptop, weakest node) while
+**JJACKSON** (Ryzen 9 7940HS) sat idle — `dval_searchwalk.sh` picked by
+`min(integer-truncated 1-min loadavg)` over 4 hosts; TITOJ read `2`, won, then
+load-bombed itself to 16 with the 780%-CPU pass. Same crude signal in encode
+dispatch (`ENCODE_POOL` list order) and `dval_dynamic_worker_count` (fixed
+load/mem tiers, no hardware term).
+
+- **`dval_calibrate.sh`** (new, gitignored) — times a fixed all-core SVT-AV1
+  encode of a locally-generated clip on each fleet node (best of 2, niced),
+  `weight = CAL_K / seconds`, into `state/host_calibration.tsv`. Skips a host
+  whose `load1/nproc > 0.6` (a starved encode measures scraps) and falls back to
+  a CPU-model hint × nproc; re-runnable, `--host <name>` for one. First run:
+  JJACKSON 200, MARLONJ(M2 Max) 249, AI-PROCESSOR 130, LAYTOYAJ 109, TITOJ 96
+  (est), MJACKSON 384 (est — was slammed).
+- **`dval_paths.sh`** — `dval_host_score(host,nproc,load1,memfrac)` =
+  `weight × clamp(1 − load1/nproc, 0, 1)`, mem-gated (`<0.08` free ⇒ 0). A
+  strong-but-slammed box scores ~0; a weak-but-idle box wins.
+  `dval_rank_hosts(spec…)` probes each host once (load/nproc/memfrac in one
+  ssh), scores, sorts, then **re-checks the winner** and demotes it if its load
+  spiked below #2. Live: JJACKSON 173 > AI-PROCESSOR 102 > LAYTOYAJ 96 > TITOJ
+  20; slammed MJACKSON 0.
+- **`dval_dynamic_worker_count`** — replaces the fixed 4/2/1/0 tiers with
+  `round((nproc − load1) / DVAL_CORES_PER_SEARCH_WORKER)` (default 4), capped at
+  the per-host ceiling, memory still hard-gating. A 32-thread box at load 8 now
+  gets 6 workers where the old tiers capped it at 4; a 16-thread box at the same
+  load gets 2.
+- **Wiring** — `dval_searchwalk.sh` manifest picker and `dval_dispatch.sh`
+  encode assignment both iterate `dval_rank_hosts` best-first (falling to the
+  next candidate on failure) instead of loadavg-min / pool order.
+
+Coordinator-only change (no worker protocol / redis schema change);
+`dval_paths.sh` still deployed fleet-wide to keep the epoch aligned. Version +
+changelog carried here; the four scripts are gitignored `orchestration/`.
+
 ## v6.0.2C — 2026-09-07 (branch `6.x-chunk-redesign`)
 
 **D-val search fleet — redis admission tracker (Stage 2), shipped as an EPOCH
