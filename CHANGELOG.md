@@ -4,6 +4,23 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.2G — 2026-09-07 (branch `6.x-chunk-redesign`)
+
+**Real-worker detection, done right this time: `pid == sid`.** v6.0.2E/F tried
+`DVAL_WORKER_PID` env then PPID==1. Both fail: `export` runs post-`exec` so it's
+not in the worker's own `/proc/PID/environ`, a *forked* subshell shares the
+parent's `/proc/environ` image, and an orphaned subshell is reparented to PPID 1.
+A real search worker is launched `setsid nohup … bash worker_loop_discovery_multi.sh`
+→ it is a **session leader**, `pid == sid`; every subshell it forks shares the
+session. Verified live: `pid==sid` count == `dval:wreg:*` HLEN on every host
+(LAYTOYAJ 4/4, TITOJ 3/3, JJACKSON 3/3, MJACKSON 0/0).
+
+- `worker_loop_discovery_multi.sh` `_dval_is_real_worker`, `dval_worker_reap.sh`
+  forktree accounting, `ves_fleet_monitor.sh` `SWK` — all switched to
+  `ps -o sid`. `DVAL_WORKER_PID` removed.
+- macOS `ps` has no `sid` column → MARLONJ's count reads 0 → the pgrep/forktree
+  backstops no-op there (fail-safe; the redis registry manages MARLONJ correctly).
+
 ## v6.0.2F — 2026-09-07 (branch `6.x-chunk-redesign`)
 
 **Per-shot `dval_admit` in the hot loop stranded nested command-sub subshells;
