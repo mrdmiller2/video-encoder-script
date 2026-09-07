@@ -4,6 +4,35 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.1V — 2026-09-07 (branch `6.x-chunk-redesign`)
+
+**Concerts + Stand-Up Comedy re-bucketed to production-transition era tiers**
+(same rationale as the TV change):
+
+    Concerts/          Vintage (<=1989)   Classic (1990-2004)   Modern (2005+)
+                       35mm concert-film   pro-video / SD         HD digital multi-cam
+    Stand-Up Comedy/   Vintage (<=1989)   Classic (1990-2007)   Modern (2008+)
+                       film + early video  SD video specials     HD / Netflix era
+
+Movies keep `Vintage (<=1958)` / `Classic (1959-1997)` / `Modern (1998+)` — those
+already track New Hollywood (1959) and the Digital Intermediate era (1998).
+`_LIBRARY-SCHEME.txt` dropped at every library root (Movies, TV, Anime, Concerts,
+Stand-Up) documenting the tiers + the transition each boundary marks — the scheme
+now lives next to the folders.
+
+**B&W detection reworked from a mean to a full-runtime fraction.** The old
+`is_bw` took the mean SATAVG of 15 sparse probe windows — a modern title with a
+long B&W flashback / historical sequence could false-positive, and it couldn't
+tell a uniformly-desaturated grade from a bimodal B&W-reels + colour-reels title.
+Now: a title is `is_bw=1` only if the **duration-weighted greyscale fraction** of
+its runtime `>= SOURCE_TRAITS_BW_FRACTION_MIN` (0.90). The manifest build
+aggregates per-shot `cx_sat` (already computed) into `bw_frac` in
+`manifest.meta` — whole runtime, shot-accurate, zero extra cost — and that
+overrides the sparse probe when present (Gun Crazy 1950 -> 1.0000, Akira -> 0.06).
+`is_bw` stays per-FILE and folder-independent (a mis-filed B&W title still
+encodes B&W). Standalone-probe rework + a calibration harness are speced in
+`docs/bw_detection_plan_20260907.md`.
+
 ## v6.0.1U — 2026-09-06 (branch `6.x-chunk-redesign`)
 
 **Television gains a proper 3-tier era scheme**, aligned to the two hard

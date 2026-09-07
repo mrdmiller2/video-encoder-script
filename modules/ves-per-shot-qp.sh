@@ -1217,6 +1217,24 @@ EOF
     [[ "$_st" =~ is_bw=([01]) ]] && _bw="${BASH_REMATCH[1]}"
   fi
 
+  # B&W: duration-weighted greyscale FRACTION across every shot we just wrote
+  # (cx_sat is the per-shot mean SATAVG). This is the whole runtime, shot by
+  # shot -- so a modern title with a B&W flashback reads (correctly) as mostly
+  # colour, and a B&W film with a short colour insert still reads as B&W. When
+  # we have this it OVERRIDES the sparse multi-window detect_source_traits guess.
+  local _bw_frac=""
+  _bw_frac="$(cat "$tmpdir"/shot-*.meta 2>/dev/null | awk -F= -v smax="${SOURCE_TRAITS_BW_SATAVG_MAX:-4.0}" '
+      function flush(){ if (havee && d>0){ tot+=d; if(greyf) grey+=d } }
+      /^index=/     { flush(); s=""; e=""; d=0; havee=0; greyf=0 }
+      /^start_ts=/  { s=$2 }
+      /^end_ts=/    { e=$2; if (s!="") { d=e-s; havee=1 } }
+      /^cx_sat=/    { if ($2!="" && $2+0<=smax) greyf=1 }
+      END          { flush(); if (tot>0) printf "%.4f", grey/tot }
+    ')"
+  if [ -n "$_bw_frac" ]; then
+    awk -v f="$_bw_frac" -v m="${SOURCE_TRAITS_BW_FRACTION_MIN:-0.90}" 'BEGIN{exit !(f>=m)}' && _bw=1 || _bw=0
+  fi
+
   cat >"${tmpdir}/manifest.meta" <<EOF
 source=$src
 shot_count=$n
@@ -1226,6 +1244,7 @@ target=$target
 model=$model
 field_mode=$_fm
 is_bw=$_bw
+bw_frac=${_bw_frac:-}
 created_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 created_host=$(hostname 2>/dev/null || echo unknown)
 EOF

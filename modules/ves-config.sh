@@ -6,7 +6,7 @@
 # MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
 # bug fix) -- see its own comment.
 
-VERSION="6.0.1U"
+VERSION="6.0.1V"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
 # as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
@@ -830,7 +830,18 @@ SOURCE_TRAITS_TELECINE_REPEAT_MIN=0.12 # avg repeated-field ratio in [MIN,MAX] -
 SOURCE_TRAITS_TELECINE_REPEAT_MAX=0.30
 SOURCE_TRAITS_INTERLACE_MIN=0.10       # avg interlaced-frame ratio >= this (repeat ratio out of telecine band) -> interlaced (deinterlace)
 SOURCE_TRAITS_WINDOW_SPREAD_MAX=0.25   # max-min progressive ratio across sample windows above this -> ambiguous, never guess
-SOURCE_TRAITS_BW_SATAVG_MAX=4.0        # avg signalstats SATAVG at/below this -> classified black-and-white
+# B&W classification. Two signals, fraction-based (2026-09-07):
+#   - a frame/shot is "greyscale" if its signalstats SATAVG <= SATAVG_MAX
+#   - a TITLE is is_bw=1 iff the greyscale FRACTION of runtime >= BW_FRACTION_MIN
+# Fraction (not a mean) so a modern title with a long B&W flashback / historical
+# sequence is NOT misclassified, and a mostly-B&W film with a short colour
+# insert (Schindler's List red coat / colour coda, Wizard of Oz) still is.
+# Preferred source: per-shot cx_sat across the whole manifest (bw_frac in
+# manifest.meta -- shot-accurate, full runtime, free). Fallback: the multi-
+# window source-traits probe (now also fraction-based, denser sampling).
+SOURCE_TRAITS_BW_SATAVG_MAX=4.0        # per-sample SATAVG at/below this -> that sample is greyscale
+SOURCE_TRAITS_BW_FRACTION_MIN="${CONVERT_BW_FRACTION_MIN:-0.90}"  # >= this fraction of runtime greyscale -> is_bw=1
+SOURCE_TRAITS_BW_PROBE_WINDOWS="${CONVERT_BW_PROBE_WINDOWS:-30}"  # standalone-probe sample count (was 15)
 
 # Source frame-rate mode (CFR/VFR) + baseline self-VMAF. Added 2026-08-13
 # after the VMAF-VFR false-positive bug (v5.1.0S/T): that bug was only
