@@ -1527,7 +1527,23 @@ shot_search_worker_loop() {
       && dval_heartbeat "$_slug" "$1" "$VES_CLAIM_OWNER" || exit 0; done; }
   fi
   _shot_scratch_sweep
+  # Survey pause/terminate + lifetime cap (2026-09-07). Before this a search
+  # worker ran until the manifest resolved or it idled out (7h) -- a paused
+  # survey left every in-flight search worker grinding, and a wedged shot search
+  # with no encoder child evaded the reaper's log-mtime gate. Now the loop
+  # checks SURVEY-STOPPED every iteration and self-exits after
+  # DVAL_SEARCH_WORKER_MAX_SECS (default 6h) regardless.
+  local _sw_t0="$SECONDS"
+  local _sw_max="${DVAL_SEARCH_WORKER_MAX_SECS:-21600}"
+  local _sw_stopf="${DVAL_SHARED_DIR:-}/SURVEY-STOPPED"
+  _sw_stopped(){ [ -n "${DVAL_SHARED_DIR:-}" ] && [ -f "$_sw_stopf" ] && cat "$_sw_stopf" >/dev/null 2>&1; }
   while [ "$count" -lt "$max_shots" ]; do
+    if _sw_stopped; then
+      echo "shot-search: SURVEY-STOPPED present -- worker exiting cleanly (processed $count)"; break
+    fi
+    if [ $(( SECONDS - _sw_t0 )) -gt "$_sw_max" ]; then
+      warn "shot-search: worker lifetime cap ${_sw_max}s reached on $(hostname 2>/dev/null || echo '?') -- exiting (processed $count)"; break
+    fi
     idx="$(shot_claim_next "$src")"; claim_rc=$?
     if [ "$claim_rc" -eq 2 ]; then
       warn "shot-search: claim backend unreachable -- pausing ${retry_wait}s"

@@ -4,6 +4,43 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.1X — 2026-09-07 (branch `6.x-chunk-redesign`)
+
+**D-val survey worker garbage-collection / termination overhaul.** Fleet hosts
+(LAYTOYAJ, TITOJ) kept ending up with orphaned/wedged workers burning cycles —
+especially after the survey was paused or a title terminated. Root causes and
+fixes:
+
+- **Workers ignored `SURVEY-STOPPED`.** An in-flight `dval_worker_encode.sh` ran
+  its full base-search + 8 variants regardless of a pause; `shot_search_worker_loop`
+  ran until the manifest resolved or a 7 h idle-out. LAYTOYAJ ground on a
+  quarantined title for 6.5 h *after* the pause. Now both poll the stop flag —
+  encode worker at startup, every variant boundary, and on a 60 s heartbeat;
+  search loop every iteration — and exit cleanly, resume-safe.
+- **No wall-clock cap anywhere.** Added: per-variant timeout
+  (`DVAL_VARIANT_MAX_SECS`, duration-aware ≈ 8× realtime, 2× for UHD) that kills
+  the variant's whole process group and moves on; a 4 h encode-worker lifetime
+  cap (`DVAL_ENCODE_WORKER_MAX_SECS`); a 6 h search-worker lifetime cap
+  (`DVAL_SEARCH_WORKER_MAX_SECS`).
+- **`kill -TERM <script-pid>` did nothing mid-encode** — bash defers the trap
+  until the foreground pipeline exits (i.e. never, for a wedged variant). The
+  encode pipeline now runs as its own process group; the abort trap and the
+  timeout watchdog kill the group (+ tree-walk + `-b $WORK/` sweep fallback).
+- **Reaper trusted a moving log.** `dval_worker_reap.sh` vetoed reaping any
+  worker with a live encoder child + fresh `encode.log` — a pathological grain
+  reel / NFS D-state crawls for hours doing exactly that. Added a hard-age tier
+  (`DVAL_ENCODE_HARD_MAX_HRS`, 6 h) that reaps regardless, with forensics.
+- **Reaper had no pause awareness.** New stop-sweep (§0): `SURVEY-STOPPED`
+  present > `DVAL_STOP_GRACE_MIN` (8 min) → bundle + kill every survey worker on
+  the host + clear scratch/locks.
+- **Dispatch reassignment left the losing host running.** The stale-title
+  hand-off now sends `TERM` to the worker's process group, waits ≤ 6 s for its
+  flush-and-free, then `KILL`s the group and removes the lockdir (was a single
+  bare `kill -TERM <pid>`).
+
+Also: `dval_prestage.sh` TITLES array (all 74 entries were stale pre-era-rename
+paths → every pass a no-op) regenerated from `dval_searchwalk.sh`.
+
 ## v6.0.1W — 2026-09-07 (branch `6.x-chunk-redesign`)
 
 **Scene detection swapped to the dedicated `scdet` filter + under-segmentation
