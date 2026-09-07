@@ -4,6 +4,32 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.2E — 2026-09-07 (branch `6.x-chunk-redesign`)
+
+**`forktree_Nx` false positives — stop counting a worker's own subshells as
+workers.** After the v6.0.2C epoch the redis admission registry (`dval:wreg:*`)
+held the correct counts (LAYTOYAJ 4/4, MJACKSON 7/7, …) but the fleet still
+generated 15–28 `worker-crash-rate` alerts/hr. Cause: a real search worker forks
+bash subshells that inherit its argv and so match
+`pgrep -f worker_loop_discovery_multi.sh` — the per-shot redis-lease heartbeat
+(`_dval_hb_bg`), every `$(dval_admit …)` command-substitution, and (v6.0.2C's
+addition) a persistent admission "beat". `dval_worker_reap.sh`'s `forktree_Nx`
+counter and `worker_loop_discovery_multi.sh`'s `_wl_over_ceiling` counted all of
+them, tripped at 2–4 real workers (12–22 processes), and the forktree kill —
+"keep the youngest N" — then removed the **oldest**, i.e. the actual workers,
+leaving the subshells. `dval_research` relaunched, redis churned.
+
+- **`worker_loop_discovery_multi.sh`**: `export DVAL_WORKER_PID=$$` before
+  anything forks — a real worker has `DVAL_WORKER_PID == own pid` in its environ,
+  a subshell inherits the parent's. `_wl_over_ceiling` counts only those (PPID==1
+  fallback when environ is unreadable). **The background admission beat is
+  removed** — it was the extra persistent subshell and it duplicated what
+  `shot_search_worker_loop` already does between shots (`_sw_admit_ok`, clean
+  exit on STOP, no mid-shot kill).
+- **`dval_worker_reap.sh`**: `forktree_Nx` accounting uses the same
+  `DVAL_WORKER_PID` test. It is now a true backstop — the redis registry is the
+  authoritative worker count.
+
 ## v6.0.2D — 2026-09-07 (branch `6.x-chunk-redesign`)
 
 **Capacity-aware fleet host selection.** The post-cutover All About Eve scdet
