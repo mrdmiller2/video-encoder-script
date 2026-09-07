@@ -4,6 +4,30 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.1U — 2026-09-06 (branch `6.x-chunk-redesign`)
+
+**Television gains a proper 3-tier era scheme**, aligned to the two hard
+production transitions instead of a collection artifact:
+
+    Television/<Country>/   Vintage (<=1965)   Classic (1966-2003)   Modern (2004+)
+                            B&W -> colour       colour SD 4:3          SD -> HD 16:9
+
+TV was 2-tier before (`Vintage (<=1989)` / `Modern (1990+)`) with the old bucket
+mis-named "Vintage" while holding mostly 1959-1989 *classic*-era content, and no
+`Classic` tier at all. Now: **≤1965** = the B&W→colour line (mostly B&W, restore-
+heavy — `is_bw` optimisation land); **1966-2003** = colour standard-def broadcast
+masters; **2004+** = HD 16:9 (most scripted shows got HD masters ~2004-2008).
+`Classic` and `Modern`/`Modern` should contain **no fully-B&W titles** — those
+belong in `Vintage`. Both `Vintage` and `Classic` route to `vtv` (SD, upscale-
+aware, grain synth); `Modern` -> `mtv` (native HD, ≈ movies) — the SD/HD line is
+the one the encoder cares about. `ves-profile-decision.sh` +
+`VesProfileDecision.psm1` gain the previously-missing `*/Television/*/Classic*`
+case; both match parenthesised and bare names.
+
+The whole TV library (~1,380 shows across 13 countries) was re-bucketed by year:
+11 Vintage / 138 Classic / 1,232 Modern. `.plexignore` (`*_WORKING` etc.) added
+at every media-library root + the new anime/TV era buckets.
+
 ## v6.0.1T — 2026-09-06 (branch `6.x-chunk-redesign`)
 
 **Every era-tier library folder now carries its year range in the name**, so a

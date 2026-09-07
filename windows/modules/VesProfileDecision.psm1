@@ -143,6 +143,9 @@ function Get-VesDetectedProfileForPath {
     if ($pNorm -match '/Movies/[^/]+/Classic( \([^)]*\))?/') { return 'classic' }
     if ($pNorm -match '/Movies/[^/]+/Vintage( \([^)]*\))?/') { return 'vintage' }
     if ($pNorm -match '/Television/[^/]+/Modern( \([^)]*\))?/') { return 'mtv' }
+    # TV Vintage (<=1965, B&W->colour) AND Classic (1966-2003, colour SD) both
+    # -> vtv; Modern (2004+, HD) -> mtv.
+    if ($pNorm -match '/Television/[^/]+/Classic( \([^)]*\))?/') { return 'vtv' }
     if ($pNorm -match '/Television/[^/]+/Vintage( \([^)]*\))?/') { return 'vtv' }
     return $null
 }

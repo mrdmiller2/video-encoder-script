@@ -286,17 +286,21 @@ detect_profile_for_path() {
     */Stand-Up\ Comedy/*) printf 'standup'; return 0 ;;
     */Learning\ Series/*) printf 'learning'; return 0 ;;
     */Animation/*) printf 'wanime'; return 0 ;;
-    # Live-action era tiers. 2026-09-06: the tier folders now carry their year
-    # range in the NAME for unambiguous human filing -- Movies/<Lang>/
-    # "Vintage (<=1958)" | "Classic (1959-1997)" | "Modern (1998+)",
-    # Television/<Country>/ "Vintage (<=1989)" | "Modern (1990+)" (TV has no
-    # Classic tier; "Animation" stays bare -- it is a content type, not an era).
+    # Live-action era tiers. The tier folders carry their year range in the NAME
+    # for unambiguous human filing. Boundaries track real production transitions:
+    #   Movies/<Lang>/       "Vintage (<=1958)" | "Classic (1959-1997)" | "Modern (1998+)"
+    #   Television/<Country>/ "Vintage (<=1965)" | "Classic (1966-2003)" | "Modern (2004+)"
+    #     TV: <=1965 = B&W->colour line; 2004+ = SD 4:3 -> HD 16:9 broadcast
+    #     master line (the split the encoder cares about). "Vintage" AND
+    #     "Classic" both -> vtv (SD, upscale-aware, grain synth); "Modern" -> mtv
+    #     (native HD, ~= movies). "Animation" stays bare (content type, not era).
     # Match BOTH the parenthesised name and the bare word (transition-safe).
     */Movies/*/Modern/*|*/Movies/*/Modern\ \(*)   printf 'movies';  return 0 ;;
     */Movies/*/Classic/*|*/Movies/*/Classic\ \(*) printf 'classic'; return 0 ;;
     */Movies/*/Vintage/*|*/Movies/*/Vintage\ \(*) printf 'vintage'; return 0 ;;
-    */Television/*/Modern/*|*/Television/*/Modern\ \(*)   printf 'mtv'; return 0 ;;
-    */Television/*/Vintage/*|*/Television/*/Vintage\ \(*) printf 'vtv'; return 0 ;;
+    */Television/*/Modern/*|*/Television/*/Modern\ \(*)     printf 'mtv'; return 0 ;;
+    */Television/*/Classic/*|*/Television/*/Classic\ \(*)   printf 'vtv'; return 0 ;;
+    */Television/*/Vintage/*|*/Television/*/Vintage\ \(*)   printf 'vtv'; return 0 ;;
   esac
   return 1
 }
