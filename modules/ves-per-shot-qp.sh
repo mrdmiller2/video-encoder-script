@@ -1137,11 +1137,39 @@ shot_split_create_manifest() {
   if [ "${SHOT_COMPLEXITY_ENABLE:-true}" != "false" ]; then
     _cx_stats="$(mktemp "${RAMDISK_JOB_DIR:-${TMPDIR:-/tmp}}/ves-cxstats-XXXXXX" 2>/dev/null)" || _cx_stats=""
   fi
-  _boundaries="$(scene_detect_boundaries "$src" "${SCENE_DETECT_THRESHOLD:-0.3}" "$_cx_stats")" || {
+  # First pass. Profiles that are usually soft / grainy / B&W start at the more
+  # sensitive threshold -- the default frame-difference metric barely moves at a
+  # cut on those masters. Everything else starts at the standard threshold.
+  local _sd_thr="${SCENE_DETECT_THRESHOLD:-0.3}" _p
+  for _p in ${SCENE_DETECT_LOWCONTRAST_PROFILES:-vintage vtv classic canime}; do
+    [ "$profile" = "$_p" ] && _sd_thr="${SCENE_DETECT_THRESHOLD_LOWCONTRAST:-0.12}" && break
+  done
+  _boundaries="$(scene_detect_boundaries "$src" "$_sd_thr" "$_cx_stats")" || {
     err "scene_detect_boundaries() failed for $src"
     [ -n "$_cx_stats" ] && rm -f -- "$_cx_stats"
     rm -rf -- "$tmpdir"; rmdir -- "$mdir" 2>/dev/null; return 1
   }
+  # Under-segmentation guard. If the average shot is longer than the cap
+  # (SCENE_DETECT_FALLBACK_MAX_AVG_SECS), retry once at the low-contrast
+  # threshold, then fall back to fixed-interval boundaries. A per-shot QP search
+  # needs tractable segments, not true scene cuts -- a 15-minute "shot" is
+  # useless either way. Found 2026-09-07: Streetcar (1951) = 50 shots / 2h05m,
+  # An American in Paris = build failed, All About Eve = 126s opening "shot".
+  local _nbx _avgx
+  _nbx="$(printf '%s\n' "$_boundaries" | grep -c .)"
+  _avgx="$(awk -v d="$dur" -v n="$_nbx" 'BEGIN{ n+=1; printf "%.1f", (n>0? d/n : d) }')"
+  if awk -v a="$_avgx" -v m="${SCENE_DETECT_FALLBACK_MAX_AVG_SECS:-30}" 'BEGIN{exit !(a+0 > m+0)}' \
+     && [ "$_sd_thr" != "${SCENE_DETECT_THRESHOLD_LOWCONTRAST:-0.12}" ]; then
+    err "scene detect: $_nbx cuts / ${_avgx}s avg shot in ${dur}s -- retrying at low-contrast threshold"
+    _boundaries="$(scene_detect_boundaries "$src" "${SCENE_DETECT_THRESHOLD_LOWCONTRAST:-0.12}" "$_cx_stats")" || _boundaries="$_boundaries"
+    _nbx="$(printf '%s\n' "$_boundaries" | grep -c .)"
+    _avgx="$(awk -v d="$dur" -v n="$_nbx" 'BEGIN{ n+=1; printf "%.1f", (n>0? d/n : d) }')"
+  fi
+  if awk -v a="$_avgx" -v m="${SCENE_DETECT_FALLBACK_MAX_AVG_SECS:-30}" 'BEGIN{exit !(a+0 > m+0)}'; then
+    local _fbs="${SCENE_DETECT_FALLBACK_SECS:-10}"
+    err "scene detect: still $_nbx cuts / ${_avgx}s avg in ${dur}s -- fixed-interval fallback every ${_fbs}s"
+    _boundaries="$(awk -v d="$dur" -v s="$_fbs" 'BEGIN{ for (t=s; t < d-1; t+=s) printf "%.3f\n", t }')"
+  fi
   # idx -> "luma motion detail sat"  (raw stats file kept until after the meta
   # loop -- _shot_long_windows() re-reads it per long shot for window placement)
   local -A _CX=()

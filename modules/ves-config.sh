@@ -6,7 +6,7 @@
 # MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
 # bug fix) -- see its own comment.
 
-VERSION="6.0.1V"
+VERSION="6.0.1W"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
 # as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
@@ -271,6 +271,21 @@ CONVERT_CHUNK_TARGET_SECS="${CONVERT_CHUNK_TARGET_SECS:-600}"
 # default for this exact use -- not yet independently tuned/validated
 # against real fleet content.
 SCENE_DETECT_THRESHOLD="${SCENE_DETECT_THRESHOLD:-0.3}"
+# Cut-detection method (2026-09-07): "scdet" = the purpose-built FFmpeg scene-
+# change filter (default; robust on low-contrast B&W where the old
+# select='gt(scene,X)' barely moves at a cut -- Streetcar 1951 came back as
+# 50 shots for 2h05m). "scene" = the legacy filter.
+SCENE_DETECT_METHOD="${SCENE_DETECT_METHOD:-scdet}"
+# Low-contrast pass: profiles most likely to be soft / grainy / B&W get a more
+# sensitive first pass. Value is in the legacy 0-1 scale (mapped to scdet 0-100).
+SCENE_DETECT_THRESHOLD_LOWCONTRAST="${SCENE_DETECT_THRESHOLD_LOWCONTRAST:-0.12}"
+SCENE_DETECT_LOWCONTRAST_PROFILES="${SCENE_DETECT_LOWCONTRAST_PROFILES:-vintage vtv classic canime}"
+# Under-segmentation guard: if scene detection yields an average shot longer
+# than this, retry once at the low-contrast threshold; if STILL over, fall back
+# to fixed-interval boundaries every SCENE_DETECT_FALLBACK_SECS. A per-shot QP
+# search does not need true scene boundaries, only tractable segments.
+SCENE_DETECT_FALLBACK_MAX_AVG_SECS="${SCENE_DETECT_FALLBACK_MAX_AVG_SECS:-30}"
+SCENE_DETECT_FALLBACK_SECS="${SCENE_DETECT_FALLBACK_SECS:-10}"
 # Per-shot complexity index (2026-09-02): when true, shot_split_create_manifest()
 # has scene_detect_boundaries() fan its single decode to a signalstats+entropy
 # branch and writes 4 aggregated fields per shot into shot-NNN.meta --

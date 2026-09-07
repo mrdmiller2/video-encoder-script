@@ -32,6 +32,26 @@
 # title (result belongs on the chunk manifest, resolved once by the
 # splitter, same pattern chunk_split_create_manifest() already uses for
 # CRF), never per-chunk or per-encoder.
+# Cut-detection filter chain. `scdet` (FFmpeg 4.3+) is a purpose-built
+# scene-change detector -- more robust than `select='gt(scene,X)'` on
+# low-contrast / soft / grainy B&W masters, where the old frame-difference
+# metric barely moves at a cut (no colour change, similar luma) and whole
+# reels came back as one 15-minute "shot" (Streetcar 1951: 50 shots for 2h05m).
+# `scdet` threshold is 0-100 (default 10); lower = more sensitive. `sc_pass=1`
+# passes ONLY scene-change frames to showinfo, so the existing pts_time grep is
+# unchanged. Set SCENE_DETECT_METHOD=scene to force the legacy filter.
+_scene_detect_filter() {  # $1 = threshold-in-old-scale (0-1); prints the [sc] filter body
+  local t="$1"
+  if [ "${SCENE_DETECT_METHOD:-scdet}" = "scene" ]; then
+    printf "select='gt(scene,%s)',showinfo" "$t"
+  else
+    # map the 0-1 legacy threshold onto scdet's 0-100 (0.3 -> ~10). A caller
+    # that wants the low-contrast setting passes a smaller number (e.g. 0.12).
+    local st; st="$(awk -v x="$t" 'BEGIN{ v=x*33.3; if(v<1)v=1; if(v>100)v=100; printf "%.1f", v }')"
+    printf "scdet=threshold=%s:sc_pass=1,showinfo" "$st"
+  fi
+}
+
 scene_detect_boundaries() {
   local src="$1" threshold="${2:-${SCENE_DETECT_THRESHOLD:-0.3}}" stats_out="${3:-}"
   # showinfo logs at AV_LOG_INFO -- `-v error` would silently suppress every
@@ -50,17 +70,18 @@ scene_detect_boundaries() {
   else
     stats_out=""
   fi
+  local _scf; _scf="$(_scene_detect_filter "$threshold")"
   if [ -n "$stats_out" ]; then
     local _fps="${SHOT_COMPLEXITY_FPS:-4}"
     "${FFMPEG_CMD[@]}" -nostdin -v info -nostats -i "$src" -filter_complex "\
 [0:v]split=2[sc][st];\
-[sc]select='gt(scene,${threshold})',showinfo[cuts];\
+[sc]${_scf}[cuts];\
 [st]fps=${_fps},signalstats,entropy=mode=normal,metadata=print:file='${stats_out}',nullsink" \
       -map '[cuts]' -an -sn -f null - 2>&1 \
       | grep -oE 'pts_time:[0-9]+(\.[0-9]+)?' | cut -d: -f2
   else
     "${FFMPEG_CMD[@]}" -nostdin -v info -nostats -i "$src" \
-      -vf "select='gt(scene,${threshold})',showinfo" -an -sn -f null - 2>&1 \
+      -vf "${_scf}" -an -sn -f null - 2>&1 \
       | grep -oE 'pts_time:[0-9]+(\.[0-9]+)?' | cut -d: -f2
   fi
 }

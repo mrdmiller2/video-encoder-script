@@ -4,6 +4,29 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.1W — 2026-09-07 (branch `6.x-chunk-redesign`)
+
+**Scene detection swapped to the dedicated `scdet` filter + under-segmentation
+fallback.** `scene_detect_boundaries()` used `select='gt(scene,0.3)',showinfo`,
+whose frame-difference metric barely moves at a cut on low-contrast / soft /
+grainy / B&W masters — whole reels came back as one 10-15 minute "shot"
+(Streetcar 1951: 50 shots for 2h05m; An American in Paris: build failed;
+All About Eve: 126 s opening "shot"). This was the root cause of the forktree
+worker-pileup bundles: a per-shot QP search on a 900 s "shot" runs for hours.
+
+- New `_scene_detect_filter()` helper: primary path is `scdet=threshold=N:sc_pass=1`
+  (purpose-built scene-change detector, FFmpeg 4.3+, far more robust on
+  low-contrast material); `SCENE_DETECT_METHOD=scene` forces the legacy filter.
+  The 0-1 legacy threshold is mapped onto scdet's 0-100 scale (0.3 → ~10).
+- `shot_split_create_manifest()`: profiles in `SCENE_DETECT_LOWCONTRAST_PROFILES`
+  (`vintage vtv classic canime`) start at `SCENE_DETECT_THRESHOLD_LOWCONTRAST`
+  (0.12). If the average shot still exceeds `SCENE_DETECT_FALLBACK_MAX_AVG_SECS`
+  (30 s), it retries once at the low threshold, then synthesises fixed-interval
+  boundaries every `SCENE_DETECT_FALLBACK_SECS` (10 s) — a QP search needs
+  tractable segments, not true scene cuts.
+- Verified on Doctor Who S05E07 (1963, B&W), 300 s clip: legacy `gt(scene,0.3)`
+  = 12 cuts; `scdet` (mapped low-contrast) = 29 cuts, matching legacy at 0.12.
+
 ## v6.0.1V — 2026-09-07 (branch `6.x-chunk-redesign`)
 
 **Concerts + Stand-Up Comedy re-bucketed to production-transition era tiers**
