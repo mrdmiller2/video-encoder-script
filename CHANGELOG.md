@@ -4,6 +4,22 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.2K — 2026-09-07 (branch `6.x-chunk-redesign`)
+
+**Registration heartbeat is a background beat again, not tied to the shot loop.**
+v6.0.2H put the redis-registration refresh in the module's between-shots check
+(`_sw_admit_ok`). On a slammed host (TITOJ, loadavg 90) a per-shot search takes
+5-10 min, so the check fired rarely, the coordinator's count-Lua evicted the
+worker (hb stale > `DVAL_WREG_TTL` 240s) between checks, `reconcile_host`
+relaunched, and the box restacked to 8 workers for a target of 3.
+
+- `worker_loop_discovery_multi.sh`: a `_wl_beat` subshell refreshes the
+  registration every `DVAL_WREG_HB_SECS` (75s) on its own clock. GO -> hb
+  refreshed; STOP x2 (2-beat grace) -> SIGTERM the main loop. Safe now that
+  v6.0.2G counts real workers by pid==sid -- the beat shares the session
+  (pid != sid) so it is not counted (this is why 6.0.2E/F had removed it).
+  `_sw_admit_ok` stays as a faster between-shots supplement when shots are quick.
+
 ## v6.0.2J — 2026-09-07 (branch `6.x-chunk-redesign`)
 
 **Dynamic per-title encode-time budget.** The flat "grain=24h / else 6h" split
