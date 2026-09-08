@@ -38,6 +38,22 @@ measured `total ~701,463 s` (8 days) for one grain title there.
   `DVAL_DYNAMIC_HOSTS` — its search-worker count is sized to live headroom
   instead of a fixed 4.
 
+- **VMAF frame-alignment diagnostic** (`score()` in `dval_worker_encode.sh`):
+  All About Eve's D-val encode scored VMAF ~28-31 at near-lossless (vs ~95 for
+  the same params on a clean-extracted clip and vs 89-97 for A Day at the Races).
+  Not grain synthesis (tested: grain-ON vs grainy source = VMAF 94.75 on a clean
+  clip). It is a whole-movie frame desync: the source is Matroska with a
+  `1/1000` ms timebase and non-CFR early-frame PTS, so `fps=${SRC_FPS}` resamples
+  it differently from the clean-CFR encode. Added: `src_frames`/`enc_frames`
+  logging, and when a primary score is < 60 an automatic frame-index-aligned
+  re-measure + quartile VMAF to `encode.log`. `DVAL_VMAF_ALIGN=index` switches
+  the primary measurement to frame-index pairing (default stays `fps` so the
+  survey baseline doesn't shift mid-run pending confirmation).
+- Dispatch follow-ups: capacity gate skipped for a host whose load is its own
+  D-val search (the reservation drains it); repetitive skip logging deduped;
+  `DVAL_DECLINE_COOLDOWN` (600s) after a worker DECLINE so dispatch doesn't
+  thrash reserve->drain->decline.
+
 ## v6.0.2L — 2026-09-08 (branch `6.x-chunk-redesign`)
 
 **Coordinator SSH pressure — collapse per-reconcile connection storm to one
