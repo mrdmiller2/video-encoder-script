@@ -4,6 +4,17 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.2O — 2026-09-08 (branch `6.x-chunk-redesign`)
+
+**Fix a v6.0.2N regression: the frame-count diagnostic in `score()` used
+`ffprobe -count_frames`, which full-decodes the entire file.** On All About Eve
+(22 GB, ~199k frames) it ran 40+ min at 100 % CPU per variant, produced no
+`.ivf` growth, and tripped the STALL detector -> the AAE and Streetcar encodes
+were SIGTERM-killed at ~2.4-2.9 h with zero variants, then re-dispatched, on
+loop. Now uses container metadata only (`nb_frames`, or `duration x r_frame_rate`).
+The v6.0.2N `setpts=N` CRF-search fix itself is working -- AAE's base search
+converged to CRF 33 (was flooring at 16).
+
 ## v6.0.2N — 2026-09-08 (branch `6.x-chunk-redesign`)
 
 **VMAF frame pairing switched to frame-INDEX alignment (`setpts=N`) by default.**
