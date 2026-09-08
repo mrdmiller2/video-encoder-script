@@ -4,6 +4,40 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.2M — 2026-09-08 (branch `6.x-chunk-redesign`)
+
+**A fleet node does search XOR encode, never both — plus stop re-dispatching a
+doomed encode forever.** Triage of "LAYTOYAJ keeps getting stuck": it is a
+24-thread VMware VM whose primary job is the comics/ebook OCR fleet; with that
++ ESET AV + `WORKERS[LAYTOYAJ]=4` search workers + a D-val encode piled on, it
+sat at **loadavg 71** (≈3× oversubscribed). At that load new sshd logins can't
+be scheduled (dispatch can't probe it), and the encode makes no `.ivf` progress
+for 45 min → STALL-`SIGTERM` at ~2.9 h → dispatch reclaims → the `-1 → 0
+variants` first reclaim counted as "progress" so the strike reset → re-dispatched
+to the *same* box (only free encode host) → forever. `estimate_encode_budget`
+measured `total ~701,463 s` (8 days) for one grain title there.
+
+- **Node search/encode mutex** (`dval:encnode:<host>`, redis): `dval_dispatch`
+  reserves a host before launching an encode; `dval_admit` then STOPs every
+  search worker on it and `reconcile_host` publishes target 0, so the box
+  drains search before the encode ramps. Dispatch defers the launch one 90 s
+  pass for the drain. Cleared on encode exit / SIGKILL-stale sweep.
+- **`dval_worker_encode.sh` preflight**: refuse (`# DECLINED`, exit 93, fast) if
+  `load1/nproc > DVAL_ENCODE_MAX_LOAD_RATIO` (0.9) or search workers won't
+  drain — dispatch reassigns in seconds instead of a 2.9 h stall. A DECLINE
+  releases the host with **no strike** (not the title's fault).
+- **Capacity floor for every encode host** (not just the dynamic ones): dispatch
+  skips a host whose `load1/nproc` is over the ratio — waits rather than start a
+  doomed encode.
+- **Strike fix**: only a real *scored variant* (`cur > prev` **and** `cur > 0`)
+  resets the strike counter; a partial `base.ivf` no longer does.
+- **Host+title blacklist** (`strikes/<cat>__<slug>.badhosts`): after a strike,
+  that host won't be handed that title again; struck out on every encode host →
+  quarantine. Cleared on completion.
+- **LAYTOYAJ removed from `ENCODE_POOL`** (search-only now) and added to
+  `DVAL_DYNAMIC_HOSTS` — its search-worker count is sized to live headroom
+  instead of a fixed 4.
+
 ## v6.0.2L — 2026-09-08 (branch `6.x-chunk-redesign`)
 
 **Coordinator SSH pressure — collapse per-reconcile connection storm to one
