@@ -4,6 +4,31 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.3 — 2026-09-08 (branch `6.x-chunk-redesign`)
+
+**Strength-ordered fleet allocation — coordinator foundation.** First slice of
+the Windows-fleet + allocation-policy work (full plan:
+`.claude/plans/floating-splashing-tiger.md`). Bash-only, no Windows dependency.
+
+- `dval_paths.sh`: `DVAL_STRENGTH_ORDER` (static strongest→weakest list) +
+  `dval_strength_idx` / `dval_strength_factor` (search-worker multiplier ramping
+  `DVAL_SEARCH_MIN_FACTOR` 0.25 → 1.0 by rank `DVAL_STRENGTH_RAMP` 3) +
+  `dval_role_of` (`STING=io`, `RANDYJ=coordinator-light`) + `DVAL_ENCODE_CAPABLE_HOSTS`.
+- `dval_research.sh` `_wc()`: search-worker count = `base × strength_factor`, then
+  ≤`DVAL_ENCODE_HOST_SEARCH_CAP` (2) for an encode-capable host while
+  `dval:encbacklog` is set and it is not encoding, then ≤`nproc/2` for RANDYJ.
+  So the strongest 2-3 nodes throttle spillover search; mid/weak nodes keep
+  their full `WORKERS[]`. An explicit `DVAL_WORKERS_<HOST>` override still wins.
+- `dval_dispatch.sh`: writes `$SHARED/state/SEARCH-COMPLETE` (all titles searched)
+  and the `dval:encbacklog` redis flag (≥1 searched title not done and not
+  being encoded) each pass — the signals the encode-spillover and search
+  throttle read.
+
+Deferred to v6.0.3 phase 2+ / v6.0.4: the PowerShell search + encode + manifest
+worker ports (`VesDvalClaim.psm1`, `generic_manifest_build.ps1`, worker parity),
+PRINCE/ELVIS/RANDYJ into `HOSTS`, STING as the I/O node, `_launch_encode` win/mac
+branches, strength-ordered encode assignment.
+
 ## v6.0.2P — 2026-09-08 (branch `6.x-chunk-redesign`)
 
 **LAYTOYAJ back in the encode pool** (user directive). The rule is now explicit:
