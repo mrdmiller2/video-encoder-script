@@ -4,6 +4,30 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.2N — 2026-09-08 (branch `6.x-chunk-redesign`)
+
+**VMAF frame pairing switched to frame-INDEX alignment (`setpts=N`) by default.**
+Confirmed root cause of All About Eve's D-val `base` scoring VMAF 30.87 at
+near-lossless (vs 94.75 for the same SVT params + grain on a clean-extracted
+clip, vs 89-97 for A Day at the Races): `score()` / `_vmaf_score_one` paired the
+encode against the source by PTS via `fps=${SRC_FPS}`. For a source whose
+container timestamps are irregular -- Matroska with a `1/1000` ms timebase and
+non-CFR early-frame PTS (All About Eve, A Streetcar Named Desire) -- `fps=`
+resampled the raw source differently from the clean-CFR encode and desynced the
+whole comparison. `.mp4` sources with a frame-exact timebase were unaffected.
+
+- `dval_worker_encode.sh score()`: default `DVAL_VMAF_ALIGN=index`
+  (`[0:v]setpts=N` / `[1:v]setpts=N` -- pair frame i with frame i). No-op for a
+  clean-CFR source (bit-identical to the old `fps=` result, verified);
+  `DVAL_VMAF_ALIGN=fps` restores the old behaviour. Logs `src_frames`/
+  `enc_frames`; a still-low score (<75) triggers a quartile-VMAF dump +
+  cross-check against the other alignment, to `encode.log`.
+- `ves-vmaf-crf-search.sh _vmaf_score_one()`: same `setpts=PTS-STARTPTS` ->
+  `setpts=N` fix for the sample-clip CRF search (Streetcar's search curve was a
+  flat 71-76 across all CRF -- the desync signature, not a real CRF response).
+- Encodes running on pre-fix code against ms-timebase Matroska sources produce
+  known-bad VMAF -- abort + re-dispatch rather than finish them.
+
 ## v6.0.2M — 2026-09-08 (branch `6.x-chunk-redesign`)
 
 **A fleet node does search XOR encode, never both — plus stop re-dispatching a

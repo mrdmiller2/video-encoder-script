@@ -1355,7 +1355,14 @@ _vmaf_score_one() {  # clip crf codec model profile target_height
     1080) scale_filter='scale=1920:1080:flags=lanczos:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2' ;;
   esac
   [ -n "$scale_filter" ] && encode_filter=(-vf "$scale_filter")
-  ref_filter="${scale_filter:+$scale_filter,}setpts=PTS-STARTPTS,format=yuv420p10le"
+  # v6.0.2M: pair the sample encode and its reference clip by FRAME INDEX
+  # (setpts=N), not PTS. A clip extracted with `-ss ... -c copy` from an
+  # irregular-timebase Matroska source (1/1000 ms, non-CFR frame PTS) carries
+  # those irregular timestamps; `setpts=PTS-STARTPTS` only zeroes the start, so
+  # libvmaf still paired frames by (bogus) PTS and desynced the comparison --
+  # the same whole-movie bug seen in dval_worker_encode.sh score(). setpts=N is
+  # a no-op for a clean-CFR clip.
+  ref_filter="${scale_filter:+$scale_filter,}setpts=N,format=yuv420p10le"
   # run_ffmpeg_validation (timeout-wrapped), not bare run_ffmpeg, for both the
   # sample-clip encode and the VMAF scoring pass below -- these operate on a
   # single short clip (VMAF_SAMPLE_SECS), never a real multi-hour encode, so
@@ -1384,7 +1391,7 @@ _vmaf_score_one() {  # clip crf codec model profile target_height
         -pix_fmt yuv420p10le -x265-params "$x265p" ${x265_tune:+-tune "$x265_tune"} -an "$out" 2>/dev/null || return 1 ;;
   esac
   run_ffmpeg_validation -y -v error "${grain_decode_flag[@]}" -i "$out" -i "$clip" -lavfi \
-    "[0:v]setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]$ref_filter[r];[d][r]libvmaf=model=$model:n_threads=$(nproc 2>/dev/null || sysctl -n hw.ncpu):log_fmt=json:log_path=$vlog" \
+    "[0:v]setpts=N,format=yuv420p10le[d];[1:v]$ref_filter[r];[d][r]libvmaf=model=$model:n_threads=$(nproc 2>/dev/null || sysctl -n hw.ncpu):log_fmt=json:log_path=$vlog" \
     -f null - 2>/dev/null || return 1
   v="$(python3 -c "import json;print(round(json.load(open('$vlog'))['pooled_metrics']['vmaf']['mean'],2))" 2>/dev/null)" || return 1
   printf '%s %s' "$v" "$(file_size_bytes "$out")"
