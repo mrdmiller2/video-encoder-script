@@ -58,10 +58,14 @@ function Invoke-VesRedis {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory, ValueFromRemainingArguments)]
-        [string[]]$CmdArgs,
-        [int]$ConnectTimeoutMs = 2000,
-        [int]$IoTimeoutMs      = 5000
+        [string[]]$CmdArgs
     )
+    # NOTE: keep $CmdArgs the ONLY declared parameter. A trailing [int] parameter
+    # after a ValueFromRemainingArguments one steals the 2nd positional arg
+    # ("dval:<slug>:<idx>" -> ConnectTimeoutMs cast -> throw), so timeouts are
+    # env-overridable locals, never parameters.
+    $ConnectTimeoutMs = if ($env:VES_REDIS_CONNECT_MS) { [int]$env:VES_REDIS_CONNECT_MS } else { 2000 }
+    $IoTimeoutMs      = if ($env:VES_REDIS_IO_MS)      { [int]$env:VES_REDIS_IO_MS }      else { 5000 }
     $client = $null
     try {
         $client = [System.Net.Sockets.TcpClient]::new()

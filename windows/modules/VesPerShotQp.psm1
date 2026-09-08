@@ -55,6 +55,28 @@ if (-not (Get-Module -Name VesOrganize)) {
 # only, much tighter than per-shot search staleness.
 $script:VesShotManifestBuildStaleSeconds = 1800
 
+function Assert-VesShotSearchParitySafe {
+    <#
+    .SYNOPSIS
+    Fail-fast guard for search config this PowerShell port does NOT yet
+    reproduce bit-for-bit against the bash fleet. A PS worker that silently
+    scored a shot a different way than the Linux fleet would corrupt the
+    survey's QP allocation with no error -- so refuse to run instead.
+    Currently the only gap: PER_SHOT_UHD_VMAF_PROXY (_shot_uhd_proxy_active
+    in ves-per-shot-qp.sh downscales both VMAF legs to 1080p, swaps to
+    vmaf_v0.6.1neg, and shifts the target by
+    PER_SHOT_UHD_VMAF_PROXY_TARGET_DELTA -- none of which is ported here).
+    Dormant on the fleet today (ves-config.sh forces it =false); this makes
+    a future flip loud instead of a parity leak. Remove the throw once the
+    proxy path lands in Get-VesVmafScoreShot.
+    #>
+    if ($env:PER_SHOT_UHD_VMAF_PROXY -eq 'true') {
+        throw ("PER_SHOT_UHD_VMAF_PROXY=true is not supported by the PowerShell per-shot " +
+               "search port -- the 1080p-proxy / vmaf_v0.6.1neg / target-delta path is bash-only. " +
+               "This node would score UHD shots differently from the Linux fleet. Refusing to run.")
+    }
+}
+
 function Get-VesShotSearchStaleSeconds {
     if ($env:SHOT_SEARCH_STALE_SECS) { return [int]$env:SHOT_SEARCH_STALE_SECS }
     return 25200
@@ -950,17 +972,88 @@ function New-VesShotManifest {
     }
 }
 
+# ===========================================================================
+# redis lease backend glue (v6.0.3)
+# When the search worker is launched by the survey, worker_loop_discovery_multi.ps1
+# imports VesDvalClaim and exports VES_CLAIM_COORD; shot claims then go through
+# the coordinator's redis lease (dval:<slug>:<idx>) so a PS worker shares the
+# fleet's shot-lease namespace instead of the SMB lock-dir (double-claim risk,
+# no admission/sizing, can't honor dval:encnode). The SMB lock-dir stays as the
+# no-redis fallback -- exactly the bash `[ -n "$VES_CLAIM_CMD" ]` split in
+# ves-per-shot-qp.sh:1374 / :1515.
+# ===========================================================================
+
+function Get-VesShotSlug {
+    # Fleet-canonical shot slug. The bash fleet computes this EVERYWHERE as
+    #   basename -- "$src" | tr -c 'A-Za-z0-9._-' '_'
+    # and the pipe feeds basename's trailing newline THROUGH to `tr -c`, which
+    # maps it to '_' -- so every real fleet slug carries a trailing underscore
+    # (redis keys `dval:A_Few_Good_Men__1992_.mkv_:45`, log names, wreg hashes).
+    # Miss that '_' and a PS worker claims in a different namespace from the
+    # Linux fleet -> double-claim. $env:DVAL_SLUG (forwarded verbatim by
+    # dval_research.sh _launch_win) wins when set, for exact parity regardless
+    # of any path munging.
+    param([Parameter(Mandatory)][string]$Source)
+    if ($env:DVAL_SLUG) { return $env:DVAL_SLUG }
+    return ([regex]::Replace((Split-Path -Leaf $Source), '[^A-Za-z0-9._\-]', '_') + '_')
+}
+
+function Test-VesShotClaimRedisMode {
+    # redis lease active iff the coordinator addr is exported AND the claim
+    # client is importable in this session (the driver did Import-Module
+    # VesDvalClaim). Mirrors bash `declare -F dval_claim`.
+    if (-not $env:VES_CLAIM_COORD) { return $false }
+    return [bool](Get-Command -Name Enter-VesDvalClaim -ErrorAction SilentlyContinue)
+}
+
 function Enter-VesShotClaim {
     <#
     .SYNOPSIS
-    Port of shot_claim_next(). Claims one not-yet-resolved shot via an
-    atomic lock directory containing owner.meta. Returns a claim object
-    (Index/LockPath/Token/MetaPath) or $null. Staleness ceiling =
-    SHOT_SEARCH_STALE_SECS (default 25200).
+    Port of shot_claim_next(). Claims one not-yet-resolved shot -- via the
+    coordinator's redis lease (dval:<slug>:<idx>) when the survey launched
+    this worker (Test-VesShotClaimRedisMode), otherwise via an atomic lock
+    directory containing owner.meta. Returns a claim object
+    (Index/Slug/Redis or Index/LockPath/MetaPath/Token), a {Wait=$true}
+    object when redis is unreachable (caller pauses, must NOT fall back to
+    the lock-dir), or $null when nothing is claimable. Lock-dir staleness
+    ceiling = SHOT_SEARCH_STALE_SECS (default 25200); redis stale claims
+    free themselves at the lease TTL (VES_CLAIM_TTL, 2700s).
     #>
     param([Parameter(Mandatory)][string]$Source)
     $mdir = Get-VesShotManifestDir -Source $Source
     if (-not (Test-Path -LiteralPath (Join-Path $mdir '.complete'))) { return $null }
+
+    if (Test-VesShotClaimRedisMode) {
+        $slug = Get-VesShotSlug -Source $Source
+        $shotFiles = Get-ChildItem -LiteralPath $mdir -Filter 'shot-*.meta' -ErrorAction SilentlyContinue | Sort-Object Name
+        foreach ($f in $shotFiles) {
+            $meta = Get-Content -LiteralPath $f.FullName -Raw
+            $idxStr = Get-VesShotMetaValue -Content $meta -Key 'index'
+            if ($null -eq $idxStr) { continue }
+            $idx = [int]$idxStr
+            $statusFile = Join-Path $mdir ("shot-{0:D3}.status" -f $idx)
+            if (Test-Path -LiteralPath $statusFile) {
+                $stContent = Get-Content -LiteralPath $statusFile -Raw
+                if ((Get-VesShotMetaValue -Content $stContent -Key 'status') -eq 'resolved') { continue }
+            }
+            switch (Enter-VesDvalClaim -Slug $slug -Index ([string]$idx)) {
+                'OK' {
+                    return [PSCustomObject]@{
+                        Index = $idx; Slug = $slug; Redis = $true
+                        LockPath = $null; MetaPath = $null; Token = $null
+                    }
+                }
+                'WAIT' {
+                    # redis unreachable -- tell the loop to pause; do NOT drop
+                    # to the SMB lock-dir (that would split the namespace and
+                    # risk a double-claim against the Linux fleet).
+                    return [PSCustomObject]@{ Wait = $true; Redis = $true }
+                }
+                default { continue }   # TAKEN -> try the next shot
+            }
+        }
+        return $null
+    }
 
     $staleSecs = Get-VesShotSearchStaleSeconds
     $shotFiles = Get-ChildItem -LiteralPath $mdir -Filter 'shot-*.meta' -ErrorAction SilentlyContinue | Sort-Object Name
@@ -1029,12 +1122,22 @@ function Enter-VesShotClaim {
 function Exit-VesShotClaim {
     <#
     .SYNOPSIS
-    Port of shot_release_claim() -- recursive removal of the lock dir.
+    Port of shot_release_claim(). Redis claim -> owner-checked lease DEL
+    (Exit-VesDvalClaim leaves a peer-retaken lease alone). Lock-dir claim
+    -> recursive removal of the lock dir.
     #>
     param(
         [Parameter(Mandatory)][PSCustomObject]$Claim
     )
-    Remove-Item -LiteralPath $Claim.LockPath -Recurse -Force -ErrorAction SilentlyContinue
+    if ($Claim.Redis) {
+        if ($Claim.Slug -and $null -ne $Claim.Index) {
+            Exit-VesDvalClaim -Slug $Claim.Slug -Index ([string]$Claim.Index)
+        }
+        return
+    }
+    if ($Claim.LockPath) {
+        Remove-Item -LiteralPath $Claim.LockPath -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Clear-VesShotScratch {
@@ -1517,6 +1620,8 @@ function Resolve-VesPerShotQp {
         [Parameter(Mandatory)][string]$SvtAv1EncAppPath
     )
 
+    Assert-VesShotSearchParitySafe
+
     $score = @{}
     $bytes = @{}
     $samples = [System.Collections.Generic.List[string]]::new()
@@ -1609,12 +1714,14 @@ function Resolve-VesPerShotQp {
                 break
             }
         }
+        if ($env:DVAL_PARITY_DEBUG) { Write-Host "  [dbg] interp i=$i keys=$(($score.Keys | Sort-Object) -join ',') wt=$workingTarget above=$above below=$below" }
         # v6.0.1B: nothing meets / everything meets -- stop; (B) extension maps RD.
         if ($null -eq $above -or $null -eq $below) { break }
         $gap = $below - $above
         if ($gap -le 1) { break }
         $nextQp = Get-VesInterpQp -AboveQp $above -AboveScore $score[$above] `
             -BelowQp $below -BelowScore $score[$below] -Target $workingTarget
+        if ($env:DVAL_PARITY_DEBUG) { Write-Host "  [dbg] interp i=$i gap=$gap aScore=$($score[$above]) bScore=$($score[$below]) -> nextQp=$nextQp" }
         if (-not (& $probeQp $nextQp)) { break }
     }
 
@@ -1667,6 +1774,7 @@ function Resolve-VesPerShotQp {
                 }
             }
         }
+        if ($env:DVAL_PARITY_DEBUG) { Write-Host "  [dbg] crossover center=$center xoProbes=$xoProbes hiQp=$hiQp" }
         if ($null -ne $center) {
             for ($d = 1; $d -le $xoProbes; $d++) {
                 $c = $center - $d
@@ -1685,6 +1793,15 @@ function Resolve-VesPerShotQp {
         }
     }
 
+    # NOTE (parity, deferred -- item 5, 2026-09-08): "highest QP whose vmaf >=
+    # target" is a hard cut. When a probe lands within ~0.1 VMAF of the target,
+    # a last-ULP libvmaf difference across CPU microarchitectures (AVX2 vs
+    # AVX-512, x86 vs ARM NEON) can flip that boundary -> a +/-1 QP disagreement
+    # between two fleet nodes for the same shot. Masked today by the 2-dp score
+    # rounding + the parity gate's |dqp|<=1 tolerance. If the gate ever trips on
+    # a boundary flip, add hysteresis here: when the chosen QP's vmaf is within
+    # DVAL_QP_DECISION_EPS of target AND the next-lower QP also cleared, keep the
+    # lower (more compression). Mirror the same change in bash resolve_per_shot_qp.
     $best = $null
     $bv = $null
     $closest = $null
@@ -1736,15 +1853,21 @@ function Invoke-VesShotSearchClaimed {
     <#
     .SYNOPSIS
     Port of shot_search_claimed(). Runs Resolve-VesPerShotQp for one
-    already-claimed shot and writes shot-NNN.status. Releases the claim
-    on the way out (success or fallback).
+    already-claimed shot and writes shot-NNN.status (atomically, via
+    Write-VesKvFile's temp+Move). Releases the claim on the way out --
+    UNLESS -DeferRelease is set, in which case the caller frees the lease
+    only after the status is confirmed on the NAS (bash
+    SHOT_CLAIM_DEFER_RELEASE, review CRIT #1). The two early-exit paths
+    (missing .meta / a peer already resolved it) always release now: there
+    is nothing pending to confirm.
     #>
     param(
         [Parameter(Mandatory)][string]$Source,
         [Parameter(Mandatory)][PSCustomObject]$Claim,
         [Parameter(Mandatory)][string]$FfmpegPath,
         [Parameter(Mandatory)][string]$FfprobePath,
-        [Parameter(Mandatory)][string]$SvtAv1EncAppPath
+        [Parameter(Mandatory)][string]$SvtAv1EncAppPath,
+        [switch]$DeferRelease
     )
     $mdir = Get-VesShotManifestDir -Source $Source
     $idx = [int]$Claim.Index
@@ -1839,20 +1962,126 @@ function Invoke-VesShotSearchClaimed {
         "search_failed=$searchFailed",
         "nosignal=$nosignal",
         "bracket_edge=$bracketEdge",
-        "searched_host=$env:COMPUTERNAME",
+        "searched_host=$(if ($env:DVAL_WREG_HOST) { $env:DVAL_WREG_HOST } else { $env:COMPUTERNAME })",
         "searched_utc=$(Get-VesUtcStamp)"
     )
     Set-VesEveryoneReadWrite -Path $statusFile
-    Exit-VesShotClaim -Claim $Claim
+    if (-not $DeferRelease) { Exit-VesShotClaim -Claim $Claim }
     return $true
+}
+
+# --- background admission/lease beat (redis mode only) ----------------------
+# Port of worker_loop_discovery_multi.sh's `_wl_beat` + shot_search_worker_loop's
+# `_dval_hb_bg`, folded into ONE background runspace (NOT Start-Job -- see
+# VesPipelineScan.psm1's header for why). It runs on its own clock regardless of
+# what the shot loop is doing so a 5-10min per-shot search on a slammed box
+# can't let the coordinator's count-Lua evict this worker (hb stale >
+# DVAL_WREG_TTL 240s) and restack the host to 8 workers (bash v6.0.2K).
+#   * every DVAL_WREG_HB_SECS (75s): Test-VesDvalAdmit -- the GO path HSETs
+#     hb_epoch, so this beat IS the wreg heartbeat. 2 consecutive STOP ->
+#     flag the main loop to exit (a slow box making real progress gets one
+#     more beat first).
+#   * whichever shot the main loop currently holds ($State.CurrentShot):
+#     Update-VesDvalLease so a genuinely long search can't lose its claim.
+function Start-VesShotSearchBeat {
+    param(
+        [Parameter(Mandatory)][string]$Slug,
+        [Parameter(Mandatory)][string]$DvalHost,
+        [Parameter(Mandatory)][int]$WorkerPid,
+        [Parameter(Mandatory)][int]$FallbackTarget,
+        [Parameter(Mandatory)][hashtable]$State,
+        [int]$BeatSeconds = 0
+    )
+    if ($BeatSeconds -le 0) {
+        $BeatSeconds = if ($env:DVAL_WREG_HB_SECS) { [int]$env:DVAL_WREG_HB_SECS } else { 75 }
+    }
+    $claimModulePath = (Get-Command -Name Test-VesDvalAdmit -ErrorAction SilentlyContinue).Module.Path
+    if (-not $claimModulePath) { return $null }
+
+    $ps = [PowerShell]::Create()
+    $rs = [runspacefactory]::CreateRunspace()
+    $rs.Open()
+    $ps.Runspace = $rs
+    [void]$ps.AddScript({
+            param($ClaimModulePath, $Slug, $DvalHost, $WorkerPid, $FallbackTarget, $State, $BeatSeconds)
+            Import-Module $ClaimModulePath -Force
+            $stopStreak = 0
+            while (-not $State.MainDone) {
+                Start-Sleep -Seconds $BeatSeconds
+                if ($State.MainDone) { break }
+                $a = Test-VesDvalAdmit -Slug $Slug -DvalHost $DvalHost -WorkerPid $WorkerPid -FallbackTarget $FallbackTarget
+                if ($a -eq 'STOP') {
+                    $stopStreak++
+                    if ($stopStreak -ge 2) { $State.Stop = $true; $State.StopReason = 'admission STOP x2 (beat)'; break }
+                } else {
+                    $stopStreak = 0     # WAIT / GO -> don't drop claimed work on a blip
+                }
+                $cur = $State.CurrentShot
+                if ($null -ne $cur) {
+                    Update-VesDvalLease -Slug $Slug -Index ([string]$cur)
+                }
+            }
+        }) | Out-Null
+    [void]$ps.AddParameter('ClaimModulePath', $claimModulePath)
+    [void]$ps.AddParameter('Slug', $Slug)
+    [void]$ps.AddParameter('DvalHost', $DvalHost)
+    [void]$ps.AddParameter('WorkerPid', $WorkerPid)
+    [void]$ps.AddParameter('FallbackTarget', $FallbackTarget)
+    [void]$ps.AddParameter('State', $State)
+    [void]$ps.AddParameter('BeatSeconds', $BeatSeconds)
+    $async = $ps.BeginInvoke()
+    return [PSCustomObject]@{ PowerShell = $ps; Runspace = $rs; AsyncResult = $async }
+}
+
+function Stop-VesShotSearchBeat {
+    param([PSCustomObject]$Handle, [hashtable]$State)
+    if (-not $Handle) { return }
+    if ($State) { $State.MainDone = $true }
+    try {
+        if (-not $Handle.AsyncResult.IsCompleted) { $Handle.PowerShell.Stop() | Out-Null }
+        $Handle.PowerShell.EndInvoke($Handle.AsyncResult) | Out-Null
+    } catch { }
+    try { foreach ($w in $Handle.PowerShell.Streams.Warning) { Write-Warning "beat: $w" } } catch { }
+    try { $Handle.PowerShell.Dispose() } catch { }
+    try { $Handle.Runspace.Close(); $Handle.Runspace.Dispose() } catch { }
+}
+
+# Deferred-release NAS confirm (bash _dval_sync_status + the loop's 5x retry,
+# review CRIT #1). The PS worker writes shot-NNN.status straight to the NAS
+# manifest dir (no local mirror on this fork), so "sync" == re-stat the file we
+# just wrote and require status=resolved to be readable back before we free the
+# lease. Returns $true once confirmed, $false after all attempts fail.
+function Confirm-VesShotStatusOnNas {
+    param(
+        [Parameter(Mandatory)][string]$StatusFile,
+        [int]$Attempts = 5
+    )
+    for ($i = 1; $i -le $Attempts; $i++) {
+        try {
+            if ((Test-Path -LiteralPath $StatusFile) -and (Get-Item -LiteralPath $StatusFile).Length -gt 0) {
+                $c = Get-Content -LiteralPath $StatusFile -Raw
+                if ((Get-VesShotMetaValue -Content $c -Key 'status') -eq 'resolved') { return $true }
+            }
+        } catch { }
+        if ($i -lt $Attempts) {
+            Write-Warning "shot-search: NAS status read-back for $(Split-Path -Leaf $StatusFile) not confirmed, attempt $i/$Attempts -- retrying in $($i * 15)s"
+            Start-Sleep -Seconds ($i * 15)
+        }
+    }
+    return $false
 }
 
 function Invoke-VesShotSearchWorkerLoop {
     <#
     .SYNOPSIS
-    Port of shot_search_worker_loop(). Idle ceiling MUST default to
-    STALE + 3*retry (v6.0.1B) so a live worker outlasts a dead peer's
-    lock and can perform the reclaim.
+    Port of shot_search_worker_loop(). In redis mode (the survey launched
+    this worker: Test-VesShotClaimRedisMode) it gains the full coordination
+    layer -- startup admission gate, a background admission/lease beat,
+    SURVEY-STOPPED + lifetime cap, and deferred lease release (free only
+    after the resolved status is confirmed readable on the NAS). Idle
+    ceiling defaults to VES_CLAIM_TTL + 10*retry in redis mode (a live
+    worker must outlast a dead peer's lease so it can re-claim), else
+    STALE + 3*retry (v6.0.1B, the lock-dir reclaim window).
     #>
     param(
         [Parameter(Mandatory)][string]$Source,
@@ -1860,12 +2089,45 @@ function Invoke-VesShotSearchWorkerLoop {
         [Parameter(Mandatory)][string]$FfprobePath,
         [Parameter(Mandatory)][string]$SvtAv1EncAppPath,
         [int]$MaxShots = 99999,
-        [int]$MaxIdleSeconds = -1
+        [int]$MaxIdleSeconds = -1,
+        [string]$DvalHost,
+        [int]$HostWorkerCount = 0,
+        [string]$SharedDir,
+        [int]$MaxLifetimeSeconds = 0
     )
+    Assert-VesShotSearchParitySafe
     $retryWait = Get-VesShotSearchRetryWait
-    if ($MaxIdleSeconds -lt 0) {
-        $MaxIdleSeconds = (Get-VesShotSearchStaleSeconds) + ($retryWait * 3)
+    $redisMode = Test-VesShotClaimRedisMode
+
+    if (-not $DvalHost) {
+        $DvalHost = if ($env:DVAL_WREG_HOST) { $env:DVAL_WREG_HOST } else { $env:COMPUTERNAME }
     }
+    if ($HostWorkerCount -le 0) {
+        $HostWorkerCount = if ($env:DVAL_HOST_WORKER_COUNT) { [int]$env:DVAL_HOST_WORKER_COUNT } else { 2 }
+    }
+    if (-not $SharedDir) { $SharedDir = $env:DVAL_SHARED_DIR }
+    if ($MaxLifetimeSeconds -le 0) {
+        $MaxLifetimeSeconds = if ($env:DVAL_SEARCH_WORKER_MAX_SECS) { [int]$env:DVAL_SEARCH_WORKER_MAX_SECS } else { 21600 }
+    }
+    $claimTtl = if ($env:VES_CLAIM_TTL) { [int]$env:VES_CLAIM_TTL } else { 2700 }
+    if ($MaxIdleSeconds -lt 0) {
+        $MaxIdleSeconds = if ($redisMode) { $claimTtl + ($retryWait * 10) }
+                          else { (Get-VesShotSearchStaleSeconds) + ($retryWait * 3) }
+    }
+
+    $slug = Get-VesShotSlug -Source $Source
+    $stopFile = if ($SharedDir) { Join-Path $SharedDir 'SURVEY-STOPPED' } else { $null }
+
+    # --- startup admission gate (redis mode) -------------------------------
+    if ($redisMode) {
+        $gate = Test-VesDvalAdmit -Slug $slug -DvalHost $DvalHost -WorkerPid $PID -FallbackTarget $HostWorkerCount
+        if ($gate -ne 'GO') {
+            Write-Host "shot-search: startup admission $gate on $DvalHost pid=$PID -- exiting cleanly, not running unmanaged"
+            return 0
+        }
+        Write-Host "shot-search: startup admission GO on $DvalHost pid=$PID (slug=$slug target-fallback=$HostWorkerCount)"
+    }
+
     # Phase 1: stage the shared source to local disk once so every extraction
     # probe reads local instead of re-fetching a window over the network.
     try {
@@ -1879,36 +2141,94 @@ function Invoke-VesShotSearchWorkerLoop {
         }
     } catch { $env:SHOT_SRC_LOCAL = $null }
 
+    # --- background admission/lease beat (redis mode) ----------------------
+    $beatState = [hashtable]::Synchronized(@{ CurrentShot = $null; Stop = $false; StopReason = $null; MainDone = $false })
+    $beat = $null
+    if ($redisMode) {
+        $beat = Start-VesShotSearchBeat -Slug $slug -DvalHost $DvalHost -WorkerPid $PID `
+            -FallbackTarget $HostWorkerCount -State $beatState
+        if ($beat) { Write-Host "  admission/lease beat started ($(if ($env:DVAL_WREG_HB_SECS) { $env:DVAL_WREG_HB_SECS } else { 75 })s)" }
+    }
+
     $count = 0
     $idle = 0
+    $t0 = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     Clear-VesShotScratch
-    while ($count -lt $MaxShots) {
-        $claim = Enter-VesShotClaim -Source $Source
-        if ($claim) {
-            $idle = 0
-            Write-Host "claimed shot $($claim.Index)"
-            $ok = Invoke-VesShotSearchClaimed -Source $Source -Claim $claim `
-                -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -SvtAv1EncAppPath $SvtAv1EncAppPath
-            if ($ok) {
-                Write-Host "resolved shot $($claim.Index)"
-                $count++
-            } else {
-                Write-Warning "shot-search: shot $($claim.Index) did not resolve -- will retry"
+    try {
+        while ($count -lt $MaxShots) {
+            if ($stopFile -and (Test-Path -LiteralPath $stopFile)) {
+                Write-Host "shot-search: SURVEY-STOPPED present -- worker exiting cleanly (processed $count)"; break
             }
-            Clear-VesShotScratch
-            continue
+            if ($beatState.Stop) {
+                Write-Host "shot-search: $($beatState.StopReason) -- worker exiting cleanly (processed $count)"; break
+            }
+            if (([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $t0) -gt $MaxLifetimeSeconds) {
+                Write-Warning "shot-search: worker lifetime cap ${MaxLifetimeSeconds}s reached on $DvalHost -- exiting (processed $count)"; break
+            }
+
+            $claim = Enter-VesShotClaim -Source $Source
+            if ($claim -and $claim.Wait) {
+                Write-Warning "shot-search: claim backend unreachable -- pausing ${retryWait}s"
+                Start-Sleep -Seconds $retryWait; continue
+            }
+            if ($claim) {
+                $idle = 0
+                $beatState.CurrentShot = $claim.Index
+                Write-Host "claimed shot $($claim.Index)"
+                $ok = Invoke-VesShotSearchClaimed -Source $Source -Claim $claim `
+                    -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -SvtAv1EncAppPath $SvtAv1EncAppPath `
+                    -DeferRelease:$redisMode
+                if ($ok) {
+                    if ($redisMode) {
+                        # Free the lease only once the resolved status is
+                        # confirmed readable on the NAS (review CRIT #1).
+                        $mdir = Get-VesShotManifestDir -Source $Source
+                        $statusFile = Join-Path $mdir ("shot-{0:D3}.status" -f [int]$claim.Index)
+                        if (Confirm-VesShotStatusOnNas -StatusFile $statusFile) {
+                            Exit-VesShotClaim -Claim $claim
+                            Write-Host "resolved shot $($claim.Index)"
+                            $count++
+                        } else {
+                            # Permanent: move the resolved status aside so a
+                            # fresh search re-runs it, alert, release the lease.
+                            $aside = "$statusFile.syncfailed.$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
+                            try { Move-Item -LiteralPath $statusFile -Destination $aside -Force -ErrorAction Stop } catch { }
+                            if ($SharedDir) {
+                                try {
+                                    Add-Content -LiteralPath (Join-Path $SharedDir 'ALERT.status-sync-failed') `
+                                        -Value "$(Get-VesUtcStamp) $slug shot $($claim.Index) on ${DvalHost}: NAS status read-back failed 5x -- re-queued" -ErrorAction Stop
+                                } catch { }
+                            }
+                            Write-Warning "shot-search: shot $($claim.Index) STATUS NAS READ-BACK FAILED 5x -- re-queued, releasing lease"
+                            Exit-VesShotClaim -Claim $claim
+                        }
+                    } else {
+                        Write-Host "resolved shot $($claim.Index)"
+                        $count++
+                    }
+                } else {
+                    Write-Warning "shot-search: shot $($claim.Index) did not resolve -- releasing for retry"
+                    if ($redisMode) { Exit-VesShotClaim -Claim $claim }
+                }
+                $beatState.CurrentShot = $null
+                Clear-VesShotScratch
+                continue
+            }
+
+            if (Test-VesShotManifestAllResolved -Source $Source) {
+                Write-Host 'shot-search: manifest fully resolved'
+                break
+            }
+            $idle += $retryWait
+            if ($idle -ge $MaxIdleSeconds) {
+                Write-Warning "shot-search: ${MaxIdleSeconds}s idle with shots still unresolved -- giving up on $DvalHost"
+                break
+            }
+            Write-Host "shot-search: nothing claimable, ${idle}s/${MaxIdleSeconds}s idle -- retry in ${retryWait}s"
+            Start-Sleep -Seconds $retryWait
         }
-        if (Test-VesShotManifestAllResolved -Source $Source) {
-            Write-Host 'shot-search: manifest fully resolved'
-            break
-        }
-        $idle += $retryWait
-        if ($idle -ge $MaxIdleSeconds) {
-            Write-Warning "shot-search: ${MaxIdleSeconds}s idle with shots still unresolved -- giving up on $env:COMPUTERNAME"
-            break
-        }
-        Write-Host "shot-search: nothing claimable, ${idle}s/${MaxIdleSeconds}s idle -- retry in ${retryWait}s"
-        Start-Sleep -Seconds $retryWait
+    } finally {
+        Stop-VesShotSearchBeat -Handle $beat -State $beatState
     }
     Write-Host "shot-search worker done: processed $count shots"
     return $count
@@ -1918,6 +2238,8 @@ Export-ModuleMember -Function `
     Get-VesWorkingDirForSource, Get-VesShotManifestDir, Get-VesShotLockPath, Get-VesShotPathMtime, `
     Convert-VesFleetPath, `
     Test-VesShotManifestAllResolved, New-VesShotManifest, `
+    Get-VesShotSlug, Test-VesShotClaimRedisMode, Assert-VesShotSearchParitySafe, `
+    Start-VesShotSearchBeat, Stop-VesShotSearchBeat, Confirm-VesShotStatusOnNas, `
     Enter-VesShotClaim, Exit-VesShotClaim, `
     Clear-VesShotScratch, Invoke-VesShotSearchWorkerLoop, `
     Get-VesVmafScoreShot, Resolve-VesPerShotQp, Invoke-VesShotSearchClaimed, `

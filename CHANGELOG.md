@@ -29,6 +29,66 @@ worker ports (`VesDvalClaim.psm1`, `generic_manifest_build.ps1`, worker parity),
 PRINCE/ELVIS/RANDYJ into `HOSTS`, STING as the I/O node, `_launch_encode` win/mac
 branches, strength-ordered encode assignment.
 
+### v6.0.3 phase 2 — PowerShell search-worker parity (2026-09-08)
+
+**The Windows per-shot search worker now shares the fleet's redis claim
+namespace and is verified byte-identical to the bash search.** PRINCE/ELVIS can
+join the D-val survey as first-class search nodes (still gated out of live
+`HOSTS` pending the staged rollout).
+
+- `windows/modules/VesDvalClaim.psm1`: fixed `Invoke-VesRedis` — a trailing
+  `[int]$ConnectTimeoutMs` parameter after the `ValueFromRemainingArguments`
+  `$CmdArgs` stole the 2nd positional arg, so every multi-arg call
+  (`SET dval:<slug>:<idx> …`) threw `cannot convert 'dval:…' to Int32`. `$CmdArgs`
+  is now the only parameter; timeouts are env-overridable locals. Live-verified
+  from PRINCE against redis-ves: PING, an NX shot-claim race against the bash
+  `dval_claim` (zero double-claim), `dval_admit`, the `dval:encnode` mutex.
+- `windows/modules/VesPerShotQp.psm1`:
+  - `Get-VesShotSlug` — reproduces the fleet-canonical slug *including its
+    trailing `_`* (the bash `basename | tr -c` pipe maps basename's newline to
+    `_`; every real slug carries it — `dval:A_Few_Good_Men__1992_.mkv_:45`).
+    `$env:DVAL_SLUG` wins when set. Missing the `_` = a different claim
+    namespace = silent double-claim.
+  - `Enter-/Exit-VesShotClaim` gain a redis-lease branch (active when
+    `VES_CLAIM_COORD` is set + the claim module is loaded); SMB lock-dir stays
+    as the no-redis fallback. `Invoke-VesShotSearchClaimed` gains `-DeferRelease`.
+  - `Invoke-VesShotSearchWorkerLoop` rewritten with the full coordination layer:
+    startup `Test-VesDvalAdmit` gate, a background admission/lease beat
+    (`Start-VesShotSearchBeat`, one runspace — wreg heartbeat + per-held-shot
+    `Update-VesDvalLease` + 2×`STOP` → clean exit), `SURVEY-STOPPED` check,
+    `DVAL_SEARCH_WORKER_MAX_SECS` lifetime cap, and deferred lease release that
+    frees only after the resolved status is confirmed readable on the NAS
+    (`Confirm-VesShotStatusOnNas`; `.syncfailed` + `ALERT.status-sync-failed`
+    fallback). `searched_host=` now writes the canonical fleet name.
+  - `Assert-VesShotSearchParitySafe` — refuses to run under
+    `PER_SHOT_UHD_VMAF_PROXY=true` (the 1080p-proxy / `vmaf_v0.6.1neg` /
+    target-delta path is bash-only, not ported — a PS worker would score UHD
+    shots differently from the Linux fleet).
+- `orchestration/regional-survey/scripts/` (gitignored):
+  - `worker_loop_discovery_multi.ps1` imports `VesDvalClaim` before
+    `VesPerShotQp`; hard-fails if `VES_CLAIM_COORD` is set but the module is
+    missing (no stale-SMB-fallback double-claim); converts `DVAL_SHARED_DIR`
+    Linux→UNC.
+  - `dval_research.sh` `_launch_win`: runs `dval_win_deploy.sh --host` first,
+    then `_dval_win_envkv` sources the fleet `ves-config.sh` and forwards the
+    *full resolved* per-shot tunable set + every `SVT_PARAMS_*` + the claim/coord
+    keys + `DVAL_SLUG` via `-EnvKv`. Closes the drift gap where the PS port
+    re-declared every default and a `ves-config.sh` change never reached the
+    Windows nodes. `dval_win_launch.ps1`'s hardcoded env block is now
+    fallback-only.
+  - `dval_parity_gate.sh` (+ `parity_ps_shots.ps1` + `parity_bash_shots.sh`) —
+    a standing gate: a Windows node (PS) and a Linux node (bash) independently
+    re-search 3 fixed AFGM shots; diffs QP/VMAF/probe-samples (tolerance
+    `|Δqp|≤1`, `|Δvmaf|≤0.25`), writes `ALERT.parity-gate` on divergence.
+
+**Parity result:** PRINCE (PS) vs current bash on STING (both SVT-AV1 v4.2.0,
+ffmpeg `N-125907-ga7e72069f1`) — 6 AFGM shots, byte-identical QP/VMAF/samples.
+The fleet's SVT-AV1 + ffmpeg are now uniformly v4.2.0 / `N-125907` on every
+Linux + Windows node (the `dval_research.sh` "fleet constant is v4.1.0" comments
+are stale). **MARLONJ (macOS/ARM) is the exception** — its SVT-AV1 (v4.2.0
+*source*, homebrew) emits a ~0.02%-different bitstream from x86 (NEON vs AVX2),
+and `--asm 0` (pure C, would be bit-exact) SIGSEGVs on ARM.
+
 ## v6.0.2P — 2026-09-08 (branch `6.x-chunk-redesign`)
 
 **LAYTOYAJ back in the encode pool** (user directive). The rule is now explicit:

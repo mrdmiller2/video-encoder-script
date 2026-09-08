@@ -889,6 +889,15 @@ resolve_per_shot_qp() {
     fi
   fi
 
+  # NOTE (fleet parity, deferred -- 2026-09-08): the "highest QP whose vmaf >=
+  # target" cut below is a hard boundary. A probe landing within ~0.1 VMAF of
+  # target can flip it on a last-ULP libvmaf difference across CPU
+  # microarchitectures (AVX2 vs AVX-512; x86 vs ARM NEON) -> two nodes pick a
+  # QP one apart for the same shot. Masked today by 2-dp score rounding + the
+  # parity gate's |dqp|<=1 tolerance (dval_parity_gate.sh). If the gate trips on
+  # a boundary flip, add hysteresis: when best's vmaf is within
+  # DVAL_QP_DECISION_EPS of target and the next-lower QP also cleared, keep the
+  # lower. Mirror in windows/modules/VesPerShotQp.psm1 Resolve-VesPerShotQp.
   local best="" bv="" closest="" cv=""
   for qp in $(printf '%s\n' "${!score[@]}" | sort -n); do
     if awk -v s="${score[$qp]}" -v t="$target" 'BEGIN{exit !(s>=t)}'; then
