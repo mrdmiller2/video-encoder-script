@@ -837,6 +837,24 @@ function New-VesShotManifest {
         }
     }
 
+    # Create the PARENT (<base>_WORKING) before the claim -- the claim lock
+    # lives at "$mdir.splitting.lock" and Enter-VesSharedMutexOnce's
+    # File.Open(CreateNew) throws if that parent is absent, so on a FRESH title
+    # (the common case) New-VesShotManifest returned $false without ever running
+    # scene-detect. Matches bash shot_split_create_manifest's
+    # `mkdir -p -- "$(dirname -- "$mdir")"` (added there after the mp4-expansion
+    # mass-quarantine). $mdir itself stays created inside the claim as the build
+    # marker.
+    $mdirParent = Split-Path -Parent $mdir
+    if ($mdirParent -and -not (Test-Path -LiteralPath $mdirParent)) {
+        # raw .NET, not New-Item -Path -- the PS provider path parser chokes on a
+        # UNC path with spaces + WildcardPattern escaping and silently no-ops,
+        # leaving the split-lock's parent absent so Enter-VesSharedMutexOnce
+        # (File.Open CreateNew) throws and this returns $false (2026-09-08).
+        [void][System.IO.Directory]::CreateDirectory($mdirParent)
+        Set-VesEveryoneReadWrite -Path $mdirParent
+    }
+
     $splitClaimPath = "$mdir.splitting.lock"
     $token = Enter-VesSharedMutexOnce -LockPath $splitClaimPath -StaleSeconds $script:VesShotManifestBuildStaleSeconds
     if (-not $token) { return $false }
@@ -866,8 +884,18 @@ function New-VesShotManifest {
         if (Get-VesShotComplexityEnable) {
             $cxStats = Join-Path ([System.IO.Path]::GetTempPath()) ("ves-cxstats-$PID-$(Get-Random)")
         }
+        # Per-profile low-contrast scene-detect threshold -- matches bash
+        # shot_split_create_manifest(): vintage / vtv / classic / canime masters
+        # have a subtle frame-diff metric at a cut, so drop 0.3 -> 0.12.
+        $sdThr = if ($env:SCENE_DETECT_THRESHOLD) { [double]$env:SCENE_DETECT_THRESHOLD } else { 0.3 }
+        $lowContrastProfiles = if ($env:SCENE_DETECT_LOWCONTRAST_PROFILES) {
+            $env:SCENE_DETECT_LOWCONTRAST_PROFILES -split '\s+'
+        } else { @('vintage', 'vtv', 'classic', 'canime') }
+        if ($Profile -in $lowContrastProfiles) {
+            $sdThr = if ($env:SCENE_DETECT_THRESHOLD_LOWCONTRAST) { [double]$env:SCENE_DETECT_THRESHOLD_LOWCONTRAST } else { 0.12 }
+        }
         try {
-            $boundaries = @(Get-VesSceneBoundaries -Source $Source -FfmpegPath $FfmpegPath -StatsOut $cxStats)
+            $boundaries = @(Get-VesSceneBoundaries -Source $Source -FfmpegPath $FfmpegPath -StatsOut $cxStats -Threshold $sdThr)
         } catch {
             Write-Warning "Get-VesSceneBoundaries failed for $Source -- $_"
             if ($cxStats -and (Test-Path -LiteralPath $cxStats)) { Remove-Item -LiteralPath $cxStats -Force -ErrorAction SilentlyContinue }
@@ -885,8 +913,14 @@ function New-VesShotManifest {
             $lines = @()
             if ($cxTable.ContainsKey($Idx)) {
                 $x = $cxTable[$Idx]
-                $lines += "cx_luma=$($x.Luma)"; $lines += "cx_motion=$($x.Motion)"
-                $lines += "cx_detail=$($x.Detail)"; $lines += "cx_sat=$($x.Sat)"
+                # fixed-width to match bash _shot_complexity_table()'s
+                # printf "%d %.2f %.4f %.4f %.2f" -- values are equal, but a
+                # trailing-zero drop (60.044 vs 60.0440) fails a byte-exact gate.
+                $ic = [System.Globalization.CultureInfo]::InvariantCulture
+                $lines += "cx_luma=$(([double]$x.Luma).ToString('0.00', $ic))"
+                $lines += "cx_motion=$(([double]$x.Motion).ToString('0.0000', $ic))"
+                $lines += "cx_detail=$(([double]$x.Detail).ToString('0.0000', $ic))"
+                $lines += "cx_sat=$(([double]$x.Sat).ToString('0.00', $ic))"
             }
             if ($cxStats -and (Test-Path -LiteralPath $cxStats) -and (($SEnd - $SStart) -gt $longSecs)) {
                 try {
@@ -938,18 +972,40 @@ function New-VesShotManifest {
                 } catch { }
             }
 
+            # bw_frac: duration-weighted fraction of shots whose cx_sat <= the
+            # b/w SATAVG ceiling -- ported from bash shot_split_create_manifest's
+            # awk over the tmpdir shot metas. is_bw flips to 1 at >= the min.
+            $ic = [System.Globalization.CultureInfo]::InvariantCulture
+            $satMax = if ($env:SOURCE_TRAITS_BW_SATAVG_MAX) { [double]$env:SOURCE_TRAITS_BW_SATAVG_MAX } else { 4.0 }
+            $bwFracMin = if ($env:SOURCE_TRAITS_BW_FRACTION_MIN) { [double]$env:SOURCE_TRAITS_BW_FRACTION_MIN } else { 0.90 }
+            $bwGrey = 0.0; $bwTot = 0.0
+            foreach ($sm in (Get-ChildItem -LiteralPath $buildTmp -Filter 'shot-*.meta' -File)) {
+                $c = Get-Content -LiteralPath $sm.FullName -Raw
+                $ss = [regex]::Match($c, '(?m)^start_ts=(.+)$'); $ee = [regex]::Match($c, '(?m)^end_ts=(.+)$')
+                $sat = [regex]::Match($c, '(?m)^cx_sat=(.+)$')
+                if (-not ($ss.Success -and $ee.Success)) { continue }
+                $d = [double]$ee.Groups[1].Value - [double]$ss.Groups[1].Value
+                if ($d -le 0) { continue }
+                $bwTot += $d
+                if ($sat.Success -and [double]$sat.Groups[1].Value -le $satMax) { $bwGrey += $d }
+            }
+            $bwFrac = if ($bwTot -gt 0) { $bwGrey / $bwTot } else { $null }
+            if ($null -ne $bwFrac -and $bwFrac -ge $bwFracMin) { $bw = '1' }
+
+            $bwFracStr = if ($null -ne $bwFrac) { $bwFrac.ToString('0.0000', $ic) } else { '' }
             $manifestFile = Join-Path $buildTmp 'manifest.meta'
             Write-VesKvFile -Path $manifestFile -Lines @(
                 "source=$(Convert-VesFleetPath -Path $Source -To Linux)",
                 "shot_count=$n",
                 "codec=$Codec",
                 "profile=$Profile",
-                "target=$Target",
+                "target=$(([double]$Target).ToString('0.0', $ic))",
                 "model=$Model",
                 "field_mode=$fm",
                 "is_bw=$bw",
+                "bw_frac=$bwFracStr",
                 "created_utc=$(Get-VesUtcStamp)",
-                "created_host=$env:COMPUTERNAME"
+                "created_host=$(if ($env:DVAL_WREG_HOST) { $env:DVAL_WREG_HOST } else { $env:COMPUTERNAME })"
             )
 
             Get-ChildItem -LiteralPath $buildTmp -File | ForEach-Object {

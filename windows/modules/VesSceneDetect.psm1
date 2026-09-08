@@ -37,7 +37,25 @@ function Get-VesSceneBoundaries {
     if (-not $PSBoundParameters.ContainsKey('Threshold')) {
         $Threshold = if ($env:SCENE_DETECT_THRESHOLD) { [double]$env:SCENE_DETECT_THRESHOLD } else { 0.3 }
     }
-    $threshStr = $Threshold.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $threshStr = $Threshold.ToString($inv)
+
+    # [sc] filter body -- MUST match _scene_detect_filter() in
+    # modules/ves-scene-detect.sh. The fleet default is the newer `scdet` filter
+    # (more robust than select='gt(scene,X)' on low-contrast / anime masters);
+    # the legacy 0-1 threshold maps onto scdet's 0-100 scale (0.3 -> ~10, a
+    # low-contrast 0.12 -> ~4). SCENE_DETECT_METHOD=scene forces the old path.
+    # (Before this the port always used select=scene -> ~7% different shot
+    # boundaries vs the bash manifest; 2026-09-08.)
+    $sceneMethod = if ($env:SCENE_DETECT_METHOD) { $env:SCENE_DETECT_METHOD } else { 'scdet' }
+    if ($sceneMethod -eq 'scene') {
+        $scFilter = "select='gt(scene,$threshStr)',showinfo"
+    } else {
+        $st = $Threshold * 33.3
+        if ($st -lt 1)   { $st = 1 }
+        if ($st -gt 100) { $st = 100 }
+        $scFilter = "scdet=threshold=$(($st).ToString('0.0', $inv)):sc_pass=1,showinfo"
+    }
 
     $wantStats = $StatsOut -and ($env:SHOT_COMPLEXITY_ENABLE -ne 'false')
     if ($wantStats) {
@@ -56,13 +74,13 @@ function Get-VesSceneBoundaries {
         $statsName = Split-Path -Leaf $StatsOut
         $psi.WorkingDirectory = Split-Path -Parent $StatsOut
         $fc = "[0:v]split=2[sc][st];" +
-              "[sc]select='gt(scene,$threshStr)',showinfo[cuts];" +
+              "[sc]$scFilter[cuts];" +
               "[st]fps=$fps,signalstats,entropy=mode=normal,metadata=print:file=$statsName,nullsink"
         $argv = @('-nostdin', '-v', 'info', '-nostats', '-i', $Source,
                   '-filter_complex', $fc, '-map', '[cuts]', '-an', '-sn', '-f', 'null', '-')
     } else {
         $argv = @('-nostdin', '-v', 'info', '-nostats', '-i', $Source,
-                  '-vf', "select='gt(scene,$threshStr)',showinfo", '-an', '-sn', '-f', 'null', '-')
+                  '-vf', $scFilter, '-an', '-sn', '-f', 'null', '-')
     }
     foreach ($a in $argv) { $psi.ArgumentList.Add($a) }
     $psi.RedirectStandardOutput = $true

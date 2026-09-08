@@ -89,6 +89,55 @@ are stale). **MARLONJ (macOS/ARM) is the exception** — its SVT-AV1 (v4.2.0
 *source*, homebrew) emits a ~0.02%-different bitstream from x86 (NEON vs AVX2),
 and `--asm 0` (pure C, would be bit-exact) SIGSEGVs on ARM.
 
+### v6.0.3 phase 3 — PRINCE/ELVIS in HOSTS + manifest-build parity (2026-09-08)
+
+- **`New-VesShotManifest` (`windows/modules/VesPerShotQp.psm1`)** — 4 bugs that
+  meant the PS manifest build never produced a bash-matching manifest:
+  1. the split-claim lock lives at `$mdir.splitting.lock` but `$mdir`'s parent
+     (`<base>_WORKING`) was never created, so `Enter-VesSharedMutexOnce`'s
+     `File.Open(CreateNew)` threw and it returned `$false` on every fresh title.
+     Now `[System.IO.Directory]::CreateDirectory` on the parent (matches bash
+     `mkdir -p -- "$(dirname "$mdir")"`).
+  2. **scene detection used the legacy `select='gt(scene,X)'`** — bash defaults
+     to the `scdet` filter (`scdet=threshold=Y:sc_pass=1`, 0-1 → 0-100 map);
+     different algorithm → 234 vs 218 shots on the test source. Fixed in
+     `Get-VesSceneBoundaries` (`windows/modules/VesSceneDetect.psm1`): scdet is
+     the default, `SCENE_DETECT_METHOD=scene` forces the old path.
+  3. the per-profile low-contrast threshold (0.3 → 0.12 for
+     vintage/vtv/classic/canime) wasn't applied.
+  4. numeric formatting — `cx_motion` now `%.4f`, `target` `%.1f`, the
+     `bw_frac` line is emitted (duration-weighted, ported from the bash awk),
+     `created_host` uses the canonical fleet name.
+  Result: **234 = 234 shots, boundaries + `manifest.meta` byte-identical**;
+  2/234 shot metas differ by 0.01 in `cx_sat` (a `[math]::Round` vs C-`printf`
+  rounding-mode wobble on a non-decision field).
+- **PRINCE + ELVIS added to the live search `HOSTS`** (gitignored
+  `dval_research.sh`). PRINCE validated in production (clean shot resolve +
+  deferred lease release). ELVIS was missing `SvtAv1EncApp.exe` entirely (would
+  have silently used the ~8-VMAF-off ffmpeg libsvtav1 fallback) → v4.2.0 exe +
+  `libSvtAv1Enc-4.dll` copied from PRINCE.
+- **`reconcile_host` win/mac** rewritten: reconcile by live redis wreg count
+  (relaunch when below target) instead of "launch once, never resize" — that
+  rule abandoned **MARLONJ** for the whole survey after one failed launch (its
+  `~/dval-scratch/` was also missing `worker_loop_discovery_multi.sh` +
+  `ves-dval-claim-lib.sh` — a silent partial scp; the mac branch now verifies).
+- The 3 Windows drivers (`worker_loop_discovery_multi.ps1`,
+  `dval_win_launch.ps1`, `generic_manifest_build.ps1`) take a single `-VesRoot`
+  param (was PRINCE-path-hardcoded); `dval_win_deploy.sh`'s post-deploy hash
+  verify fixed (the comma-array `Get-ChildItem` one-liner always returned
+  nothing → every file logged `DRIFT`).
+- **`dval_dispatch.sh` reconcile-churn fix**: a fully-searched title that can't
+  encode anywhere (`A Fish Called Wanda` — every host oversubscribed by its
+  non-survey load) was re-reserving JJACKSON every cycle and killing its search
+  fleet, because `_launch_encode`'s 4s pid-check was shorter than the encode
+  worker's module-load time on a loaded box (→ false `NOSTART`) and a NOSTART
+  set no cooldown. Now: pid-poll to 18s + `# DECLINED` detection; **any** launch
+  failure sets the 600s `DECLINE_UNTIL` cooldown.
+- `dval_searchwalk.sh` manifest picker: **STING → RANDYJ → search-fleet** (STING
+  is the direct-ZFS I/O node, never in HOSTS; RANDYJ its local backup). ELVIS
+  (win, `pwsh generic_manifest_build.ps1`) is a further follow-up.
+- Standing parity gate installed as a weekly cron on RANDYJ (Sun 06:00 UTC).
+
 ## v6.0.2P — 2026-09-08 (branch `6.x-chunk-redesign`)
 
 **LAYTOYAJ back in the encode pool** (user directive). The rule is now explicit:
