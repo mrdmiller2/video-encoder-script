@@ -4,6 +4,20 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.2P — 2026-09-08 (branch `6.x-chunk-redesign`)
+
+**LAYTOYAJ back in the encode pool** (user directive). The rule is now explicit:
+a fleet node runs an encode XOR D-val search, **never both in parallel** -- they
+may alternate serially on the same box. That invariant is already enforced at
+three layers (v6.0.2M): `dval_dispatch` reserves `dval:encnode:<host>` and defers
+the launch until search drains; the `dval_admit` Lua CAS returns STOP + HDELs any
+search worker whose host holds that key; `dval_research reconcile_host` publishes
+search target 0 for it. So an encode on LAYTOYAJ now runs with zero survey
+workers competing -- only its own (non-survey) comics/ebook OCR fleet, which the
+load-ratio capacity gate + worker preflight decline already account for. LAYTOYAJ
+was only pulled in v6.0.2M because at the time it ran search + encode + OCR
+simultaneously.
+
 ## v6.0.2O — 2026-09-08 (branch `6.x-chunk-redesign`)
 
 **Fix a v6.0.2N regression: the frame-count diagnostic in `score()` used
