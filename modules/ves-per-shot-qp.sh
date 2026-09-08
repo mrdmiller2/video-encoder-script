@@ -1537,9 +1537,34 @@ shot_search_worker_loop() {
   local _sw_max="${DVAL_SEARCH_WORKER_MAX_SECS:-21600}"
   local _sw_stopf="${DVAL_SHARED_DIR:-}/SURVEY-STOPPED"
   _sw_stopped(){ [ -n "${DVAL_SHARED_DIR:-}" ] && [ -f "$_sw_stopf" ] && cat "$_sw_stopf" >/dev/null 2>&1; }
+  # v6.0.2H: between-shot admission check is BACK -- 6.0.2F removed it to stop a
+  # subshell hang, but that hang was the OLD `$(timeout N bash -c '. lib; ...')`
+  # shape; 6.0.2F also made dval_admit forkless (~0.12s, direct _ves_redis after
+  # a bounded reach test), so it is safe here now. It does double duty:
+  #   * the GO path HSETs hb_epoch -- this is the ONLY heartbeat for the redis
+  #     registration. Without it the coordinator's count-Lua evicts every
+  #     worker after DVAL_WREG_TTL (240s) and reconcile_host relaunches a full
+  #     batch every sweep -> 8+ workers/host, loadavg 80+ (seen 2026-09-07).
+  #   * STOP -> we are the excess after a target drop: exit cleanly between shots.
+  local _sw_admit_slug _sw_admit_host _sw_admit_last=0
+  local _sw_admit_every="${DVAL_ADMIT_CHECK_SECS:-60}"
+  _sw_admit_slug="$_slug"
+  _sw_admit_host="${DVAL_WREG_HOST:-$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo host)}"
+  _sw_admit_ok(){
+    declare -F dval_admit >/dev/null 2>&1 || return 0
+    [ $(( SECONDS - _sw_admit_last )) -ge "$_sw_admit_every" ] || return 0
+    _sw_admit_last="$SECONDS"
+    case "$(dval_admit "$_sw_admit_slug" "$_sw_admit_host" "$$" "${DVAL_HOST_WORKER_COUNT:-2}")" in
+      STOP) return 1 ;;    # WAIT / GO -> keep going (don't drop claimed work on a blip)
+      *) return 0 ;;
+    esac
+  }
   while [ "$count" -lt "$max_shots" ]; do
     if _sw_stopped; then
       echo "shot-search: SURVEY-STOPPED present -- worker exiting cleanly (processed $count)"; break
+    fi
+    if ! _sw_admit_ok; then
+      echo "shot-search: admission STOP (target lowered / de-piled) -- worker exiting cleanly (processed $count)"; break
     fi
     if [ $(( SECONDS - _sw_t0 )) -gt "$_sw_max" ]; then
       warn "shot-search: worker lifetime cap ${_sw_max}s reached on $(hostname 2>/dev/null || echo '?') -- exiting (processed $count)"; break

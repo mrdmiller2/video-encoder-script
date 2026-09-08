@@ -4,6 +4,34 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.2L — 2026-09-08 (branch `6.x-chunk-redesign`)
+
+**Coordinator SSH pressure — collapse per-reconcile connection storm to one
+mux per host.** LAYTOYAJ (an EPYC VMware VM also running the comics/ebook OCR
+fleet) was intermittently dropping inbound `:22` SYNs — `ok=0-3/15-20` on a
+port-22 SYN probe while `:111` and ICMP stayed 100%. Not VMware stun, not
+fail2ban/sshguard (both inactive). Root cause: the coordinator's raw ssh
+connection *rate* against that host — every `reconcile_host` fired a burst of
+N separate `_mssh` calls to launch the deficit workers (one connection each,
+`sleep 1` apart), on top of the count/kill probes, `× every host`, plus
+`ves_fleet_monitor.sh` every 3 min — overflowed the VM's sshd accept queue
+under loadavg ~90.
+
+- `dval_research.sh` `_launch_host_workers`: the linux and mac launch paths now
+  run **one** `_mssh` with a remote `for` loop (`seq 1 N … & sleep 1`) instead
+  of N back-to-back connections. Same startup stagger, 1/Nth the SYNs.
+- `_mssh`/`_mscp`: added `ServerAliveInterval=15 ServerAliveCountMax=3`, raised
+  `ConnectTimeout` 8→12 and the hard `timeout` wall 30→45s / 90→120s — a busy
+  sshd takes longer to *accept* now that we lean on it less often.
+- `_ssh_mux_gc()` (new): before each reconcile sweep, `ssh -O check` every
+  remote master (local socket op, no network); a wedged one gets `ssh -O exit`
+  so the next `_mssh` builds a fresh master instead of every child inheriting
+  the wedge. The `~/.ssh/config` `ControlMaster auto` / `~/.ssh/cm/` mux (dir
+  was missing until this pass) now actually carries the fleet-control traffic.
+- LAYTOYAJ host tuning (applied out-of-band, recorded here): `sysctl`
+  `somaxconn=4096`, `tcp_max_syn_backlog=8192`, `tcp_abort_on_overflow=0`;
+  sshd `MaxStartups 150:30:400`, `MaxSessions 200`, `LoginGraceTime 20`.
+
 ## v6.0.2K — 2026-09-07 (branch `6.x-chunk-redesign`)
 
 **Registration heartbeat is a background beat again, not tied to the shot loop.**
