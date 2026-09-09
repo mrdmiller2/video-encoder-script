@@ -190,19 +190,21 @@ grain branch; `dval_worker_encode.ps1` now always runs the search (was gated on
 `if ($abAv1)`). Verified end-to-end on ELVIS.
 
 **MARLONJ reaper scheduling.** `dval_worker_reap.sh` + `dval_scratch_reap.sh`
-were deployed to MARLONJ but never scheduled (macOS has no per-user crontab
-wired for `worker`, and `cron` needs Full-Disk-Access on current macOS). Added
-`orchestration/regional-survey/deploy/macos/` — two `LaunchDaemon` plists
-(`com.ves.dval-{worker,scratch}-reap`, `StartInterval` 300 / 1800 s, `UserName
-worker`, `DVAL_SHARED_DIR=/Volumes/Media/_dval-survey`) + `install-macos-reap.sh`
-(idempotent `launchctl bootstrap system`; `worker` has NOPASSWD sudo). Same
-pattern as the existing `com.ves.rsyncd` LaunchDaemon on the box. Wired into
-`dval_epoch_cutover.sh` (a `kind=mac` node now gets the plists rsync'd + the
-installer run). Both reapers also gained a Darwin `SHARED` remap (source
-`dval_paths.sh` → `dval_mac_path`) so a bare invocation resolves `/Volumes`
-too — without it the "is this title done?" reads all missed and finished-title
-scratch never got cleaned on the mac node. Installed + verified on MARLONJ
-(`runs=2, last exit 0`; reap log shows a clean `host=MARLONJ` pass).
+were deployed to MARLONJ but never scheduled — the box had no crontab for any
+user. Added `orchestration/regional-survey/deploy/macos/install-macos-reap.sh`
+(gitignored tree; documented here): writes the `worker` crontab with the same
+two lines the Linux fleet uses (`*/5` worker, `*/30` scratch) but with
+`/opt/homebrew/bin/bash` explicitly (the reapers use `declare -A`, which
+/bin/bash 3.2 can't parse) + an explicit `PATH` + `DVAL_SHARED_DIR=/Volumes/...`.
+macOS cron is OnDemand, so launchd starts `/usr/sbin/cron` on the crontab write
+(confirmed `state = running` right after). Needs Full-Disk-Access on
+`/usr/sbin/cron` granted once per box (System Settings › Privacy & Security).
+Wired into `dval_epoch_cutover.sh` for `kind=mac`. Both reapers also gained a
+Darwin `SHARED` remap (source `dval_paths.sh` → `dval_mac_path`) so a bare
+invocation resolves `/Volumes` too — without it the "is this title done?" reads
+all missed and finished-title scratch never got cleaned on the mac node.
+(An earlier LaunchDaemon variant was installed then replaced with the crontab
+for fleet consistency; the installer removes it if present.)
 
 Deferred: parallelising dispatch's serial per-host SSH probes (a slow pass, not
 a hang); the x265/HEVC arm of the internal search (D-val is AV1-only).
