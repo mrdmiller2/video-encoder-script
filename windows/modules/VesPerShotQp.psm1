@@ -748,18 +748,24 @@ function Assemble-VesQpfileViaEqualSlopeBudget {
 
     if ($ByteBudget -gt 0 -and $ByteBudget -le 4) {
         $baseline = Get-VesEqualSlopeBudgetBaseline -ManifestDir $mdir -Target $pstTarget
-        # baseline-unfit safety net (mirrors ves-per-shot-qp.sh:2240-2255): a
-        # per-shot-optimal encode >= source, or well above the CRF base, means
-        # the search data / VMAF target is wrong for this title. Return $false so
-        # the worker skips this variant loud, instead of emitting a degenerate
-        # f90=f80=f70=... near-identical fraction sweep.
+        # baseline-unfit safety net (mirrors ves-per-shot-qp.sh:2249-2270): a
+        # per-shot-optimal encode well above the CRF base means the search data
+        # / VMAF target is wrong for this title. Return $false so the worker
+        # skips this variant loud instead of emitting a degenerate sweep.
         $srcBytes = 0.0
         try { $srcBytes = [double](Get-Item -LiteralPath (Convert-VesFleetPath -Path $Source -To Windows) -ErrorAction Stop).Length } catch { }
         $baseSanity = 0.0
         if ($env:ALLOC_BASELINE_SANITY_BYTES) { [double]::TryParse($env:ALLOC_BASELINE_SANITY_BYTES, [ref]$baseSanity) | Out-Null }
-        $maxRatio = if ($env:ALLOC_BASELINE_MAX_RATIO) { [double]$env:ALLOC_BASELINE_MAX_RATIO } else { 1.15 }
-        if ($srcBytes -gt 0 -and $baseline -ge $srcBytes) {
-            Write-Warning "  equal-slope budget: BASELINE UNFIT -- baseline $([int64]$baseline) B >= source $([int64]$srcBytes) B; search data / VMAF target suspect. Refusing."
+        # 1.5, not 1.15 -- healthy DONE A_pershot/base is <= ~1.1; 1.5 covers a
+        # legit hard grainy title, 2.0 would pass a runaway. KEEP IN SYNC with
+        # ves-per-shot-qp.sh ALLOC_BASELINE_MAX_RATIO default.
+        $maxRatio = if ($env:ALLOC_BASELINE_MAX_RATIO) { [double]$env:ALLOC_BASELINE_MAX_RATIO } else { 1.5 }
+        # `baseline >= source` only meaningful when the CRF base is <= source
+        # (a real master). If base already exceeds source (compressed re-encode
+        # like the 2 Mbps A Fish Called Wanda), the source byte count isn't a
+        # valid ceiling -- skip and rely on the ratio-vs-base check.
+        if ($srcBytes -gt 0 -and $baseline -ge $srcBytes -and ($baseSanity -le 0 -or $baseSanity -le $srcBytes)) {
+            Write-Warning "  equal-slope budget: BASELINE UNFIT -- baseline $([int64]$baseline) B >= source $([int64]$srcBytes) B (CRF base <= source); search data / VMAF target suspect. Refusing."
             return $false
         }
         if ($baseSanity -gt 0 -and $baseline -gt ($baseSanity * $maxRatio)) {
@@ -1538,8 +1544,8 @@ function Get-VesVmafScoreShot {
     <#
     .SYNOPSIS
     Port of _vmaf_score_shot() (v6.0.1A): SvtAv1EncApp --qpfile uniform
-    encode, grain-ON VMAF (NO -export_side_data film_grain), frame-
-    aligned via setpts=PTS-STARTPTS on matched extracted clips. Two-stage
+    encode, grain-ON VMAF (NO -export_side_data film_grain), frame-index
+    aligned via setpts=N on matched extracted clips (v6.0.2N). Two-stage
     seek (fast pre-input -ss + accurate post-input -ss). Returns
     PSCustomObject @{ Vmaf; Bytes } or $null on failure.
     #>
@@ -1661,7 +1667,12 @@ function Get-VesVmafScoreShot {
             $stride = Get-VesPerShotVmafStride
             if ($stride -gt 1) { $sel = "select='not(mod(n\,$stride))'," }
         }
-        $lavfi = "[0:v]${sel}setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]${sel}setpts=PTS-STARTPTS,format=yuv420p10le[r];[d][r]libvmaf=model=${Model}:n_threads=${nThreads}:log_fmt=json:log_path=$vlogName"
+        # Frame-index pairing (setpts=N), matching the v6.0.2N fix in score() /
+        # _vmaf_score_one and the bash _vmaf_score_shot. $outMkv (CFR) and $clip
+        # (ffv1 re-encode, may carry the source's irregular ms-timebase PTS)
+        # have identical frame counts by construction; PTS-pairing desynced them
+        # on ms-timebase Matroska and suppressed the per-shot VMAF ceiling.
+        $lavfi = "[0:v]${sel}setpts=N,format=yuv420p10le[d];[1:v]${sel}setpts=N,format=yuv420p10le[r];[d][r]libvmaf=model=${Model}:n_threads=${nThreads}:log_fmt=json:log_path=$vlogName"
         $vmafRun = Invoke-VesWithTimeoutRetry -FilePath $FfmpegPath -ArgumentList @(
             '-y', '-v', 'error', '-i', $outMkv, '-i', $clip,
             '-lavfi', $lavfi, '-f', 'null', '-'

@@ -34,6 +34,7 @@ if (-not (Get-Module -Name VesProfileDecision)) {
 }
 
 $script:VmafCrfCache = @{}
+$script:LastCrfSearchVmaf = $null
 
 # Real bug found 2026-08-03, root-caused via team research (2026-08-03):
 # SVT-AV1 v4.1.0-279-gd3c4cb394's SSSE3 kernel
@@ -482,12 +483,21 @@ function Resolve-VesCrfForEncode {
     if ($null -eq $result) {
         Write-Warning "VMAF search failed or no CRF met target -- fixed CRF $FixedCrf"
         $script:VmafCrfCache[$key] = $FixedCrf
+        $script:LastCrfSearchVmaf = $null
         return $FixedCrf
     }
 
     Write-Host "VMAF search chose CRF $($result.Crf) (sample VMAF $($result.Vmaf) >= $VmafTarget; predicted $($result.PredictedSize))"
     $script:VmafCrfCache[$key] = $result.Crf
+    # best achieved sample VMAF, for the worker's source-limited cohort tag
+    $script:LastCrfSearchVmaf = $result.Vmaf
     return $result.Crf
+}
+
+function Get-VesLastCrfSearchVmaf {
+    <# The best sample VMAF from the most recent Resolve-VesCrfForEncode call
+       ($null if it fell back to fixed CRF). Used for the SOURCE-LIMITED tag. #>
+    if ($null -ne $script:LastCrfSearchVmaf) { [double]$script:LastCrfSearchVmaf } else { $null }
 }
 
 function Invoke-VesVmafScoreOne {
@@ -895,4 +905,4 @@ function Get-VesFinalVmaf {
     return [math]::Round($vsum / $n, 1)
 }
 
-Export-ModuleMember -Function Get-VesVideoHeight, Get-VesVideoWidth, Test-VesSourceIsUhd, Get-VesVmafTargetForSource, Get-VesVmafModelForSource, Invoke-VesVmafCrfSearchAbAv1, Invoke-VesVmafScoreOne, Invoke-VesVmafCrfSearchInternal, Resolve-VesCrfForEncode, Test-VesSvtAv1Preset8Safe, Get-VesFinalVmaf
+Export-ModuleMember -Function Get-VesVideoHeight, Get-VesVideoWidth, Test-VesSourceIsUhd, Get-VesVmafTargetForSource, Get-VesVmafModelForSource, Invoke-VesVmafCrfSearchAbAv1, Invoke-VesVmafScoreOne, Invoke-VesVmafCrfSearchInternal, Resolve-VesCrfForEncode, Get-VesLastCrfSearchVmaf, Test-VesSvtAv1Preset8Safe, Get-VesFinalVmaf

@@ -515,6 +515,15 @@ _vmaf_score_shot() {
     _stride="${PER_SHOT_VMAF_STRIDE:-2}"
   fi
   [ "${_stride:-1}" -gt 1 ] 2>/dev/null && _sel="select='not(mod(n\,${_stride}))',"
+  # Frame-index pairing (setpts=N), NOT setpts=PTS-STARTPTS. This scorer got
+  # left behind by the v6.0.2N fix that switched score() + _vmaf_score_one to
+  # setpts=N. $out_mkv (CFR, from a y4m) and $clip (ffv1 re-encode of the same
+  # shot, which can carry the source's irregular ms-timebase-Matroska PTS)
+  # have IDENTICAL frame counts by construction, but PTS-pairing silently
+  # desynced them on that source class and suppressed the per-shot VMAF ceiling
+  # -- the likely cause of grain/vintage titles' shots flooring at the QP
+  # extend-floor (All About Eve, 2026-09-09). setpts=N after ${_sel} renumbers
+  # the post-select frames 0..n on both legs identically.
   # grain_decode_flag (empty by default; -filmgrain 0 when PER_SHOT_VMAF_FGS=off)
   # goes before BOTH -i so the strip is symmetric. -threads caps dav1d/scale on
   # this leg; libvmaf gets its own n_threads. _vmaf_scale downscales both legs
@@ -522,7 +531,7 @@ _vmaf_score_shot() {
   _t0="$(_shot_diag_now)"
   _run_timeout_retry "$enc_timeout" "${FFMPEG_CMD[@]}" -y -v error -threads "$_dthreads" \
     "${grain_decode_flag[@]}" -i "$out_mkv" "${grain_decode_flag[@]}" -i "$clip" -lavfi \
-    "[0:v]${_sel}${_vmaf_scale}setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]${_sel}${_vmaf_scale}setpts=PTS-STARTPTS,format=yuv420p10le[r];[d][r]libvmaf=model=$model:n_threads=$(_shot_vmaf_threads):log_fmt=json:log_path=$vlog" \
+    "[0:v]${_sel}${_vmaf_scale}setpts=N,format=yuv420p10le[d];[1:v]${_sel}${_vmaf_scale}setpts=N,format=yuv420p10le[r];[d][r]libvmaf=model=$model:n_threads=$(_shot_vmaf_threads):log_fmt=json:log_path=$vlog" \
     -f null - 2>/dev/null
   { local _rc=$?; _shot_diag vmaf "$_t0" "$_rc" "model=$model${_vmaf_scale:+ proxy1080}"; [ "$_rc" -eq 0 ]; } || { rm -rf "$work"; return 1; }
   _t0="$(_shot_diag_now)"
@@ -2237,17 +2246,27 @@ assemble_qpfile_via_equal_slope_budget() {
       log_err "  equal-slope budget: baseline ${_baseline} B < physical floor ${_floor_sum} B -- clamping up (hard-shot fallback under-priced)"
       _baseline="$_floor_sum"
     fi
-    # SANITY (Option 3 safety net): a per-shot-optimal AV1 encode bigger than the
-    # source, or well above the CRF base, means the search data or the VMAF
-    # target is wrong for this title. Fail loud rather than emit a degenerate
-    # fraction sweep. Survey caller exports ALLOC_BASELINE_SANITY_BYTES=<base>.
+    # SANITY (Option 3 safety net): a per-shot-optimal AV1 encode well above the
+    # CRF base means the search data or the VMAF target is wrong for this title.
+    # Fail loud rather than emit a degenerate fraction sweep. Survey caller
+    # exports ALLOC_BASELINE_SANITY_BYTES=<base>.
     local _srcbytes; _srcbytes="$(_pfs "$src")"
-    if [ "${_baseline:-0}" -ge "${_srcbytes:-0}" ] 2>/dev/null && [ "${_srcbytes:-0}" -gt 0 ]; then
-      log_err "  equal-slope budget: BASELINE UNFIT -- baseline ${_baseline} B >= source ${_srcbytes} B; search data / VMAF target suspect for this title. Refusing to build a fraction qpfile."
+    # `_baseline >= source` is only meaningful when the source is a real quality
+    # master. If the CRF `base` ALREADY exceeds the source (A Fish Called Wanda:
+    # 2.0 Mbps HEVC re-encode, base = 159% of src), the source byte count is not
+    # a valid ceiling -- skip this check and rely on the ratio-vs-base one.
+    if [ "${_baseline:-0}" -ge "${_srcbytes:-0}" ] 2>/dev/null && [ "${_srcbytes:-0}" -gt 0 ] \
+       && { [ -z "${ALLOC_BASELINE_SANITY_BYTES:-}" ] || [ "${ALLOC_BASELINE_SANITY_BYTES:-0}" -le "${_srcbytes:-0}" ] 2>/dev/null; }; then
+      log_err "  equal-slope budget: BASELINE UNFIT -- baseline ${_baseline} B >= source ${_srcbytes} B (and CRF base <= source, so source is a valid ceiling); search data / VMAF target suspect. Refusing to build a fraction qpfile."
       return 2
     fi
     if [ -n "${ALLOC_BASELINE_SANITY_BYTES:-}" ] && [ "${ALLOC_BASELINE_SANITY_BYTES:-0}" -gt 0 ] 2>/dev/null; then
-      local _maxr="${ALLOC_BASELINE_MAX_RATIO:-1.15}"
+      # 1.5x, not 1.15: every healthy DONE title's A_pershot/base is <= ~1.1;
+      # the fraction _baseline runs slightly under A_pershot. 1.5 covers a
+      # legitimately hard grainy title with margin for the isolated-clip k;
+      # 2.0 would pass a genuinely runaway per-shot search (All About Eve at
+      # 3.6x base). KEEP IN SYNC with VesPerShotQp.psm1 Get-VesAllocBaselineMaxRatio.
+      local _maxr="${ALLOC_BASELINE_MAX_RATIO:-1.5}"
       if awk -v b="$_baseline" -v s="$ALLOC_BASELINE_SANITY_BYTES" -v r="$_maxr" 'BEGIN{exit !(b > s*r)}'; then
         log_err "  equal-slope budget: BASELINE UNFIT -- baseline ${_baseline} B > ${_maxr}x CRF base ${ALLOC_BASELINE_SANITY_BYTES} B; hard shots inflating the sum. Refusing to build a fraction qpfile."
         return 2

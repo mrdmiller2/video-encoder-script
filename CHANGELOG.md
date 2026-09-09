@@ -89,6 +89,53 @@ are stale). **MARLONJ (macOS/ARM)** was the exception (homebrew svt-av1 bottle
 emits a ~0.03%-different bitstream) — **resolved in phase 5**: a clean v4.2.0
 git-tag build is bit-exact; MARLONJ now encodes.
 
+### v6.0.3 phase 7 — D-val per-shot scorer desync + BASELINE-UNFIT gate (2026-09-09)
+
+Two peer reviews of the "3 stuck titles" (Wanda / All About Eve / American Pop)
+overturned the first triage: grain synthesis is a ~0.5 VMAF effect (live-tested,
+`dval-grain-vmaf-crf-search-broken`), not the cause; 8-bit is not the
+discriminator (Gun Crazy / Conan / A Day at the Races are 8-bit and DONE). The
+real bug:
+
+- **`_vmaf_score_shot` never got the v6.0.2N `setpts=N` fix.** `score()` and
+  `_vmaf_score_one` were switched to frame-index pairing; the per-shot search
+  scorer (`ves-per-shot-qp.sh:525`, `VesPerShotQp.psm1`) still used
+  `setpts=PTS-STARTPTS`. `$out_mkv` (CFR) vs `$clip` (ffv1 re-encode that can
+  carry a ms-timebase Matroska's irregular PTS) have identical frame counts by
+  construction, but PTS-pairing desynced them on that source class and
+  suppressed the per-shot VMAF ceiling — the likely cause of All About Eve's
+  366/866 shots flooring at the QP extend-floor and its base landing at 90.25
+  (below the 94 target). Fixed both legs → `setpts=N` (after `${_sel}` so
+  post-select frames renumber identically). Bash + PS.
+
+- **BASELINE-UNFIT gate reworked.** `_baseline >= _srcbytes` is a false positive
+  for an already-compressed source (A Fish Called Wanda: 2.0 Mbps HEVC, CRF base
+  = 159% of source) — now only applied when the CRF `base` is itself `<= source`
+  (i.e. the source is a real quality master). `ALLOC_BASELINE_MAX_RATIO`
+  1.15 → **1.5** (new `ves-config.sh` constant): healthy DONE titles' A_pershot/
+  base is `<= ~1.1`; 1.5 tolerates a legitimately hard grainy title; All About
+  Eve at 3.6× is still correctly rejected. Bash + PS lockstep.
+
+- **Auto-quarantine on a completion-blocking BASELINE-UNFIT** (`dval_dispatch.sh`).
+  `_note_strike` only quarantined on a *full* 6-variant sweep or 3 strikes — a
+  title whose D_ variants landed but whose B_f80 is unfit (Wanda) can never hit
+  "full sweep", so it re-dispatched every pass forever (worker does the unfit
+  variant → exits INCOMPLETE → repeat). Now: `>= 1` BASELINE-UNFIT entry on a
+  title with 1–7 scored variants → quarantine immediately.
+
+- **`SOURCE-LIMITED base-ceiling=` cohort tag** in the result header when the
+  CRF search's best sample VMAF is > 3 below target (American Pop tops out ~88
+  at any CRF). Informational — the encode still runs at the normal target
+  (shifting it would break cross-title comparability). Bash + PS (new
+  `Get-VesLastCrfSearchVmaf`).
+
+Dropped from the proposed plan: grain-OFF per-shot scoring (comparability trap,
+already reverted twice — grain-OFF *lowers* VMAF and makes the search spend
+more). Deferred to a follow-up: the source-quality pre-gate at searchwalk
+intake, the 10-bit source policy + "10-bit default for all encodes (AV1/x265)",
+and the `assemble_qpfile_from_shot_manifest` byte governor (pending the
+re-searched All About Eve numbers).
+
 ### v6.0.3 phase 6 — cross-platform E2E review remediation (2026-09-09)
 
 A 3-platform review (Linux coordinator / Windows PS / macOS + x-platform) found

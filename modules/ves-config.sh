@@ -664,6 +664,13 @@ ALLOC_MIN_SHOT_PIN_ROUNDS="${ALLOC_MIN_SHOT_PIN_ROUNDS:-4}"
 # the target is divided by K before the lambda solve so the final encode lands
 # near it. Recalibrate per codec/preset if it drifts; 1.0 = off (raw target).
 ALLOC_BYTES_CALIBRATION_K="${ALLOC_BYTES_CALIBRATION_K:-1.13}"
+# BASELINE-UNFIT gate: the per-shot-optimal sum (fraction-mode baseline) may not
+# exceed this multiple of the CRF `base`. Healthy DONE titles' A_pershot/base is
+# <= ~1.1; 1.5 tolerates a legitimately hard grainy title; > this = a runaway
+# per-shot search (bad search data / wrong VMAF target) -> the fraction sweep is
+# refused (equal_slope_budget returns 2). KEEP IN SYNC with
+# VesPerShotQp.psm1's default in Assemble-VesQpfileViaEqualSlopeBudget.
+ALLOC_BASELINE_MAX_RATIO="${ALLOC_BASELINE_MAX_RATIO:-1.5}"
 #
 # (#3) crossover refinement in resolve_per_shot_qp(). VMAF-vs-QP is not
 # monotone-smooth — GOP/RC decisions give ±0.3–0.5 wiggle — so the bounded
