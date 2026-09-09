@@ -172,8 +172,25 @@ macOS, ×7 assemblies per encode, and read as a stall by the encode heartbeat).
 Now a single `awk` pass — byte-identical output, 145 k frames in <1 s
 (live-verified on MARLONJ).
 
+**W10 — grain base-CRF search ported (`VesVmafCrfSearch.psm1`).** The review
+called this a MEDIUM PS gap; it was bigger. `profile_uses_grain_synthesis()` is
+true for `anime|classic|vintage|vtv`, and the **D-val survey runs profile=classic
+on the whole corpus** — so on PRINCE/ELVIS *every* D-val title's `base` CRF was
+falling through to the static `FIXED_CRF_SVT_CLASSIC=25` instead of the grain-ON
+VMAF-target bisection the rest of the fleet runs. `base` is the D-val anchor
+(A_pershot, the D_fXX byte fractions, `ALLOC_BASELINE_SANITY_BYTES` all key off
+it), so a PRINCE-encoded classic title was not in the same measurement
+population as a Linux-encoded one. Fix: ported `vmaf_crf_search_internal` +
+`_vmaf_score_one` (`Invoke-VesVmafCrfSearchInternal` / `Invoke-VesVmafScoreOne`)
+— coarse anchors 22/30/38, bisect the target crossing over `VMAF_SAMPLES` clips,
+each encoded at `SVT_PRESET_SEARCH=8` with the full profile svt params and scored
+grain-ON (`setpts=N` frame-index alignment, no `-export_side_data film_grain`),
+same below-target fallback (2026-08-16). Wired into `Resolve-VesCrfForEncode`'s
+grain branch; `dval_worker_encode.ps1` now always runs the search (was gated on
+`if ($abAv1)`). Verified end-to-end on ELVIS.
+
 Deferred: parallelising dispatch's serial per-host SSH probes (a slow pass, not
-a hang).
+a hang); the x265/HEVC arm of the internal search (D-val is AV1-only).
 
 ### v6.0.3 phase 5 — encode robustness, spill tiering, MARLONJ resolved (2026-09-09)
 

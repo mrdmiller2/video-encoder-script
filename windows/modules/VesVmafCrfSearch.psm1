@@ -2,19 +2,17 @@
 # (resolve_crf_for_encode() and vmaf_crf_search_abav1(), lines
 # ~10619-10736).
 #
-# Deliberately NOT ported in this pass: vmaf_crf_search_internal()'s
-# bespoke ffmpeg-based search (coarse-anchor-then-bisect over sample
-# clips, its own libvmaf scoring via _vmaf_score_one). The bash version
-# uses ab-av1 for almost everything and only falls back to the internal
-# search for AV1 grain-synthesizing profiles (anime/vintage), because
-# those profiles need the project's own candidate scoring policy. As of
-# v6.0.1A that policy deliberately scores grain-ON playback against the
-# grainy source (not the former grain-stripped decode), so ab-av1 is still
-# not used for those profiles until the internal search is ported. This port covers the
-# ab-av1 path, which is the common case; the grain-synthesis case is
-# handled by failing closed to the fixed-CRF fallback with an explicit
-# warning (never a silently-uncorrected-for-grain VMAF score), tracked
-# as a real gap until the internal search gets ported.
+# v6.0.3 phase 6: vmaf_crf_search_internal() + _vmaf_score_one() are now
+# ALSO ported (Invoke-VesVmafCrfSearchInternal / Invoke-VesVmafScoreOne).
+# The bash side uses ab-av1 for almost everything and falls back to the
+# internal search for AV1 grain-synthesizing profiles (anime/classic/
+# vintage/vtv) -- and the D-val regional survey runs profile=classic on the
+# WHOLE corpus, so on a Windows encoder every D-val `base` CRF was falling
+# through to the static FIXED_CRF_SVT_CLASSIC (25) instead of a grain-ON
+# VMAF-target bisection like the rest of the fleet. That made a Windows-
+# encoded `base` variant (and everything anchored to it: the D_fXX byte
+# fractions, ALLOC_BASELINE_SANITY_BYTES) methodologically incomparable
+# with a Linux/mac-encoded one. The internal search closes that gap.
 #
 # VmafTarget/FixedCrf/SVT-or-x265 params still come in as caller-supplied
 # parameters (same layering as VesTwoStageEncode.psm1 taking pre-built
@@ -434,13 +432,27 @@ function Resolve-VesCrfForEncode {
     $grainSynthesis = if ($null -ne $ProfileUsesGrainSynthesis) { $ProfileUsesGrainSynthesis } else { Test-VesProfileUsesGrainSynthesis -Profile $Profile }
     $canUseAbAv1 = ($Codec -ne 'av1') -or (-not $grainSynthesis)
     $result = $null
-    if ($canUseAbAv1 -and $Codec -eq 'av1' -and $FfmpegPath) {
+    $preset8State = $null
+    # the ab-av1 AND the internal search both encode at SVT preset 8, which
+    # crashes on some pre-AVX2 CPUs (see the SSSE3 note at the top) -- run the
+    # guard for either path.
+    if ($Codec -eq 'av1' -and $FfmpegPath) {
         $preset8State = Test-VesSvtAv1Preset8Safe -FfmpegPath $FfmpegPath -Source $Source
         if ($preset8State -eq 'Broken') {
             Write-Warning "SVT-AV1 preset 8 crashes on this host even with the asm=sse3 workaround -- skipping AV1 VMAF CRF-search entirely (fixed CRF $FixedCrf) rather than risking a crash"
             $canUseAbAv1 = $false
+            $grainSynthesis = $false   # force the fixed-CRF fallback below
         }
     }
+
+    # svt params for the internal search (grain path): pull from EncoderArgs
+    # ("--svt <params>"), append :asm=sse3 on a NeedsSse3 host.
+    $svtParamsForSearch = ''
+    for ($i = 0; $i -lt $EncoderArgs.Count - 1; $i++) {
+        if ($EncoderArgs[$i] -eq '--svt') { $svtParamsForSearch = "$($EncoderArgs[$i + 1])"; break }
+    }
+    if ($svtParamsForSearch -and $preset8State -eq 'NeedsSse3') { $svtParamsForSearch = "${svtParamsForSearch}:asm=sse3" }
+
     if ($canUseAbAv1 -and $AbAv1Path) {
         $searchEncoderArgs = $EncoderArgs
         if ($Codec -eq 'av1' -and $preset8State -eq 'NeedsSse3') {
@@ -454,8 +466,17 @@ function Resolve-VesCrfForEncode {
         }
         $result = Invoke-VesVmafCrfSearchAbAv1 -Source $Source -Codec $Codec -Target $VmafTarget -Model $model `
             -AbAv1Path $AbAv1Path -EncoderArgs $searchEncoderArgs -VideoFilter $VideoFilter
+    } elseif (-not $canUseAbAv1 -and $grainSynthesis -and $Codec -eq 'av1' -and $FfmpegPath -and $FfprobePath -and $svtParamsForSearch) {
+        # grain-synthesizing AV1 (anime/classic/vintage/vtv): ab-av1 can't
+        # disable synth-grain decode, so use the ported internal search --
+        # grain-ON scoring against the grainy source, same as the fleet.
+        $internal = Invoke-VesVmafCrfSearchInternal -Source $Source -Target $VmafTarget -Model $model `
+            -SvtParams $svtParamsForSearch -FfmpegPath $FfmpegPath -FfprobePath $FfprobePath -TargetHeight $TargetHeight
+        if ($null -ne $internal) {
+            $result = [PSCustomObject]@{ Crf = $internal.Crf; Vmaf = $internal.Vmaf; PredictedSize = $internal.PredictedSize }
+        }
     } elseif (-not $canUseAbAv1 -and $grainSynthesis -and $Codec -eq 'av1') {
-        Write-Warning "Profile '$Profile' uses AV1 grain synthesis -- the project's grain-ON internal VMAF search is not ported yet -- using fixed CRF $FixedCrf instead of a potentially-wrong VMAF-searched value"
+        Write-Warning "Profile '$Profile' uses AV1 grain synthesis but ffmpeg/ffprobe/svt-params were not all supplied to the internal search -- using fixed CRF $FixedCrf"
     }
 
     if ($null -eq $result) {
@@ -467,6 +488,178 @@ function Resolve-VesCrfForEncode {
     Write-Host "VMAF search chose CRF $($result.Crf) (sample VMAF $($result.Vmaf) >= $VmafTarget; predicted $($result.PredictedSize))"
     $script:VmafCrfCache[$key] = $result.Crf
     return $result.Crf
+}
+
+function Invoke-VesVmafScoreOne {
+    <#
+    .SYNOPSIS
+    Port of _vmaf_score_one(): encode ONE sample clip at ONE CRF with the
+    profile's real SVT params, then score it grain-ON against the clip
+    (frame-index aligned via setpts=N -- the clip and its encode have the
+    same frame count by construction, so no offset search is needed, unlike
+    Get-VesFinalVmaf's independent whole-movie seeks). Returns
+    @{ Vmaf=<double>; Bytes=<int64> } or $null on any failure.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Clip,
+        [Parameter(Mandatory)][int]$Crf,
+        [Parameter(Mandatory)][string]$SvtParams,
+        [Parameter(Mandatory)][string]$Model,
+        [Parameter(Mandatory)][string]$FfmpegPath,
+        [int]$SearchPreset = 8,
+        [int]$TargetHeight = 0,
+        [int]$TimeoutSeconds = 900
+    )
+    $out = [System.IO.Path]::ChangeExtension($Clip, $null) + "-enc-av1-$Crf.mkv"
+    $scaleFilter = switch ($TargetHeight) {
+        720  { 'scale=1280:720:flags=lanczos:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2' }
+        1080 { 'scale=1920:1080:flags=lanczos:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2' }
+        default { '' }
+    }
+    $encArgs = @('-y', '-v', 'error', '-i', $Clip)
+    if ($scaleFilter) { $encArgs += @('-vf', $scaleFilter) }
+    $encArgs += @('-c:v', 'libsvtav1', '-preset', "$SearchPreset", '-crf', "$Crf",
+        '-pix_fmt', 'yuv420p10le', '-svtav1-params', $SvtParams, '-an', $out)
+    $enc = Invoke-VesProbeFfmpegRun -FfmpegPath $FfmpegPath -Args $encArgs -TimeoutSeconds $TimeoutSeconds
+    if (-not $enc.Ok -or -not (Test-Path -LiteralPath $out)) {
+        Remove-Item -LiteralPath $out -Force -ErrorAction SilentlyContinue
+        return $null
+    }
+    $bytes = [int64](Get-Item -LiteralPath $out).Length
+
+    $refFilter = if ($scaleFilter) { "$scaleFilter,setpts=N,format=yuv420p10le" } else { 'setpts=N,format=yuv420p10le' }
+    $nThreads = [Environment]::ProcessorCount
+    $vlogDir = [System.IO.Path]::GetTempPath()
+    $vlogName = "ves-crf-$([guid]::NewGuid().ToString('N')).json"
+    $vlog = Join-Path $vlogDir $vlogName
+    # grain-ON scoring: NO -export_side_data film_grain (see the bash
+    # _vmaf_score_one comment -- grain-off-vs-grainy penalises grain the
+    # real decoder re-synthesises). Bare filename + WorkingDirectory so
+    # ffmpeg's ':'-splitting filter parser doesn't choke on a Windows path.
+    $lavfi = "[0:v]setpts=N,format=yuv420p10le[d];[1:v]$refFilter[r];[d][r]libvmaf=model=$Model`:n_threads=$nThreads`:log_fmt=json:log_path=$vlogName"
+    $scoreArgs = @('-y', '-v', 'error', '-i', $out, '-i', $Clip, '-lavfi', $lavfi, '-f', 'null', '-')
+    $score = Invoke-VesProbeFfmpegRun -FfmpegPath $FfmpegPath -Args $scoreArgs -TimeoutSeconds $TimeoutSeconds -WorkingDirectory $vlogDir
+    $vmaf = $null
+    if ($score.Ok -and (Test-Path -LiteralPath $vlog)) {
+        try {
+            $json = Get-Content -LiteralPath $vlog -Raw | ConvertFrom-Json
+            $vmaf = [double]$json.pooled_metrics.vmaf.mean
+        } catch { $vmaf = $null }
+    }
+    Remove-Item -LiteralPath $vlog, $out -Force -ErrorAction SilentlyContinue
+    if ($null -eq $vmaf) { return $null }
+    return [PSCustomObject]@{ Vmaf = $vmaf; Bytes = $bytes }
+}
+
+function Invoke-VesVmafCrfSearchInternal {
+    <#
+    .SYNOPSIS
+    Port of vmaf_crf_search_internal(): coarse anchors (22/30/38) then
+    bisect the target crossing over VMAF_SAMPLES sample clips, each scored
+    grain-ON by Invoke-VesVmafScoreOne. Used for AV1 grain-synthesizing
+    profiles (ab-av1 can't disable synth-grain decode -- ab-av1 #139).
+    Returns @{ Crf; PredictedSize; Vmaf } or $null (caller falls back to
+    the static fixed CRF only when literally nothing was measured).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][double]$Target,
+        [Parameter(Mandatory)][string]$Model,
+        [Parameter(Mandatory)][string]$SvtParams,
+        [Parameter(Mandatory)][string]$FfmpegPath,
+        [Parameter(Mandatory)][string]$FfprobePath,
+        [int]$TargetHeight = 0,
+        [int]$Samples        = $(if ($env:CONVERT_VMAF_SAMPLES)      { [int]$env:CONVERT_VMAF_SAMPLES }      else { 3 }),
+        [int]$SampleSeconds  = $(if ($env:CONVERT_VMAF_SAMPLE_SECS)  { [int]$env:CONVERT_VMAF_SAMPLE_SECS }  else { 20 }),
+        [int]$SearchPreset   = $(if ($env:SVT_PRESET_SEARCH)         { [int]$env:SVT_PRESET_SEARCH }         else { 8 }),
+        [int]$MinCrf         = 16,
+        [int]$MaxCrf         = 46
+    )
+    # duration (ffprobe, short; Invoke-VesProbeFfmpegRun doesn't return stdout)
+    $durArgs = @('-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', $Source)
+    $dur = 0.0
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $FfprobePath
+    foreach ($a in $durArgs) { $psi.ArgumentList.Add($a) }
+    $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false
+    $p = [System.Diagnostics.Process]::Start($psi)
+    try {
+        $t = $p.StandardOutput.ReadToEndAsync()
+        if (-not $p.WaitForExit(30000)) { try { $p.Kill($true) } catch { }; return $null }
+        $t.Wait()
+        [void][double]::TryParse($t.Result.Trim(), [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$dur)
+    } finally { $p.Dispose() }
+    $durInt = [int][math]::Floor($dur)
+    if ($durInt -lt ($SampleSeconds * 3)) { return $null }
+
+    $nsamples = $Samples
+    while ($nsamples -gt 1 -and $durInt -lt ($SampleSeconds * $nsamples * 2)) { $nsamples-- }
+
+    $work = Join-Path ([System.IO.Path]::GetTempPath()) "ves-crf-$([guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $work -Force | Out-Null
+    try {
+        $clips = @()
+        $clipBytes = [int64]0
+        for ($i = 1; $i -le $nsamples; $i++) {
+            $start = [int][math]::Floor($durInt * ($i * 2 - 1) / ($nsamples * 2))
+            $clip = Join-Path $work "clip$i.mkv"
+            $exArgs = @('-y', '-v', 'error', '-ss', "$start", '-t', "$SampleSeconds", '-i', $Source, '-map', '0:v:0', '-c', 'copy', $clip)
+            $ex = Invoke-VesProbeFfmpegRun -FfmpegPath $FfmpegPath -Args $exArgs -TimeoutSeconds 120
+            if (-not $ex.Ok -or -not (Test-Path -LiteralPath $clip) -or (Get-Item -LiteralPath $clip).Length -le 0) { return $null }
+            $clips += $clip
+            $clipBytes += [int64](Get-Item -LiteralPath $clip).Length
+        }
+
+        $score = @{}   # crf -> avg vmaf
+        $bytes = @{}   # crf -> total bytes across clips
+        $probeCrf = {
+            param($crf)
+            if ($score.ContainsKey($crf)) { return $true }
+            $vsum = 0.0; $btot = [int64]0
+            foreach ($c in $clips) {
+                $r = Invoke-VesVmafScoreOne -Clip $c -Crf $crf -SvtParams $SvtParams -Model $Model -FfmpegPath $FfmpegPath -SearchPreset $SearchPreset -TargetHeight $TargetHeight
+                if ($null -eq $r) { return $false }
+                $vsum += $r.Vmaf; $btot += $r.Bytes
+            }
+            $score[$crf] = [math]::Round($vsum / $clips.Count, 2)
+            $bytes[$crf] = $btot
+            Write-Host ("  crf-search [av1] crf={0} vmaf={1}" -f $crf, $score[$crf])
+            return $true
+        }
+
+        foreach ($crf in @(22, 30, 38)) { if (-not (& $probeCrf $crf)) { return $null } }
+        for ($iter = 1; $iter -le 3; $iter++) {
+            $above = $null; $below = $null
+            foreach ($crf in ($score.Keys | Sort-Object)) {
+                if ($score[$crf] -ge $Target) { $above = $crf } else { $below = $crf; break }
+            }
+            if ($null -eq $above) { if (-not (& $probeCrf $MinCrf)) { break }; continue }
+            if ($null -eq $below) { if (-not (& $probeCrf $MaxCrf)) { break }; continue }
+            $gap = $below - $above
+            if ($gap -le 1) { break }
+            if (-not (& $probeCrf ($above + [int][math]::Floor($gap / 2)))) { break }
+        }
+
+        $best = $null; $bv = $null; $bb = $null
+        $closest = $null; $cv = $null; $cb = $null
+        foreach ($crf in ($score.Keys | Sort-Object)) {
+            if ($score[$crf] -ge $Target) { $best = $crf; $bv = $score[$crf]; $bb = $bytes[$crf] }
+            if ($null -eq $cv -or $score[$crf] -gt $cv) { $closest = $crf; $cv = $score[$crf]; $cb = $bytes[$crf] }
+        }
+        if ($null -eq $best) {
+            # nothing met target -- hand back the best sample actually
+            # measured (still connected to THIS content), never the static
+            # per-profile constant. Matches the bash 2026-08-16 fix.
+            $best = $closest; $bv = $cv; $bb = $cb
+        }
+        if ($null -eq $best) { return $null }
+
+        $orig = [int64](Get-Item -LiteralPath $Source).Length
+        $pred = if ($clipBytes -gt 0) { [int64]([double]$orig * ([double]$bb / [double]$clipBytes)) } else { 0 }
+        return [PSCustomObject]@{ Crf = $best; PredictedSize = $pred; Vmaf = $bv }
+    } finally {
+        Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Get-VesFinalVmaf {
@@ -702,4 +895,4 @@ function Get-VesFinalVmaf {
     return [math]::Round($vsum / $n, 1)
 }
 
-Export-ModuleMember -Function Get-VesVideoHeight, Get-VesVideoWidth, Test-VesSourceIsUhd, Get-VesVmafTargetForSource, Get-VesVmafModelForSource, Invoke-VesVmafCrfSearchAbAv1, Resolve-VesCrfForEncode, Test-VesSvtAv1Preset8Safe, Get-VesFinalVmaf
+Export-ModuleMember -Function Get-VesVideoHeight, Get-VesVideoWidth, Test-VesSourceIsUhd, Get-VesVmafTargetForSource, Get-VesVmafModelForSource, Invoke-VesVmafCrfSearchAbAv1, Invoke-VesVmafScoreOne, Invoke-VesVmafCrfSearchInternal, Resolve-VesCrfForEncode, Test-VesSvtAv1Preset8Safe, Get-VesFinalVmaf
