@@ -85,9 +85,196 @@ join the D-val survey as first-class search nodes (still gated out of live
 ffmpeg `N-125907-ga7e72069f1`) — 6 AFGM shots, byte-identical QP/VMAF/samples.
 The fleet's SVT-AV1 + ffmpeg are now uniformly v4.2.0 / `N-125907` on every
 Linux + Windows node (the `dval_research.sh` "fleet constant is v4.1.0" comments
-are stale). **MARLONJ (macOS/ARM) is the exception** — its SVT-AV1 (v4.2.0
-*source*, homebrew) emits a ~0.02%-different bitstream from x86 (NEON vs AVX2),
-and `--asm 0` (pure C, would be bit-exact) SIGSEGVs on ARM.
+are stale). **MARLONJ (macOS/ARM)** was the exception (homebrew svt-av1 bottle
+emits a ~0.03%-different bitstream) — **resolved in phase 5**: a clean v4.2.0
+git-tag build is bit-exact; MARLONJ now encodes.
+
+### v6.0.3 phase 6 — cross-platform E2E review remediation (2026-09-09)
+
+A 3-platform review (Linux coordinator / Windows PS / macOS + x-platform) found
+a batch of latent stall/hang, silent-failure, and inconsistency bugs. Fixed:
+
+**Windows encode worker (`dval_worker_encode.ps1`)**
+- **CRITICAL — heartbeat could not stop a wedged encode mid-variant.** It only
+  set a flag; `Assert-DvalNotStopped` runs *between* variants, so a hung
+  SvtAv1EncApp/ffmpeg pinned PRINCE/ELVIS for up to `DVAL_ENCODE_PIPE_TIMEOUT_SEC`
+  (8 h). Now the heartbeat runspace actively `Stop-Process`es this slug's
+  SVT/ffmpeg on STALL / lifetime-cap / SURVEY-STOPPED (scoped by slug argv,
+  never a `ves-shotqp` search shot), which unblocks the pipe waits so the main
+  flow aborts cleanly.
+- `VMAF ERR` variants counted toward DONE — `Test-DvalHave` + the done-count now
+  require `.*VMAF [0-9]` and count *distinct* names (mirrors bash, 2026-09-04).
+- Any qpfile-assembler exception unwound the whole worker → all 8 variants lost →
+  dispatch re-looped the same failure. Each variant is now isolated in try/catch
+  (skip + `BASELINE-UNFIT.log`, keep the rest); `ALLOC_BASELINE_SANITY_BYTES` is
+  set from the base size and `Assemble-VesQpfileViaEqualSlopeBudget` returns
+  `$false` on a baseline ≥ source / > 1.15× base (ported from the bash net).
+- Tool paths were hard-coded to `D:\VES-PRINCE\` → **ELVIS could not encode**.
+  Now `$VesRoot\tools\bin` first (+ prepended to PATH), then the legacy path,
+  then PATH; honours `$env:VES_SVTAV1_BIN`.
+- Result header gained `gate=` / `fallback_shots=` / `DEGRADED=1` (class-F
+  clean/degraded split was blind to Windows-encoded titles).
+- Search-drain process filter matched nothing (S4U runs `dval_run_<slug>_N.ps1`,
+  not `worker_loop_discovery_multi.ps1` on the argv) → now matches the runner
+  name, excludes our own `$PID`.
+- Renews `dval:encnode` across the pre-heartbeat setup window (manifest stage +
+  scans).
+- `Write-VesShotQpsToQpfile`: full-precision `$t = frame/$Fps` (was a 6-dp
+  round-trip that could flip a shot boundary — byte-identical qpfile parity).
+
+**Windows launch (`dval_win_launch.ps1`)** — the S4U task's 12 h
+`ExecutionTimeLimit` is a hard terminate (no `finally`, no `# ABORTED`, orphaned
+encnode key). Now mode-specific: 8 h for search, **unlimited for encode** (the
+worker's own `DVAL_ENCODE_WORKER_MAX_SECS` + heartbeat own its lifetime).
+
+**macOS crash janitor (`dval_worker_reap.sh`)** — was inert on MARLONJ:
+`ps -o cmd=` / `sid=` / `etimes=` are GNU-only → every age gate, the forktree
+cap, and the orphan-search reap were dead. Now: portable `_age` (parses
+`ps -o etime=`), `_cmd` uses `command=`, the session check falls back to
+`ppid==1` where `sid` is unavailable, a mkdir cron-overlap lock where `flock`
+is missing, and `_bundle` has BSD fallbacks (`vm_stat`, `log show`). Also clears
+a SIGKILLed encode's stale `dval:encnode:<host>` (was lingering to the 900 s TTL
+and pinning the host's search target at 0).
+
+**Node mutex** — `dval:encnode` TTL 900 → **1200 s** (covers a slow pre-heartbeat
+setup on a big title without the mutex lapsing and letting search restart on the
+encode box; the reaper now clears stale keys so the longer TTL is bounded).
+`dval_dispatch.sh` `_encnode_reserve` is now a Lua CAS (take/renew only if empty
+or already ours — a plain SET could stomp a different live encode's key), and
+the three reserve call sites bail out of the pass if it reports the host taken.
+
+**Orphan search self-sustain** — when `dval:target:<slug>:<host>` expired (30 min
+after research exits) `dval_admit` fell back to the worker's fallback count and
+kept an abandoned title's search alive. `kill_workers` now winds every host's
+target to 0 on teardown.
+
+**macOS bash portability (rest)** — `dval_worker_encode.sh`: `sha256sum ||
+shasum`, `nproc || sysctl -n hw.ncpu`, `/proc/loadavg || sysctl -n vm.loadavg`,
+module-tree integrity guard (missing load-bearing function → `exit 90` not a
+silently-wrong encode), base CRF search under the `.assembling` stall-suppress
+marker, low-VMAF cross-check sampled (`-t 600`, was a full extra movie decode
+per re-dispatch). `worker_loop_discovery_multi.sh` + `dval_research.sh`: portable
+`ps` session/age checks. `modules/ves-per-shot-qp.sh`: `_pfs()` portable size in
+`_stage_source_local` / `_stage_copy*` (bare `stat -c%s` returned 0 on macOS →
+the "same-size copy already staged" reuse was dead, a **truncated SMB copy was
+accepted as the canonical source**, and with no `flock` on stock macOS nothing
+serialised the parallel multi-GB copies) + the equal-slope baseline-sanity read.
+
+**Path remap** — one `dval_mac_path()` in `dval_paths.sh` (Linux `/mnt/<export>`
+→ macOS `/Volumes/...`); `dval_worker_encode.sh`, `dval_research.sh`,
+`dval_parity_gate.sh` all call it (was four hand-maintained tables already
+drifting). `DVAL_ENCODE_SPILL_HOSTS` in `dval_paths.sh` now includes MARLONJ,
+matching `dval_dispatch.sh` `ENCODE_POOL_SPILL`.
+
+**qpfile assembly** (`modules/ves-per-shot-qp.sh`) — `_write_shot_qps_to_qpfile`
+forked `awk` once per frame (~145 k forks for a feature: ~10 min Linux / 20+ min
+macOS, ×7 assemblies per encode, and read as a stall by the encode heartbeat).
+Now a single `awk` pass — byte-identical output, 145 k frames in <1 s
+(live-verified on MARLONJ).
+
+Deferred: parallelising dispatch's serial per-host SSH probes (a slow pass, not
+a hang).
+
+### v6.0.3 phase 5 — encode robustness, spill tiering, MARLONJ resolved (2026-09-09)
+
+**PS encode worker hardening** (`dval_worker_encode.ps1`) — the worker "vanished"
+mid-long-op three times; each cause fixed and deployed:
+- `dval_research.sh` `kill_workers` win branch ran a blanket
+  `Get-Process ffmpeg,SvtAv1EncApp | Stop-Process` on every win node — killed an
+  **in-flight encode**. Now scoped to `ves-shotqp` argv (`_win_stop_search`
+  helper), guarded by `dval:encnode`, and used in `reconcile_host`'s drain too.
+- Child ffmpeg/SVT never reaped on Windows (no cascade) — `Stop-DvalEncodeCoordination`
+  + `dval_win_encode_ctl.ps1 kill` now stop any ffmpeg/SVT carrying the slug.
+- A win search worker mid-shot lingered past the 200 s drain → the encode
+  DECLINEd. Worker now runs `Stop-DvalLocalSearch` itself after a 45 s grace.
+- Bare `Add-Content` to the NAS log under `$ErrorActionPreference='Stop'` was a
+  worker-killer on an SMB blip — all process output → `Write-Host`/Tee, never a
+  direct NAS write; `Write-DvalLog` + the FATAL writes wrapped in try/catch.
+- `[Task]::WaitAll` on the child read tasks had no timeout → after a force-killed
+  child the worker idle-wedged forever. `Invoke-DvalProcess` gained a 4 h ceiling
+  + 30 s `WaitAll` cap + `IsCompletedSuccessfully` guards; `Invoke-DvalFfmpegToSvt`
+  an 8 h pipe ceiling + a **1800 s SVT post-input flush budget** (a 15 s cap
+  killed SVT right after its SUMMARY → "encode failed").
+- Top-level `catch` → `# FATAL` + `ScriptStackTrace` to log + result file.
+- **Source local-staging** (`$srcEnc`): every variant decodes the source for
+  encode AND re-reads it as the VMAF reference (~13 whole-file SMB reads at
+  ~62 MB/s) → stage once. `$src` (UNC) kept for path-derived resolution.
+
+**Encode tiering** (`dval_paths.sh` + `dval_dispatch.sh`, user directive):
+`DVAL_ENCODE_PRIMARY_HOSTS` (PRINCE MJACKSON AI-PROCESSOR JJACKSON LAYTOYAJ)
+encode any time; `DVAL_ENCODE_SPILL_HOSTS` (TITOJ ELVIS MARLONJ) are
+survey-primary and only encode once `state/SEARCH-COMPLETE` exists
+(`_encode_host_eligible`); `DVAL_ENCODE_NEVER_HOSTS` (STING RANDYJ) are
+hard-blocked. `_launch_encode` gained an `_is_mac_encode_host` branch (homebrew
+PATH/bash, no setsid, `ps -p` probe).
+
+**MARLONJ ARM bitstream — resolved.** The ~0.03% divergence was the Homebrew
+svt-av1 4.2.0 **bottle being a broken pre-release** (self-reports
+`v4.1.0-279-gd3c4cb394` — 17 commits before the v4.2.0 tag, missing `2acdf460`'s
+`inf→int` UB fix). A clean build from the `v4.2.0` git tag with `-DBUILD_TESTING=ON`
+(disables `CONFIG_ARM_NEON_IS_GUARANTEED`, which was stripping the C dispatch
+table → the `--asm 0` SIGSEGV) is **byte-identical NEON == C == x86**. Installed
+at `MARLONJ:~/VES-tools/bin`, selected via `VES_SVTAV1_BIN` (new
+`discover_svtav1encapp` override in `modules/ves-per-shot-qp.sh`). MARLONJ moved
+to the SPILL encode tier. See `dval-marlonj-arm-encode-parity`.
+
+### v6.0.3 phase 4 — PowerShell encode-stream parity (PRINCE as a fleet encoder) (2026-09-08)
+
+**The D-val encode+measure worker now runs on PRINCE as a first-class encode
+node.** `dval_worker_encode.ps1` (8-variant base/A_pershot/D_f90..D_f50/B_f80_F1
++ `DVAL_ENCODE_DONE`) was structurally complete but had no coordination layer and
+several parity bugs; all wired now. This closes the last gap in "a Windows node
+is interchangeable with a Linux one".
+
+- **`dval_worker_encode.ps1` coordination layer** (mirrors
+  `dval_worker_encode.sh:13-294`): `VesDvalClaim` import; `SURVEY-STOPPED` check;
+  single-instance lock at `C:\Users\worker\dval-encode-locks\<cat>__<slug>\pid`
+  (the Windows analogue of the Linux `/tmp` lockdir — `_launch_encode` probes it);
+  `DVAL_WE_SHA` staleness guard; Windows oversubscription preflight (CIM
+  `PercentProcessorTime`); `dval:encnode:<host>` claim + drain-wait for local
+  search workers; a background-runspace heartbeat (60s encnode renew + stall
+  detector + lifetime cap + result-mtime touch); `Stop-DvalEncodeCoordination`
+  in a `finally` with an idempotency guard; `Assert-DvalNotStopped` before each
+  variant.
+- **Parity bugs fixed**: `Invoke-DvalScore` used `fps=$SrcFps` not `setpts=N`
+  (the v6.0.2N frame-index alignment — the whole-movie desync VMAF bug); `$slug`
+  lacked the trailing `_` (→ `results/<cat>__<slug>.log` never matched
+  `done_ok`, title re-dispatches forever); `Get-VesUtcStamp` + `Write-VesKvFile`
+  were used by the worker but **not in `VesPerShotQp.psm1`'s
+  `Export-ModuleMember`** → every encode died silently at the first `since`-file
+  write (a terminating error inside `& script *>&1 | Tee-Object` produces no
+  output). Now exported.
+- **`DVAL_WE_SHA_PS`**: the PS worker hashes its own `.ps1`; dispatch was
+  forwarding the `.sh` sha → every PRINCE/ELVIS encode would exit 90 "STALE".
+  Dispatch now computes and forwards a separate `.ps1` sha.
+- **Local manifest staging** (`dval_worker_encode.ps1` + `Get-VesShotManifestDir`
+  `DVAL_SHOT_MANIFEST_DIR` override): `Get-Content -Raw` over the SMB share
+  measured **~330 ms/file**; the assemble/verify passes touch every
+  `shot-*.meta/.status` 3-4×, so a 959-shot title (A Fish Called Wanda) sat ~30
+  min in pure latency before the first encode. Now robocopy `/MT:32` stages the
+  whole manifest dir to `$work\manifest-shots` once (~15 s) and every read
+  resolves locally. Straggler force-resolve writes land on both local + NAS.
+- **`_src_win_safe`**: titles under `Vintage (<=1958)` (Win32-illegal `<`/`>` →
+  the SMB share only exposes an 8.3 mangled name → `Get-Item` throws) are
+  filtered out of the win-encode assign path in `dval_dispatch.sh` and
+  `dval_research.sh` `reconcile_host` — Linux-only titles. See
+  `dval-windows-node-path-limits`.
+- **`dval_dispatch.sh` `_launch_encode` win branch** (§9): S4U
+  `dval_win_launch.ps1 -Mode encode`, `_dval_win_envkv` forwards the full
+  `ves-config.sh` tunable set (the helper + `_DVAL_WIN_TUNABLE_KEYS` moved to
+  `dval_paths.sh`, shared with the search launch), probe polls the lock-dir pid
+  ~24 s and reads the NAS result file for a `# DECLINED` line. `reconcile_running`
+  win probe (running task + live lock-dir pid). `_win_encode_release`
+  (Unregister-ScheduledTask + lock cleanup) on the done + stale-reclaim paths;
+  win-aware stale probe/kill (`Stop-Process`, no `/proc`).
+- **`ENCODE_POOL += PRINCE|2022|10.200.200.104`** (name-keyed via
+  `_is_win_encode_host`); `DVAL_ENCODE_CAPABLE_HOSTS` and the strength order +
+  `host_calibration.tsv` (weight 400, estimated) updated so an idle PRINCE wins
+  `dval_rank_hosts` — the "always one strong encoder free" reserve the user
+  asked for (the `dval:encnode` mutex still means PRINCE does search XOR encode).
+  `dval_rank_hosts` gets a `:win` kind tag for these hosts so it uses the pwsh
+  probe (a Linux `/proc/loadavg` probe over ssh to PRINCE would drop it from the
+  ranking).
 
 ### v6.0.3 phase 3 — PRINCE/ELVIS in HOSTS + manifest-build parity (2026-09-08)
 

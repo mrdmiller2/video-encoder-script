@@ -148,7 +148,18 @@ SVTAV1ENCAPP_CMD=()
 discover_svtav1encapp() {
   [ "${#SVTAV1ENCAPP_CMD[@]}" -gt 0 ] && return 0
   local tool
-  tool="$(command -v SvtAv1EncApp 2>/dev/null)" || return 1
+  # VES_SVTAV1_BIN: explicit path to a SvtAv1EncApp, checked before PATH. For a
+  # node whose PATH-visible binary is wrong -- e.g. MARLONJ (arm64 macOS), where
+  # the Homebrew svt-av1 4.2.0 bottle is a broken pre-release build
+  # (self-reports v4.1.0-279-gd3c4cb394, missing commit 2acdf460's inf->int UB
+  # fix) that emits a ~0.03% different bitstream from the x86 fleet. A clean
+  # build from the v4.2.0 git tag is bit-exact NEON==C==x86 (verified 2026-09-09)
+  # and lives at ~/VES-tools/bin. See dval-marlonj-arm-encode-parity.
+  if [ -n "${VES_SVTAV1_BIN:-}" ] && [ -x "$VES_SVTAV1_BIN" ]; then
+    tool="$VES_SVTAV1_BIN"
+  else
+    tool="$(command -v SvtAv1EncApp 2>/dev/null)" || return 1
+  fi
   SVTAV1ENCAPP_CMD=("$tool")
   # VES_SVTAV1_ASM caps the assembly instruction set (SvtAv1EncApp --asm
   # <c|sse2|...|avx512|max>). SVT-AV1 v4.2.0's x86 SIMD kernels SIGSEGV on
@@ -201,6 +212,16 @@ discover_svtav1encapp() {
 # disabled. Idempotent + shareable: a re-launched worker on the same host that
 # finds a same-size copy reuses it. The manifest / claims / status stay on
 # NFS -- only the read-heavy extraction source moves local.
+# Portable file size. Bare `stat -c%s` is GNU-only: on macOS (MARLONJ) it printed
+# nothing so `want`/`have` were both 0 -> the "same-size copy already staged"
+# reuse path (want>0 guard) was permanently dead (re-copy the multi-GB source
+# every launch), the post-copy size verify became `"0" = "0"` = true (a
+# truncated SMB copy was accepted as the canonical source -> late shots read
+# garbage), and with no flock on stock macOS nothing serialised the parallel
+# copies. 2026-09-09.
+_pfs(){ [ -e "$1" ] || { echo 0; return; }
+  stat -c%s -- "$1" 2>/dev/null || stat -f%z -- "$1" 2>/dev/null || wc -c < "$1" 2>/dev/null | tr -d ' ' || echo 0; }
+
 _stage_source_local() {
   local src="$1" dir base dst want have h
   [ "${SHOT_SRC_LOCAL_STAGE:-true}" = "true" ] || { printf '%s' "$src"; return 0; }
@@ -212,13 +233,13 @@ _stage_source_local() {
   h="$(printf '%s' "$src" | { cksum 2>/dev/null || md5sum 2>/dev/null; } | tr -cd '0-9a-f' | cut -c1-10)"
   base="$(basename -- "$src" | tr -c 'A-Za-z0-9._-' '_')"
   dst="$dir/${h}_${base}"
-  want="$(stat -c%s -- "$src" 2>/dev/null || echo 0)"
+  want="$(_pfs "$src")"
   # Sweep stale stages (>48h -- a Phase-1 title search should finish well
   # inside that) but NEVER the file we are about to hand back, and prefer
   # atime so a long-lived worker that is still reading its stage keeps it.
   find "$dir" -maxdepth 1 -type f ! -name "$(basename -- "$dst")" \
        \( -atime +2 -o -mmin +2880 \) -delete 2>/dev/null
-  have="$(stat -c%s -- "$dst" 2>/dev/null || echo 0)"
+  have="$(_pfs "$dst")"
   if [ "$want" -gt 0 ] && [ "$have" = "$want" ]; then
     touch -a -- "$dst" 2>/dev/null   # mark in-use so the sweep spares it
     printf '%s' "$dst"; return 0
@@ -240,10 +261,10 @@ _stage_source_local() {
   if command -v flock >/dev/null 2>&1; then
     (
       flock -w 2700 9 || exit 99
-      _h2="$(stat -c%s -- "$dst" 2>/dev/null || echo 0)"
+      _h2="$(_pfs "$dst")"
       [ "$want" -gt 0 ] && [ "$_h2" = "$want" ] && exit 0    # a peer staged it
       _t2="$dst.$$.part"
-      if _stage_copy "$src" "$_t2" && [ "$(stat -c%s -- "$_t2" 2>/dev/null || echo 0)" = "$want" ]; then
+      if _stage_copy "$src" "$_t2" && [ "$want" -gt 0 ] && [ "$(_pfs "$_t2")" = "$want" ]; then
         mv -f -- "$_t2" "$dst" 2>/dev/null && exit 0
       fi
       rm -f -- "$_t2" 2>/dev/null; exit 1
@@ -254,7 +275,7 @@ _stage_source_local() {
   fi
   # no flock (e.g. bare macOS) -- single-shot copy, best effort
   local tmp="$dst.$$.part"
-  if _stage_copy "$src" "$tmp" && [ "$(stat -c%s -- "$tmp" 2>/dev/null || echo 0)" = "$want" ]; then
+  if _stage_copy "$src" "$tmp" && [ "$want" -gt 0 ] && [ "$(_pfs "$tmp")" = "$want" ]; then
     mv -f -- "$tmp" "$dst" 2>/dev/null && { printf '%s' "$dst"; return 0; }
   fi
   rm -f -- "$tmp" 2>/dev/null
@@ -301,7 +322,7 @@ _vpn_pull_slot_release() {
 
 _stage_copy_rsync() {  # <src> <dst>
   local s="$1" d="$2" sz have
-  sz="$(stat -c%s -- "$s" 2>/dev/null)" || return 1
+  sz="$(_pfs "$s")"; [ "$sz" -gt 0 ] || return 1
   command -v rsync >/dev/null 2>&1 || return 1
   _vpn_pull_slot_acquire
   # --inplace avoids double space; --partial allows resume after VPN blip.
@@ -311,7 +332,7 @@ _stage_copy_rsync() {  # <src> <dst>
   local rc=$?
   _vpn_pull_slot_release
   [ "$rc" -eq 0 ] || return "$rc"
-  have="$(stat -c%s -- "$d" 2>/dev/null || echo 0)"
+  have="$(_pfs "$d")"
   [ "$have" = "$sz" ] || return 1
   # Optional strong verify (expensive on multi-GB titles).
   if [ "${VES_STAGE_VERIFY_HASH:-0}" = "1" ] && command -v sha256sum >/dev/null 2>&1; then
@@ -326,7 +347,7 @@ _stage_copy_rsync() {  # <src> <dst>
 _stage_copy_parallel_dd() {  # <src> <dst>
   local s="$1" d="$2" n="${VES_STAGE_COPY_STREAMS:-3}" sz i chunk ok
   local -a pids=()
-  sz="$(stat -c%s -- "$s" 2>/dev/null)" || { cp -f -- "$s" "$d" 2>/dev/null; return $?; }
+  sz="$(_pfs "$s")"; [ "$sz" -gt 0 ] || { cp -f -- "$s" "$d" 2>/dev/null; return $?; }
   if [ "${sz:-0}" -lt 67108864 ] || [ "$n" -le 1 ]; then
     cp -f -- "$s" "$d" 2>/dev/null; return $?
   fi
@@ -340,12 +361,12 @@ _stage_copy_parallel_dd() {  # <src> <dst>
     pids+=("$!")
   done
   ok=1; for i in "${pids[@]}"; do wait "$i" || ok=0; done
-  [ "$ok" = 1 ] && [ "$(stat -c%s -- "$d" 2>/dev/null || echo 0)" = "$sz" ]
+  [ "$ok" = 1 ] && [ "$(_pfs "$d")" = "$sz" ]
 }
 
 _stage_copy() {  # <src> <dst>
   local s="$1" d="$2" mode="${VES_STAGE_COPY_MODE:-rsync}" sz
-  sz="$(stat -c%s -- "$s" 2>/dev/null)" || { cp -f -- "$s" "$d" 2>/dev/null; return $?; }
+  sz="$(_pfs "$s")"; [ "$sz" -gt 0 ] || { cp -f -- "$s" "$d" 2>/dev/null; return $?; }
   # Small / already-local: plain cp
   if [ "${sz:-0}" -lt 67108864 ]; then
     cp -f -- "$s" "$d" 2>/dev/null; return $?
@@ -375,7 +396,7 @@ _stage_copy() {  # <src> <dst>
       cp -f -- "$s" "$d" 2>/dev/null
       local rc=$?
       _vpn_pull_slot_release
-      [ "$rc" -eq 0 ] && [ "$(stat -c%s -- "$d" 2>/dev/null || echo 0)" = "$sz" ]
+      [ "$rc" -eq 0 ] && [ "$(_pfs "$d")" = "$sz" ]
       ;;
   esac
 }
@@ -1007,17 +1028,25 @@ build_per_shot_qpfile() {
 _write_shot_qps_to_qpfile() {
   local -n _shots_ref="$1"
   local total_frames="$2" fps="$3" qpfile_out="$4"
-  local si=0 t qp frame shot_end_check
-  : >"$qpfile_out"
-  for ((frame = 0; frame < total_frames; frame++)); do
-    t="$(awk -v fr="$frame" -v f="$fps" 'BEGIN{printf "%.6f", fr/f}')"
-    while [ "$si" -lt $(( ${#_shots_ref[@]} - 1 )) ]; do
-      shot_end_check="${_shots_ref[$si]#*:}"; shot_end_check="${shot_end_check%%:*}"
-      awk -v t="$t" -v e="$shot_end_check" 'BEGIN{exit !(t>=e)}' && si=$((si+1)) || break
-    done
-    qp="${_shots_ref[$si]##*:}"
-    printf '%s\n' "$qp" >>"$qpfile_out"
-  done
+  # Single awk pass. The old body forked awk once per frame for the timestamp
+  # (and again per shot-boundary test) -- ~145k forks for a feature-length
+  # title: ~5-10 min on Linux, 20+ min on macOS, and a full encode assembles
+  # seven of these qpfiles. That dead time also read as a hang to the encode
+  # worker's STALL detector (no .ivf growth, no encoder CPU) and aborted live
+  # encodes on MARLONJ (2026-09-09). awk expands every frame internally in <1s.
+  printf '%s\n' "${_shots_ref[@]}" \
+    | awk -v total="$total_frames" -v fps="$fps" '
+        BEGIN { n = 0 }
+        NF { split($0, a, ":"); endt[n] = a[2] + 0; qp[n] = a[3]; n++ }
+        END {
+          if (n == 0 || fps+0 <= 0) exit 1
+          si = 0
+          for (frame = 0; frame < total+0; frame++) {
+            t = frame / (fps+0)
+            while (si < n-1 && t >= endt[si]) si++
+            print qp[si]
+          }
+        }' >"$qpfile_out"
 }
 
 # ---------------------------------------------------------------------
@@ -2212,7 +2241,7 @@ assemble_qpfile_via_equal_slope_budget() {
     # source, or well above the CRF base, means the search data or the VMAF
     # target is wrong for this title. Fail loud rather than emit a degenerate
     # fraction sweep. Survey caller exports ALLOC_BASELINE_SANITY_BYTES=<base>.
-    local _srcbytes; _srcbytes="$(stat -c%s "$src" 2>/dev/null || echo 0)"
+    local _srcbytes; _srcbytes="$(_pfs "$src")"
     if [ "${_baseline:-0}" -ge "${_srcbytes:-0}" ] 2>/dev/null && [ "${_srcbytes:-0}" -gt 0 ]; then
       log_err "  equal-slope budget: BASELINE UNFIT -- baseline ${_baseline} B >= source ${_srcbytes} B; search data / VMAF target suspect for this title. Refusing to build a fraction qpfile."
       return 2

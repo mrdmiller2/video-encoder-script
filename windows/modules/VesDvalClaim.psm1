@@ -38,7 +38,7 @@ function Get-VesDvalPort       { if ($env:VES_CLAIM_REDIS_PORT)  { [int]$env:VES
 function Get-VesDvalClaimTtl   { if ($env:VES_CLAIM_TTL)         { [int]$env:VES_CLAIM_TTL }     else { 2700 } }   # shot-lease EX
 function Get-VesDvalWregTtl    { if ($env:DVAL_WREG_TTL)         { [int]$env:DVAL_WREG_TTL }     else { 240 } }    # registration liveness window
 function Get-VesDvalWregExpire { if ($env:DVAL_WREG_EXPIRE)      { [int]$env:DVAL_WREG_EXPIRE }  else { 3600 } }   # whole wreg-hash EXPIRE
-function Get-VesDvalEncnodeTtl { if ($env:DVAL_ENCNODE_TTL)      { [int]$env:DVAL_ENCNODE_TTL }  else { 900 } }    # node-mutex EX
+function Get-VesDvalEncnodeTtl { if ($env:DVAL_ENCNODE_TTL)      { [int]$env:DVAL_ENCNODE_TTL }  else { 1200 } }   # node-mutex EX (20min; KEEP IN SYNC with ves-dval-claim-lib.sh DVAL_ENCNODE_TTL)
 
 # canonical host key: dval_research.sh forwards DVAL_WREG_HOST (the fleet name,
 # e.g. PRINCE) -- workers MUST use it, not COMPUTERNAME (which may be lowercased

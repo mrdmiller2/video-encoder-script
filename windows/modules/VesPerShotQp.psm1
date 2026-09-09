@@ -305,10 +305,19 @@ function Get-VesShotManifestDir {
     .SYNOPSIS
     Manifest directory for one title's shots, matching bash
     shot_manifest_dir() / shot_manifest_dir_nas() (Phase B, 2026-09-04):
-    <category dir>/<base>_WORKING/shots. (This fork has no in-flight local
-    override yet -- PRINCE Phase-B local-first is a separate owed item.)
+    <category dir>/<base>_WORKING/shots.
+
+    Local-first override (2026-09-08): if DVAL_SHOT_MANIFEST_DIR points at an
+    existing directory, use it verbatim. The D-val encode worker stages the
+    ~1-2k tiny shot-*.meta/.status files off the SMB share into a local dir
+    once (a `Get-Content -Raw` over SMB measured ~330 ms/file on PRINCE -> a
+    959-shot manifest cost ~30 min of pure latency across the read passes).
+    Reads are the only manifest access on a dispatched (fully-searched) title.
     #>
     param([Parameter(Mandatory)][string]$Source)
+    if ($env:DVAL_SHOT_MANIFEST_DIR -and (Test-Path -LiteralPath $env:DVAL_SHOT_MANIFEST_DIR)) {
+        return $env:DVAL_SHOT_MANIFEST_DIR
+    }
     return Join-Path (Get-VesWorkingDirForSource -Source $Source) 'shots'
 }
 
@@ -462,7 +471,10 @@ function Write-VesShotQpsToQpfile {
         $count = $Shots.Count
         if ($count -eq 0) { return }
         for ($frame = [int64]0; $frame -lt $TotalFrames; $frame++) {
-            $t = [double]::Parse((([double]$frame / $Fps).ToString('0.000000', [System.Globalization.CultureInfo]::InvariantCulture)), [System.Globalization.CultureInfo]::InvariantCulture)
+            # full-precision double, matching the bash awk `t = frame/(fps+0)` --
+            # a 6-dp round-trip could flip the >= at a shot boundary and give one
+            # frame the neighbouring shot's QP (breaks byte-identical qpfile parity).
+            $t = [double]$frame / $Fps
             while ($si -lt ($count - 1)) {
                 $cur = "$($Shots[$si])"
                 $parts = $cur.Split(':')
@@ -736,6 +748,24 @@ function Assemble-VesQpfileViaEqualSlopeBudget {
 
     if ($ByteBudget -gt 0 -and $ByteBudget -le 4) {
         $baseline = Get-VesEqualSlopeBudgetBaseline -ManifestDir $mdir -Target $pstTarget
+        # baseline-unfit safety net (mirrors ves-per-shot-qp.sh:2240-2255): a
+        # per-shot-optimal encode >= source, or well above the CRF base, means
+        # the search data / VMAF target is wrong for this title. Return $false so
+        # the worker skips this variant loud, instead of emitting a degenerate
+        # f90=f80=f70=... near-identical fraction sweep.
+        $srcBytes = 0.0
+        try { $srcBytes = [double](Get-Item -LiteralPath (Convert-VesFleetPath -Path $Source -To Windows) -ErrorAction Stop).Length } catch { }
+        $baseSanity = 0.0
+        if ($env:ALLOC_BASELINE_SANITY_BYTES) { [double]::TryParse($env:ALLOC_BASELINE_SANITY_BYTES, [ref]$baseSanity) | Out-Null }
+        $maxRatio = if ($env:ALLOC_BASELINE_MAX_RATIO) { [double]$env:ALLOC_BASELINE_MAX_RATIO } else { 1.15 }
+        if ($srcBytes -gt 0 -and $baseline -ge $srcBytes) {
+            Write-Warning "  equal-slope budget: BASELINE UNFIT -- baseline $([int64]$baseline) B >= source $([int64]$srcBytes) B; search data / VMAF target suspect. Refusing."
+            return $false
+        }
+        if ($baseSanity -gt 0 -and $baseline -gt ($baseSanity * $maxRatio)) {
+            Write-Warning "  equal-slope budget: BASELINE UNFIT -- baseline $([int64]$baseline) B > ${maxRatio}x CRF base $([int64]$baseSanity) B; hard shots inflating the sum. Refusing."
+            return $false
+        }
         $ByteBudget = [double]::Parse(($ByteBudget * $baseline).ToString('0', [System.Globalization.CultureInfo]::InvariantCulture), [System.Globalization.CultureInfo]::InvariantCulture)
         Write-Warning "  equal-slope budget: fraction mode -> baseline=$([int64]$baseline) B, budget=$([int64]$ByteBudget) B"
     } else {
@@ -2292,7 +2322,7 @@ function Invoke-VesShotSearchWorkerLoop {
 
 Export-ModuleMember -Function `
     Get-VesWorkingDirForSource, Get-VesShotManifestDir, Get-VesShotLockPath, Get-VesShotPathMtime, `
-    Convert-VesFleetPath, `
+    Convert-VesFleetPath, Get-VesUtcStamp, Write-VesKvFile, `
     Test-VesShotManifestAllResolved, New-VesShotManifest, `
     Get-VesShotSlug, Test-VesShotClaimRedisMode, Assert-VesShotSearchParitySafe, `
     Start-VesShotSearchBeat, Stop-VesShotSearchBeat, Confirm-VesShotStatusOnNas, `
