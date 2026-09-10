@@ -122,6 +122,23 @@ sub-optimal QP on the long meditative takes such a film is made of.
   `4h + 14s/shot`, floored 5h, capped 9h — so a 641-shot title gets ~5.4h and a
   1500-shot title ~9h per pass.
 
+- **1080p proxy for UHD survey titles** (`dval_paths.sh` `dval_ensure_proxy`,
+  wired into `dval_research.sh` + `dval_worker_encode.sh` +
+  `worker_loop_discovery_multi.sh`). A 4K10 grain title's 8-variant D-val encode
+  is ~75h on one node (A Few Good Men, 3840×2160: base variant alone was 30h+
+  and still going after 7h). The survey's deliverable — the byte-allocation
+  strategy (base vs A_pershot vs D_fXX rankings + size ratios) — is
+  resolution-transferable, so the WHOLE survey (per-shot search AND the
+  8-variant encode/measure) now runs against a `scale=1920` SVT-AV1 CRF 8
+  proxy built once on the NAS at `$SHARED/proxies/<slug>__p1080.mkv`. Search +
+  encode must use the SAME proxy or the manifest's per-shot RD data (the
+  equal-slope allocator's input) is 4K-scale against a 1080p encode and the
+  D_fXX sweep collapses / trips BASELINE-UNFIT. `manifest.meta` records
+  `proxy=` / `native_source=`; the result log is tagged `PROXY=1080p`. The
+  winning strategy is applied to the real 4K production encode afterward.
+  `DVAL_UHD_PROXY=0` forces native. AFGM's 4K encode was killed, and AFGM +
+  2001 were reset to re-search on their proxies.
+
 `VERSION` 6.0.3 → 6.0.4. Deployed fleet-wide by targeted rsync (no epoch
 cutover; nothing in the running pipeline gates on `VERSION`). Already-searched
 grain titles with 45s+ shots keep their v1-windowed data (tagged); re-search is
