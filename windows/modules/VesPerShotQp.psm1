@@ -2244,9 +2244,32 @@ function Invoke-VesShotSearchWorkerLoop {
         Write-Host "shot-search: startup admission GO on $DvalHost pid=$PID (slug=$slug target-fallback=$HostWorkerCount)"
     }
 
+    # v6.0.4 UHD proxy: if the manifest declares one (dval_research.sh built it),
+    # the whole per-shot search runs against it. $Source stays native for the
+    # slug / claims / shots dir; the proxy just becomes SHOT_SRC_LOCAL after
+    # staging. Mirrors worker_loop_discovery_multi.sh.
+    $__proxyActive = $false
+    try {
+        $__mm = Join-Path (Get-VesShotManifestDir -Source $Source) 'manifest.meta'
+        if (Test-Path -LiteralPath $__mm) {
+            $__pl = (Select-String -LiteralPath $__mm -Pattern '^proxy=(.+)$' -ErrorAction SilentlyContinue |
+                     Select-Object -First 1).Matches.Groups[1].Value
+            if ($__pl) {
+                $__pw = Convert-VesFleetPath -Path $__pl -To Windows
+                if (Test-Path -LiteralPath $__pw) {
+                    $__ps = Get-VesStageSourceLocal -Source $__pw
+                    $env:SHOT_SRC_LOCAL = if ($__ps -and (Test-Path -LiteralPath $__ps)) { $__ps } else { $__pw }
+                    $__proxyActive = $true
+                    Write-Host "  UHD proxy in use for search: $($env:SHOT_SRC_LOCAL)"
+                }
+            }
+        }
+    } catch { }
+
     # Phase 1: stage the shared source to local disk once so every extraction
     # probe reads local instead of re-fetching a window over the network.
-    try {
+    if (-not $__proxyActive) {
+      try {
         $local = Get-VesStageSourceLocal -Source $Source
         if ($local -and $local -ne $Source -and (Test-Path -LiteralPath $local)) {
             $env:SHOT_SRC_LOCAL = $local
@@ -2255,7 +2278,8 @@ function Invoke-VesShotSearchWorkerLoop {
             $env:SHOT_SRC_LOCAL = $null
             Write-Host "  local staging skipped -- reading source from network"
         }
-    } catch { $env:SHOT_SRC_LOCAL = $null }
+      } catch { $env:SHOT_SRC_LOCAL = $null }
+    }
 
     # --- background admission/lease beat (redis mode) ----------------------
     $beatState = [hashtable]::Synchronized(@{ CurrentShot = $null; Stop = $false; StopReason = $null; MainDone = $false })
