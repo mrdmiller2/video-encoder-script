@@ -130,11 +130,11 @@ function Get-VesPerShotQpCrossoverProbes {
 # --- Phase 1 (2026-09-02) config getters -------------------------------------
 function Get-VesShotLongSecs {
     if ($env:SHOT_LONG_SECS) { return [double]$env:SHOT_LONG_SECS }
-    return 45.0
+    return 75.0   # v6.0.4: shots <=75s get a true full-shot search
 }
 function Get-VesPerShotMwLen {
     if ($env:PER_SHOT_MW_LEN) { return [double]$env:PER_SHOT_MW_LEN }
-    return 8.0
+    return 12.0   # v6.0.4
 }
 function Get-VesPerShotMultiwindowEnable {
     $v = if ($env:PER_SHOT_MULTIWINDOW_ENABLE) { $env:PER_SHOT_MULTIWINDOW_ENABLE } else { 'true' }
@@ -1040,6 +1040,8 @@ function New-VesShotManifest {
                 "field_mode=$fm",
                 "is_bw=$bw",
                 "bw_frac=$bwFracStr",
+                "mw_algo=$(if ($env:PER_SHOT_MW_ALGO) { $env:PER_SHOT_MW_ALGO } else { 'v2' })",
+                "long_secs=$longSecs",
                 "created_utc=$(Get-VesUtcStamp)",
                 "created_host=$(if ($env:DVAL_WREG_HOST) { $env:DVAL_WREG_HOST } else { $env:COMPUTERNAME })"
             )
@@ -1451,10 +1453,13 @@ function Get-VesShotEncodeBytesOnly {
 function Get-VesVmafScoreShotMw {
     <#
     .SYNOPSIS
-    Port of _vmaf_score_shot_mw(). Score a LONG shot as 3 short windows
+    Port of _vmaf_score_shot_mw(). Score a LONG shot as a set of short windows
     (placed by content via env SHOT_MW_OFFSETS, else evenly) and combine:
     MEDIAN window VMAF + rate-scaled bytes. Same @{Vmaf;Bytes} contract as
     Get-VesVmafScoreShot. >=2 usable windows required (else full-shot).
+    v6.0.4: window count scales with duration (clamp(round(dur/GAP),MIN,MAX));
+    a legacy flat-3 SHOT_MW_OFFSETS is re-windowed here. PER_SHOT_MW_ALGO=v1
+    restores the flat 3.
     #>
     param(
         [Parameter(Mandatory)][string]$Source,
@@ -1468,15 +1473,29 @@ function Get-VesVmafScoreShotMw {
         [Parameter(Mandatory)][string]$FfprobePath,
         [string]$SvtAv1EncAppPath
     )
-    $wl = if ($env:SHOT_MW_LEN) { [double]$env:SHOT_MW_LEN } else { 8.0 }
+    $wl = if ($env:SHOT_MW_LEN) { [double]$env:SHOT_MW_LEN } elseif ($env:PER_SHOT_MW_LEN) { [double]$env:PER_SHOT_MW_LEN } else { 12.0 }
     $shotDur = [math]::Max(0.0, $End - $Start)
+    # window count scales with duration (v6.0.4); matches _shot_long_windows / bash
+    $nWant = 3
+    if (($env:PER_SHOT_MW_ALGO -ne 'v1')) {
+        $gap = if ($env:PER_SHOT_MW_GAP_SECS) { [double]$env:PER_SHOT_MW_GAP_SECS } else { 18.0 }
+        $nlo = if ($env:PER_SHOT_MW_WINDOWS_MIN) { [int]$env:PER_SHOT_MW_WINDOWS_MIN } else { 4 }
+        $nhi = if ($env:PER_SHOT_MW_WINDOWS_MAX) { [int]$env:PER_SHOT_MW_WINDOWS_MAX } else { 12 }
+        $nWant = [int][math]::Round($shotDur / $gap)
+        if ($nWant -lt $nlo) { $nWant = $nlo }
+        if ($nWant -gt $nhi) { $nWant = $nhi }
+        $maxfit = [int][math]::Floor($shotDur / $wl)
+        if ($maxfit -ge 1 -and $nWant -gt $maxfit) { $nWant = $maxfit }
+        if ($nWant -lt 2) { $nWant = 2 }
+    }
     $offs = @()
     if ($env:SHOT_MW_OFFSETS) {
-        $offs = $env:SHOT_MW_OFFSETS.Split(',') | Where-Object { $_ -ne '' } | ForEach-Object { [double]$_ }
+        $offs = @($env:SHOT_MW_OFFSETS.Split(',') | Where-Object { $_ -ne '' } | ForEach-Object { [double]$_ })
     }
-    if ($offs.Count -lt 1) {
-        for ($k = 0; $k -lt 3; $k++) {
-            $o = $shotDur * (2 * $k + 1) / 6.0 - $wl / 2.0
+    if ($offs.Count -lt $nWant) {
+        $offs = @()
+        for ($k = 0; $k -lt $nWant; $k++) {
+            $o = $shotDur * (2 * $k + 1) / (2.0 * $nWant) - $wl / 2.0
             if ($o -lt 0) { $o = 0 }
             if (($o + $wl) -gt $shotDur) { $o = $shotDur - $wl }
             if ($o -lt 0) { $o = 0 }

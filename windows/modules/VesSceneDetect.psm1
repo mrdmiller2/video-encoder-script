@@ -173,16 +173,24 @@ function Get-VesShotLongWindows {
     <#
     .SYNOPSIS
     Port of _shot_long_windows(). Content-driven placement for a long shot:
-    split [Start,End) into 3 equal thirds and put each WinLen-second window
-    on that third's peak inter-frame motion (YDIF); flat third -> centred.
-    Returns "o1,o2,o3" (window START offsets, seconds from Start) or $null.
+    split [Start,End) into N equal segments and put each WinLen-second window
+    on that segment's peak inter-frame motion (YDIF); flat segment -> centred.
+    Returns "o1,..,oN" (window START offsets, seconds from Start) or $null.
+    v6.0.4: N scales with duration -- clamp(round(D/Gap), NMin, NMax) -- was a
+    flat 3.
     #>
     param(
         [Parameter(Mandatory)][string]$StatsFile,
         [Parameter(Mandatory)][double]$Start,
         [Parameter(Mandatory)][double]$End,
-        [double]$WinLen = 8.0
+        [double]$WinLen = 12.0,
+        [double]$Gap = 0.0,
+        [int]$NMin = 0,
+        [int]$NMax = 0
     )
+    if ($Gap  -le 0) { $Gap  = if ($env:PER_SHOT_MW_GAP_SECS)   { [double]$env:PER_SHOT_MW_GAP_SECS }   else { 18.0 } }
+    if ($NMin -le 0) { $NMin = if ($env:PER_SHOT_MW_WINDOWS_MIN) { [int]$env:PER_SHOT_MW_WINDOWS_MIN }  else { 4 } }
+    if ($NMax -le 0) { $NMax = if ($env:PER_SHOT_MW_WINDOWS_MAX) { [int]$env:PER_SHOT_MW_WINDOWS_MAX }  else { 12 } }
     if (-not (Test-Path -LiteralPath $StatsFile)) { return $null }
     $T = [System.Collections.Generic.List[double]]::new()
     $Y = [System.Collections.Generic.List[double]]::new()
@@ -202,6 +210,12 @@ function Get-VesShotLongWindows {
     $n = $T.Count
     $D = $End - $Start
     if ($n -lt 6 -or $D -le ($WinLen * 1.5)) { return $null }
+    $NW = [int][math]::Round($D / $Gap)
+    if ($NW -lt $NMin) { $NW = $NMin }
+    if ($NW -gt $NMax) { $NW = $NMax }
+    $maxfit = [int][math]::Floor($D / $WinLen)
+    if ($maxfit -ge 1 -and $NW -gt $maxfit) { $NW = $maxfit }
+    if ($NW -lt 2) { $NW = 2 }
     $step = ($T[$n - 1] - $T[0]) / [math]::Max(1, ($n - 1))
     if ($step -le 0) { $step = 0.25 }
     $wspan = [int][math]::Round($WinLen / $step)
@@ -215,10 +229,10 @@ function Get-VesShotLongWindows {
     }
 
     $offs = @()
-    for ($k = 0; $k -lt 3; $k++) {
-        $lo = $Start + $k * $D / 3.0
-        $hi = $Start + ($k + 1) * $D / 3.0
-        $centre = ($lo - $Start) + ($D / 3.0 - $WinLen) / 2.0
+    for ($k = 0; $k -lt $NW; $k++) {
+        $lo = $Start + $k * $D / $NW
+        $hi = $Start + ($k + 1) * $D / $NW
+        $centre = ($lo - $Start) + ($D / $NW - $WinLen) / 2.0
         if ($centre -lt 0) { $centre = 0 }
         $best = -1.0; $boff = $centre; $msum = 0.0; $mc = 0
         for ($i = 0; $i -lt $n; $i++) {
