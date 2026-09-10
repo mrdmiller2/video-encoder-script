@@ -89,6 +89,33 @@ are stale). **MARLONJ (macOS/ARM)** was the exception (homebrew svt-av1 bottle
 emits a ~0.03%-different bitstream) — **resolved in phase 5**: a clean v4.2.0
 git-tag build is bit-exact; MARLONJ now encodes.
 
+### v6.0.5 (in progress) — survey knowledge base + fleet parallelism (2026-09-10)
+
+The library is ~192 titles at 4K and growing; the serial one-title-at-a-time
+survey (8 variants each) would take months-to-years. Design at
+`_ARCHIVE/SESSION4-DESIGN-survey-parallelism-and-fingerprint-router.md`. Two
+tracks — parallelism (~2×, fleet is the ceiling) and a fingerprint→scheme
+router that lets most titles skip the full survey (the real scaling win).
+
+Shipped so far (all in `orchestration/`, gitignored):
+- **`dval_research.sh` `DVAL_RESEARCH_HOSTS`** — scope a research pass to a node
+  subset (for the coming multi-lane orchestrator). No-op unless set.
+- **`dval_titles.sh`** — regenerated as the real canonical 74-title list (the old
+  one had stale era-suffix-less paths that didn't resolve) + `dval_title_src` /
+  `dval_title_cat` helpers.
+- **`dval_fingerprint.sh`** — title feature vector from the manifest + one
+  ffprobe: res/bit-depth/bw, cx_luma/motion/detail/sat distributions, shot-length
+  signature (long-take frac), grain estimate (heuristic v1), cut rate, and the
+  search-phase QP / bracket-edge / nosignal fractions. → `knowledge/fingerprints/`.
+- **`dval_kb_ingest.sh`** — folds a completed title (fingerprint + 8-variant
+  result log + per-shot RD) into `knowledge/outcomes/<slug>.json`, recording
+  `winner_by_policy{}` (quality_first / meet_target_min_size / best_vmaf_per_byte
+  / rd_knee). Backfilled the 15 done titles; cron every 15 min.
+
+Still to build: prestage v2 (manifests + proxies), `dval_survey_orchestrator.sh`
+(2 search lanes + a permanent encode lane), `dval_route.sh` (k-NN + confidence),
+and the survey-mode phase-down (HIGH→skip, MEDIUM→validate4, LOW→full8).
+
 ### v6.0.4 — long-shot scorer density + large-title search rescue (2026-09-10)
 
 Diagnosing why 2001: A Space Odyssey (142 min, 641 shots) was heading for a
