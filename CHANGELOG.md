@@ -123,9 +123,18 @@ Shipped so far (all in `orchestration/`, gitignored):
   outliers/), and `--report` = profile split/merge candidates + mis-route
   cheap-probe hints. Cron `17,47`.
 
-Still to build: prestage v2 (manifests + proxies), `dval_survey_orchestrator.sh`
-(2 search lanes + a permanent encode lane), and B4 (wire route.survey_mode into
-the orchestrator so MEDIUM titles run only 4 variants).
+- **`dval_prestage_pipeline.sh`** (A1) -- keeps manifest + UHD proxy +
+  fingerprint built LOOKAHEAD titles ahead of the searcher (rank-selected
+  build hosts, capped concurrency, `state/prestage-ready/<slug>` sentinel).
+  `once`-tested; runs continuously only under the orchestrator (a
+  min-gap guard vs the un-modified searchwalk is still needed for standalone
+  use). Caught 1917 + the AFGM/2001/BR trio all needing proxies.
+- **`dval_titles.sh`** rebuilt as the real canonical 74-title list.
+
+Still to build: **A3** `dval_survey_orchestrator.sh` -- replaces searchwalk's
+serial loop with 2 search lanes + a permanent encode lane, consuming
+`prestage-ready` and consulting `dval_route.sh` per title (HIGH->skip,
+MEDIUM->validate4, LOW->full8). Build + shadow-test + cut over from searchwalk.
 
 ### v6.0.4 — long-shot scorer density + large-title search rescue (2026-09-10)
 
