@@ -112,9 +112,20 @@ Shipped so far (all in `orchestration/`, gitignored):
   `winner_by_policy{}` (quality_first / meet_target_min_size / best_vmaf_per_byte
   / rd_knee). Backfilled the 15 done titles; cron every 15 min.
 
+- **`dval_kb_lib.py`** -- shared fingerprint vector + weighted k-NN (one place
+  to tune 'similar' so the router and the refinement audit agree).
+- **`dval_route.sh`** -- k-NN a new file's fingerprint against the KB -> scheme +
+  confidence (HIGH/MEDIUM/LOW/NO_MATCH) -> survey_mode (skip/validate4/full8/
+  triage) + `source_limited_likelihood`. `--audit` = leave-one-out accuracy
+  (currently 80% hit / 93% hit+near over the 15).
+- **`dval_kb_refine.sh`** -- 'never discard what a title teaches': per-title
+  route-accuracy / profile-deviation / cluster-fit (outliers -> knowledge/
+  outliers/), and `--report` = profile split/merge candidates + mis-route
+  cheap-probe hints. Cron `17,47`.
+
 Still to build: prestage v2 (manifests + proxies), `dval_survey_orchestrator.sh`
-(2 search lanes + a permanent encode lane), `dval_route.sh` (k-NN + confidence),
-and the survey-mode phase-down (HIGH→skip, MEDIUM→validate4, LOW→full8).
+(2 search lanes + a permanent encode lane), and B4 (wire route.survey_mode into
+the orchestrator so MEDIUM titles run only 4 variants).
 
 ### v6.0.4 — long-shot scorer density + large-title search rescue (2026-09-10)
 
