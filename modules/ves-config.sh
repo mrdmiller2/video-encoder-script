@@ -6,7 +6,7 @@
 # MULTIPART_PART_REGEX below is a new global added 2026-08-04 (team-reviewed
 # bug fix) -- see its own comment.
 
-VERSION="6.0.3"
+VERSION="6.0.4"
 SCRIPT_NAME="convert-v${VERSION}.sh"
 # Multi-part-source filename marker (Part/Pt/CD/Disc N, any of space/./_/-
 # as separators -- e.g. "Title - Part 1", "Title CD1", "Title-Disc-2").
@@ -695,17 +695,30 @@ VES_STAGE_COPY_MODE="${VES_STAGE_COPY_MODE:-rsync}"
 VES_VPN_PULL_MAX="${VES_VPN_PULL_MAX:-2}"
 VES_STAGE_VERIFY_HASH="${VES_STAGE_VERIFY_HASH:-0}"
 #
-# (B4) long-shot multi-window search (2026-09-02). A per-shot QP search on a
-# 6-minute take is a 20-40GB ffv1 + hours per QP probe. Instead, for a shot
-# longer than SHOT_LONG_SECS, score PER_SHOT_MW_WINDOWS windows of
-# PER_SHOT_MW_LEN s each, placed by content (peak inter-frame motion within
-# each third, via _shot_long_windows / cx_windows in the shot meta), and
-# combine: MEDIAN window VMAF + rate-scaled bytes. No accuracy loss on static
-# takes (the survey norm); a genuinely ramping take gets one compromise QP
-# (the era-routed split+smooth production feature refines that later).
+# (B4) long-shot multi-window search (2026-09-02; density rework v6.0.4
+# 2026-09-10). A per-shot QP search on a 6-minute take is a 20-40GB ffv1 +
+# hours per QP probe. Instead, for a shot longer than SHOT_LONG_SECS, score a
+# set of PER_SHOT_MW_LEN-second windows placed by content (peak inter-frame
+# motion, via _shot_long_windows / cx_windows in the shot meta) and combine:
+# MEDIAN window VMAF + rate-scaled bytes.
+#
+# v6.0.4: the window COUNT now scales with shot duration instead of a flat 3
+# (which sampled only 24s of a 176s take -- 14% -- and produced a visibly
+# sub-optimal QP on the long meditative takes that dominate a film like 2001).
+# n = clamp(round(dur / PER_SHOT_MW_GAP_SECS), PER_SHOT_MW_WINDOWS_MIN,
+# PER_SHOT_MW_WINDOWS_MAX). SHOT_LONG_SECS also raised 45 -> 75 so 45-75s
+# shots get a TRUE full-shot search (y4m ~11GB, fits the 30-64GB fleet tmpfs
+# at 2 workers/node). More compute per long shot, deliberately -- the survey
+# feeds production encodes and a wrong QP on a 2-minute take is a wrong
+# 2 minutes of the final file. Legacy (flat-3) manifests are detected at
+# search time and re-windowed on the fly (mw_algo below).
 PER_SHOT_MULTIWINDOW_ENABLE="${PER_SHOT_MULTIWINDOW_ENABLE:-true}"
-SHOT_LONG_SECS="${SHOT_LONG_SECS:-45}"
-PER_SHOT_MW_LEN="${PER_SHOT_MW_LEN:-8}"   # window count is fixed at 3 (one per shot-third)
+SHOT_LONG_SECS="${SHOT_LONG_SECS:-75}"
+PER_SHOT_MW_LEN="${PER_SHOT_MW_LEN:-12}"
+PER_SHOT_MW_GAP_SECS="${PER_SHOT_MW_GAP_SECS:-18}"       # ~one window per this many shot-seconds
+PER_SHOT_MW_WINDOWS_MIN="${PER_SHOT_MW_WINDOWS_MIN:-4}"
+PER_SHOT_MW_WINDOWS_MAX="${PER_SHOT_MW_WINDOWS_MAX:-12}"
+PER_SHOT_MW_ALGO="${PER_SHOT_MW_ALGO:-v2}"               # v2 = duration-scaled window count; v1 = flat 3 (pre-6.0.4)
 SHOT_MW_DEBIAS="${SHOT_MW_DEBIAS:-1}"     # 1 = anchor MW byte scale to one real full-shot encode at the chosen QP
 #
 # (B5) VMAF frame stride in the SEARCH only (never the final whole-file

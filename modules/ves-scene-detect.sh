@@ -139,17 +139,25 @@ _shot_complexity_table() {
 }
 
 # Content-driven window placement for a long shot. Reads the per-frame YDIF
-# samples in [start,end), splits the shot into 3 equal thirds, and in each
-# third finds the <win_len>s window whose summed inter-frame motion is
-# highest -- so the 3 sample windows land where the shot actually changes,
-# not at fixed 1/4-1/2-3/4 marks. Prints "o1,o2,o3" (window START offsets in
-# seconds, relative to the shot start, ascending). Falls back to the third's
-# centre when a third has too few samples. Empty output => caller uses even
-# spacing or a full-shot search.
+# samples in [start,end), splits the shot into N equal segments, and in each
+# segment finds the <win_len>s window whose summed inter-frame motion is
+# highest -- so the sample windows land where the shot actually changes, not
+# at fixed marks. Prints "o1,o2,...,oN" (window START offsets in seconds,
+# relative to the shot start, ascending). Falls back to a segment's centre
+# when it has too few samples. Empty output => caller uses even spacing or a
+# full-shot search.
+#
+# v6.0.4 (2026-09-10): N was a flat 3. It now scales with duration --
+#   N = clamp(round(D / gap), nmin, nmax)
+# -- so a 176s take is sampled by ~10 windows (65% coverage) instead of 3
+# (14%). $5=gap_secs (default 18), $6=nmin (4), $7=nmax (12).
 _shot_long_windows() {
-  local stats_file="$1" start="$2" end="$3" win_len="${4:-8}"
+  local stats_file="$1" start="$2" end="$3" win_len="${4:-12}"
+  local gap="${5:-${PER_SHOT_MW_GAP_SECS:-18}}"
+  local nmin="${6:-${PER_SHOT_MW_WINDOWS_MIN:-4}}"
+  local nmax="${7:-${PER_SHOT_MW_WINDOWS_MAX:-12}}"
   [ -s "$stats_file" ] || return 1
-  awk -v S="$start" -v E="$end" -v L="$win_len" '
+  awk -v S="$start" -v E="$end" -v L="$win_len" -v GAP="$gap" -v NMIN="$nmin" -v NMAX="$nmax" '
     /^frame:/ { ct=-1; for(i=1;i<=NF;i++) if($i ~ /^pts_time:/){ split($i,a,":"); ct=a[2]+0 }; next }
     /^lavfi\.signalstats\.YDIF=/ {
       if (ct < S || ct >= E) next
@@ -159,6 +167,10 @@ _shot_long_windows() {
     END {
       D = E - S
       if (n < 6 || D <= L*1.5) exit 1
+      NW = int(D/GAP + 0.5); if (NW < NMIN) NW = NMIN; if (NW > NMAX) NW = NMAX
+      # never ask for more non-overlapping windows than fit
+      maxfit = int(D/L); if (maxfit >= 1 && NW > maxfit) NW = maxfit
+      if (NW < 2) NW = 2
       step = (T[n-1]-T[0])/(n-1); if (step <= 0) step = 0.25
       wspan = int(L/step + 0.5); if (wspan < 1) wspan = 1
       # sliding-window YDIF sum starting at each sample i (window = wspan samples)
@@ -168,9 +180,9 @@ _shot_long_windows() {
         WS[i] = (c ? s/c : 0)
       }
       out=""
-      for (k=0; k<3; k++) {
-        lo = S + k*D/3.0; hi = S + (k+1)*D/3.0
-        centre = (lo-S) + (D/3.0 - L)/2.0; if (centre<0) centre=0
+      for (k=0; k<NW; k++) {
+        lo = S + k*D/NW; hi = S + (k+1)*D/NW
+        centre = (lo-S) + (D/NW - L)/2.0; if (centre<0) centre=0
         best=-1; boff=centre; msum=0; mc=0
         for (i=0; i<n; i++) {
           if (T[i] < lo || T[i] >= hi) continue
@@ -178,7 +190,7 @@ _shot_long_windows() {
           msum += WS[i]; mc++
           if (WS[i] > best) { best=WS[i]; boff=T[i]-S }
         }
-        # flat third (peak within 8% of the third mean) => centre it, dont
+        # flat segment (peak within 8% of the segment mean) => centre it, dont
         # chase sampling noise
         if (mc > 0 && best <= (msum/mc) * 1.08) boff = centre
         if (boff < 0) boff=0

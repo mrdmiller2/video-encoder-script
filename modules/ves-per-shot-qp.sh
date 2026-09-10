@@ -586,20 +586,40 @@ _shot_encode_bytes_only() {
 
 # Multi-window scorer for a LONG shot: instead of extracting + encoding +
 # scoring the whole shot (a 6-min take => 20-40GB ffv1, hours per QP probe),
-# score 3 short windows placed by content (SHOT_MW_OFFSETS, seconds from the
-# shot start -- content-driven from _shot_long_windows(), or evenly spaced as
-# a fallback) and combine:
-#   vmaf  = MEDIAN of the 3 window VMAFs   (robust to one odd window)
+# score a set of short windows placed by content (SHOT_MW_OFFSETS, seconds
+# from the shot start -- content-driven from _shot_long_windows(), or evenly
+# spaced as a fallback) and combine:
+#   vmaf  = MEDIAN of the window VMAFs    (robust to one odd window)
 #   bytes = mean(window_bytes / window_secs) * shot_secs   (rate-scaled)
 # Same (qp,vmaf,bytes) contract as _vmaf_score_shot so resolve_per_shot_qp()
-# is agnostic. Env in: SHOT_MW_OFFSETS (csv), SHOT_MW_LEN (default 8).
+# is agnostic. Env in: SHOT_MW_OFFSETS (csv), SHOT_MW_LEN (default 12).
+# v6.0.4: window count scales with duration (clamp(round(dur/GAP), MIN, MAX));
+# a legacy flat-3 manifest is re-windowed here on the fly. PER_SHOT_MW_ALGO=v1
+# restores the pre-6.0.4 flat 3.
 _vmaf_score_shot_mw() {
   local src="$1" start="$2" end="$3" qp="$4" codec="$5" model="$6" profile="$7"
-  local wl="${SHOT_MW_LEN:-8}" offs="${SHOT_MW_OFFSETS:-}" shot_dur o ws we r wv wb
+  local wl="${SHOT_MW_LEN:-${PER_SHOT_MW_LEN:-12}}" offs="${SHOT_MW_OFFSETS:-}" shot_dur o ws we r wv wb
   local -a vs=() rates=()
   shot_dur="$(awk -v a="$start" -v b="$end" 'BEGIN{d=b-a; if(d<0)d=0; printf "%.6f", d}')"
-  [ -n "$offs" ] || offs="$(awk -v d="$shot_dur" -v l="$wl" 'BEGIN{
-      for(k=0;k<3;k++){o=d*(2*k+1)/6.0 - l/2.0; if(o<0)o=0; if(o+l>d)o=d-l; if(o<0)o=0; printf "%s%.2f",(k?",":""),o}}')"
+  # Window count scales with duration (v6.0.4). A legacy (flat-3) manifest's
+  # cx_windows -> SHOT_MW_OFFSETS has fewer entries than the current algo
+  # wants; regenerate even-spaced at the target count in that case so an
+  # already-built manifest still gets the denser search. PER_SHOT_MW_ALGO=v1
+  # forces the old flat 3 (for reproducing a pre-6.0.4 result).
+  local _nwant _have
+  if [ "${PER_SHOT_MW_ALGO:-v2}" = "v1" ]; then
+    _nwant=3
+  else
+    _nwant="$(awk -v d="$shot_dur" -v g="${PER_SHOT_MW_GAP_SECS:-18}" -v lo="${PER_SHOT_MW_WINDOWS_MIN:-4}" \
+                  -v hi="${PER_SHOT_MW_WINDOWS_MAX:-12}" -v l="$wl" 'BEGIN{
+        n=int(d/g + 0.5); if(n<lo)n=lo; if(n>hi)n=hi;
+        mf=int(d/l); if(mf>=1 && n>mf) n=mf; if(n<2) n=2; print n }')"
+  fi
+  _have="$(printf '%s' "$offs" | awk -F, 'BEGIN{c=0} {for(i=1;i<=NF;i++) if($i!="") c++} END{print c+0}')"
+  if [ -z "$offs" ] || [ "${_have:-0}" -lt "${_nwant:-3}" ]; then
+    offs="$(awk -v d="$shot_dur" -v l="$wl" -v nw="${_nwant:-3}" 'BEGIN{
+        for(k=0;k<nw;k++){o=d*(2*k+1)/(2.0*nw) - l/2.0; if(o<0)o=0; if(o+l>d)o=d-l; if(o<0)o=0; printf "%s%.2f",(k?",":""),o}}')"
+  fi
   local IFS=,
   for o in $offs; do
     IFS=' '
@@ -1227,7 +1247,7 @@ shot_split_create_manifest() {
     done < <(_shot_complexity_table "$_cx_stats" "$_boundaries" 2>/dev/null)
   fi
 
-  local _long_secs="${SHOT_LONG_SECS:-45}" _mw_len="${PER_SHOT_MW_LEN:-8}"
+  local _long_secs="${SHOT_LONG_SECS:-75}" _mw_len="${PER_SHOT_MW_LEN:-12}"
   _write_shot_cx() {  # <idx> <start_ts> <end_ts> -> appends cx_* lines to stdout
     local c="${_CX[$1]:-}" _sdur _win
     if [ -n "$c" ]; then
@@ -1320,6 +1340,8 @@ model=$model
 field_mode=$_fm
 is_bw=$_bw
 bw_frac=${_bw_frac:-}
+mw_algo=${PER_SHOT_MW_ALGO:-v2}
+long_secs=${_long_secs}
 created_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 created_host=$(hostname 2>/dev/null || echo unknown)
 EOF
@@ -1774,8 +1796,8 @@ shot_search_claimed() {
     if awk -v d="$_sdur" -v l="${SHOT_LONG_SECS:-45}" 'BEGIN{exit !(d+0 > l+0)}'; then
       _cxwin="$(awk -F= '/^cx_windows=/{print $2; exit}' "$shot_meta")"
       export SHOT_MW_ACTIVE=1
-      export SHOT_MW_OFFSETS="$_cxwin"        # empty => _vmaf_score_shot_mw uses even spacing
-      export SHOT_MW_LEN="${PER_SHOT_MW_LEN:-8}"
+      export SHOT_MW_OFFSETS="$_cxwin"        # empty / short => _vmaf_score_shot_mw re-windows (v6.0.4)
+      export SHOT_MW_LEN="${PER_SHOT_MW_LEN:-12}"
     fi
   fi
 

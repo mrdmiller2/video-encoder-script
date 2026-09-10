@@ -89,6 +89,44 @@ are stale). **MARLONJ (macOS/ARM)** was the exception (homebrew svt-av1 bottle
 emits a ~0.03%-different bitstream) — **resolved in phase 5**: a clean v4.2.0
 git-tag build is bit-exact; MARLONJ now encodes.
 
+### v6.0.4 — long-shot scorer density + large-title search rescue (2026-09-10)
+
+Diagnosing why 2001: A Space Odyssey (142 min, 641 shots) was heading for a
+FELL-SHORT quarantine at 75% coverage: the unresolved shots were **not** hard
+content — 100 of 149 were under 20s, almost all in the film's back half, with no
+status file at all. One 5h `dval_research.sh` pass simply runs out of budget
+around shot ~217, `DVAL_MAX_FELLSHORT=3` then quarantines a legitimate large
+title. Separately, the long-shot multi-window scorer sampled a **flat 3 × 8s =
+24s regardless of shot length** — 14% of a 176s take — producing a visibly
+sub-optimal QP on the long meditative takes such a film is made of.
+
+- **Multi-window count scales with duration** (`_vmaf_score_shot_mw`,
+  `_shot_long_windows`). `n = clamp(round(dur / PER_SHOT_MW_GAP_SECS), MIN, MAX)`
+  (defaults 18s gap, 4–12 windows), window length `PER_SHOT_MW_LEN` 8 → 12. A
+  120s take now gets ~7 × 12s ≈ 70% coverage vs 20%. A **legacy flat-3 manifest**
+  is detected at search time (`SHOT_MW_OFFSETS` shorter than the target count)
+  and re-windowed on the fly — no manifest rebuild needed. `PER_SHOT_MW_ALGO=v1`
+  restores the pre-6.0.4 behaviour; `manifest.meta` records `mw_algo=`.
+- **`SHOT_LONG_SECS` 45 → 75.** Shots up to 75s now get a **true full-shot
+  search** (y4m ≈ 11 GB, fits the 30–64 GB fleet tmpfs at 2 workers/node) instead
+  of any windowing. Deliberately more compute per long shot — the survey feeds
+  production encodes and a wrong QP on a 2-minute take is a wrong 2 minutes of
+  the final file.
+- **Search progress guard** (`dval_searchwalk.sh`). A FELL-SHORT round whose real
+  coverage climbed ≥ `DVAL_FELLSHORT_MIN_GAIN_PCT` (4%) of the manifest since the
+  previous round is the search *working*, not stuck — it no longer spends a
+  quarantine strike. `DVAL_FELLSHORT_MAX_ROUNDS` (8 total attempts) backstops a
+  title that dribbles forever. Fellshort state file is now `strikes nreal
+  attempts`.
+- **Research wall cap scales with shot count** (`dval_research.sh`). Flat 5h →
+  `4h + 14s/shot`, floored 5h, capped 9h — so a 641-shot title gets ~5.4h and a
+  1500-shot title ~9h per pass.
+
+`VERSION` 6.0.3 → 6.0.4. Deployed fleet-wide by targeted rsync (no epoch
+cutover; nothing in the running pipeline gates on `VERSION`). Already-searched
+grain titles with 45s+ shots keep their v1-windowed data (tagged); re-search is
+optional pending a spot A/B.
+
 ### v6.0.3 phase 7 — D-val per-shot scorer desync + BASELINE-UNFIT gate (2026-09-09)
 
 Two peer reviews of the "3 stuck titles" (Wanda / All About Eve / American Pop)
