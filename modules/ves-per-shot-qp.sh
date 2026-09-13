@@ -803,6 +803,8 @@ resolve_per_shot_qp() {
   _probe_qp() {
     local q="$1" r
     [ -n "${score[$q]:-}" ] && return 0
+    declare -F _shot_phase >/dev/null 2>&1 && _shot_phase \
+      "search:shot=${_DVAL_CUR_SHOT_IDX:-?}:qp=$q" "${SHOT_MW_ACTIVE:+600}"
     r="$("$_score_fn" "$src" "$start" "$end" "$q" "$codec" "$model" "$profile")" || return 1
     score[$q]="${r%% *}"; bytes[$q]="${r##* }"
     LAST_SHOT_SEARCH_SAMPLES+=("${q}:${score[$q]}:${bytes[$q]}")
@@ -1594,6 +1596,31 @@ shot_search_worker_loop() {
     _dval_hb_bg() { while :; do sleep 600; kill -0 "$_wl_pid" 2>/dev/null || exit 0
       declare -F dval_heartbeat >/dev/null 2>&1 \
       && dval_heartbeat "$_slug" "$1" "$VES_CLAIM_OWNER" || exit 0; done; }
+    # v6.0.7 (self-management plan, gap 1): per-shot phase+deadline marker,
+    # the search-side analog of dval_worker_encode.sh's _phase()/.phase file
+    # -- lets dval_local_supervisor.sh catch a worker wedged on ONE specific
+    # shot instead of waiting out the full VES_CLAIM_TTL (2700s) passive
+    # lease expiry. Written under the ENCODE convention's root, deliberately
+    # NOT this file's own $_WROOT (DVAL_LOCAL_WORK_ROOT default /srv/ves/work,
+    # confirmed to differ from encode's default /var/tmp/dval) -- the local
+    # supervisor only ever looks under the latter, so both worker types need
+    # to share it. Keyed by PID ($$, the top-level worker's own pid -- stable
+    # across this function's calls, only a real forked subshell changes it):
+    # unlike encode (capped at 1/host by the search/encode mutex), a host
+    # runs several concurrent search workers on the same slug, one file each.
+    _shot_phase(){
+      local d="${DVAL_LOCAL_WORK_ROOT:-/var/tmp}/dval/search/$_slug"
+      mkdir -p "$d" 2>/dev/null
+      printf '%s %s\n' "$1" "$(( $(date +%s) + ${2:-300} ))" > "$d/$$.phase" 2>/dev/null
+    }
+    # Cleared the instant a claimed shot's work is done (success, failure, or
+    # a permanent sync-fail requeue) -- NOT left to expire on its own. A
+    # phase file's deadline is only ever refreshed while genuinely active
+    # (claim + every QP probe); if it were left in place after the shot
+    # finished, its last deadline would eventually lapse during the
+    # worker's normal idle-between-claims window and the local supervisor
+    # would wrongly kill a perfectly healthy, idle worker.
+    _shot_phase_clear(){ rm -f "${DVAL_LOCAL_WORK_ROOT:-/var/tmp}/dval/search/$_slug/$$.phase" 2>/dev/null; }
   fi
   _shot_scratch_sweep
   # Survey pause/terminate + lifetime cap (2026-09-07). Before this a search
@@ -1646,8 +1673,16 @@ shot_search_worker_loop() {
     if [ -n "$idx" ]; then
       idle=0
       echo "claimed shot $idx"
+      # side-channel for _probe_qp() (a different function -- resolve_per_shot_qp
+      # has no idx parameter and stays signature-stable) to tag its own phase
+      # writes with which shot they belong to; same established pattern as
+      # LAST_SHOT_SEARCH_SAMPLES below.
+      _DVAL_CUR_SHOT_IDX="$idx"
       _hbpid=""
-      if [ -n "${VES_CLAIM_CMD:-}" ]; then _dval_hb_bg "$idx" & _hbpid=$!; fi
+      if [ -n "${VES_CLAIM_CMD:-}" ]; then
+        _dval_hb_bg "$idx" & _hbpid=$!
+        declare -F _shot_phase >/dev/null 2>&1 && _shot_phase "search:shot=${idx}:claim" 300
+      fi
       # Phase B: don't let shot_search_claimed release the lease on success --
       # the loop releases AFTER the status has landed on the NAS (review CRIT #1).
       SHOT_CLAIM_DEFER_RELEASE="${VES_CLAIM_CMD:+1}" shot_search_claimed "$src" "$idx"; rc=$?
@@ -1692,6 +1727,10 @@ shot_search_worker_loop() {
               # KEEP the lease + heartbeat; the human alert above is the signal.
               warn "shot-search: shot $idx sync failed AND could not set local status aside -- KEEPING the lease, needs a human"
             fi
+            # Cleared either way: this worker is moving on to claim a NEW shot
+            # next iteration regardless of what happened to THIS shot's lease,
+            # so it's no longer actively working this one as of right now.
+            declare -F _shot_phase_clear >/dev/null 2>&1 && _shot_phase_clear
             _shot_scratch_sweep; continue
           fi
         fi
@@ -1702,6 +1741,7 @@ shot_search_worker_loop() {
         declare -F shot_release_claim >/dev/null 2>&1 && shot_release_claim "$src" "$idx"
       fi
       [ -n "$_hbpid" ] && kill "$_hbpid" 2>/dev/null
+      declare -F _shot_phase_clear >/dev/null 2>&1 && _shot_phase_clear
       _shot_scratch_sweep
       continue
     fi

@@ -89,6 +89,468 @@ are stale). **MARLONJ (macOS/ARM)** was the exception (homebrew svt-av1 bottle
 emits a ~0.03%-different bitstream) — **resolved in phase 5**: a clean v4.2.0
 git-tag build is bit-exact; MARLONJ now encodes.
 
+**AFGM stuck "launch never took" for HOURS after the redis-connect fix -- different bug, also fixed.**
+The `_ves_redis` connect-timeout fix held (confirmed: sha matched deployed),
+but the exact same symptom (`"launch never took (no header in 10m, no
+worker) -- released, NO strike"`) kept recurring every ~50min on MJACKSON for
+hours. Root cause this time: `dval_worker_encode.sh`'s manifest-staging
+`rsync` (NAS -> local `$WORK/manifest-shots`, described in its own comment as
+normally "seconds") has **no timeout at all**, and the `cp -a` fallback
+behind it doesn't either. Confirmed live: the rsync copying AFGM's ~1494-shot
+manifest was hung in D-state (`folio_wait_bit_commo`) 44+ minutes with the
+underlying NFS mount otherwise responsive (a direct `stat` on another file in
+the same tree returned instantly) -- an intermittent stall, not a dead mount,
+matching this project's known NFS-blip history, just on a call site nobody
+had bounded yet. No orphan pileup (dispatch's release+retry does clean up
+the prior attempt each cycle), but each fresh worker just hit the same
+unbounded call and hung again -- explaining the hours-long repeat with no
+progress. `ves_reap_nfs_hangs.sh` doesn't help either: it only matches
+`find`/`updatedb`, not `rsync`. Fixed: both the rsync and the cp fallback
+wrapped in `timeout 300` (generous vs. the normal "seconds" case, well under
+dispatch's 10-min external check so a stall now fails fast and falls through
+to the existing "reading NAS directly" path instead of hanging the whole
+worker). Killed the stuck process + its rsync tree; dispatch will retry
+clean with the fix (propagates via the same rsync-per-launch as every other
+worker-script change).
+
+**Two-tier host monitoring (2026-09-12, user directive after the multi-agent
+architecture consult).** New `dval_local_supervisor.sh` -- host-level cron
+(1min, every fleet Linux + macOS node) that watches from OUTSIDE the worker
+process entirely, closing the gap both peer reviews converged on: an
+in-process heartbeat structurally cannot see a hang in code that runs before
+it starts, and both of the prior night's hangs (drain-wait, manifest staging)
+did exactly that. Protocol: `dval_worker_encode.sh` now writes `$WORK/.phase`
+("phase_name deadline_epoch") via a new `_phase()` helper at the start of
+every phase that has hung or could plausibly hang (`drain_wait`,
+`manifest_stage`, `assembling`, `encoding:<name>`, `scoring:<name>`). The
+local supervisor reads it for every live worker on its host; past deadline,
+it escalates immediately (recursive tree-kill, TERM then KILL, matching
+`_pkilltree`'s existing pattern rather than a bare process-group kill, which
+would miss `_cap_run`'s deliberately separate encode pgid) -- independent of
+dispatch's own much slower external stale-checks (10-45min depending on
+path). Clears the host's encode mutex + wreg registration on success so
+dispatch/research reassign immediately. A process surviving SIGKILL (the
+acknowledged-possible hard-D-state case) marks the host degraded and stops
+retrying locally rather than looping. Refreshes a per-host redis liveness key
+every run regardless of outcome.
+
+`dval_watchdog.sh` (coordinator, existing cron cadence) gained the backup
+tier: a new, deliberately coarse, time-triggered check on that same per-host
+key -- it has far less visibility (would need to ssh in and inspect each host
+to know more), so it only asks "has this host's local supervisor reported
+in recently," not anything about individual workers.
+
+**Progress-signal investigation (same day, user follow-up: "can we see what
+these tools are doing without adding load/storage")** -- checked what the
+actual binaries already emit before building anything new:
+- `SvtAv1EncApp`'s own progress mechanism updates via backspace characters
+  (TTY-style overwrite, confirmed by raw byte capture on a live fleet host)
+  -- too fragile to parse reliably. The `.ivf` output file's growing size +
+  CPU-seconds (already used by the in-process STALL detector) is a better,
+  zero-added-cost proxy for encode progress; no change needed there.
+- `ffmpeg -progress <file> -stats_period N` is different: a native, clean,
+  newline-delimited key=value stream (`frame=`, `out_time_us=`, `speed=`,
+  `progress=continue|end`) purpose-built for this, verified unaffected by
+  `-v error`. `score()`'s ffmpeg/VMAF calls had NO progress signal at all
+  before this (unlike the encode side) -- genuine gap, now closed: added,
+  cleared before every call so it never accumulates (worst case ~10KB for an
+  hour-long pass, then deleted).
+- Manifest staging needs no new flag either -- the destination directory's
+  own growing file count is already there for free.
+`dval_local_supervisor.sh` reads all three as a DIAGNOSTIC annotation
+alongside the phase-deadline check (written to a per-worker
+`.local_super_status` snapshot, one line, overwritten every pass) --
+deliberately does NOT feed into the kill decision, which stays purely
+deadline-based (cross-consult, 2026-09-11: conflating progress with deadline
+is exactly what made a naive heartbeat insufficient in the first place).
+
+Deployed to all 6 Linux/macOS fleet hosts (cron + updated worker/lib);
+PRINCE/ELVIS (Windows) don't have a port of the local-supervisor tier yet.
+
+### v6.0.6 (in progress) — rolling encode timeouts + progress ledger (2026-09-11)
+
+**CRITICAL, self-inflicted: the collision-guard added earlier tonight
+permanently blocked `A_Few_Good_Men (1992)` from ever launching an encode,
+on every host, for 7+ hours.** Found while root-causing a "fleet status"
+question: the guard (`dval_worker_encode.sh`, added this same session) reads
+the first `#`-prefixed line of `$WORK/result.log` to detect a genuine
+category collision, via `awk '/^#/{print $2; exit}'`. It didn't account for
+the OTHER `#`-line shape this same script writes: `# DECLINED $HOST $CAT/
+$SLUG -- ...` (appended by the three self-decline paths -- oversubscribed,
+encnode held, search wouldn't drain). Once a `# DECLINED ...` line became the
+first line in a title's shared result.log (normal -- LAYTOYAJ's chronic
+OCR-fleet oversubscription declines routinely), the guard read the literal
+word "DECLINED" as the prior category, saw it didn't match the real category,
+and exited 93 -- LOUD to a log nobody was watching in real time, but with
+ZERO stdout before it (confirmed live via direct foreground reproduction:
+`bash dval_worker_encode.sh ...` produced no output at all, not even its own
+startup line) and NO further diagnostic once dispatch's own capture only
+showed "launch never took (no header in 10m, no worker)". Since result.log
+lives on the shared NAS, this wasn't host-specific -- every host dispatch
+tried hit the identical wall. Fixed by excluding `# DECLINED ` lines from the
+header scan (`awk '/^# DECLINED / {next} /^#/{print $2; exit}'`). Verified
+live on LAYTOYAJ: same reproduction now proceeds past the guard normally.
+Scanned all `results/*.log` for the same first-line pattern -- one other
+title (`American_Pop`, already quarantined for an unrelated, correct
+methodology reason) had it too. Deployed to all 6 fleet hosts immediately
+rather than waiting for dispatch's own auto-redeploy-on-launch.
+
+**Quarantine review, prompted by the same fleet-status question**: confirmed
+there is no scheduled re-attempt or expiry mechanism for a quarantined title
+at all -- quarantine is a one-way state until a human (or agent) manually
+investigates. Of the 4 currently quarantined: `American_Pop` and
+`All_About_Eve` are correctly parked (confirmed methodology blockers -- base
+undershoot / grain base>source -- not transient, see
+dval-quarantine-methodology-blockers); `2001_A_Space_Odyssey` (quarantined
+~10h ago, 3 STALE reclaims after repeated `crashed_no_worker` across
+aiprocessor/MJACKSON/JJACKSON) and `A_Day_at_the_Races` (quarantined 6 DAYS
+ago, search fell short 3 rounds) have had zero re-attempts logged since and
+have not yet been root-caused -- flagged for the user, not yet investigated.
+
+**MARLONJ's `/Volumes/Media` NFS mount changed vers=4 -> vers=3 (root cause of
+the earlier "NAS status sync failed" investigation), plus a fleet-wide redis
+heartbeat scheme (user directive 2026-09-12).** The mount is managed by
+`~/bin/nfs-mount-watchdog.sh` (docmiller's own LaunchAgent, force-remounts
+every 60s if unhealthy) -- fixed its hardcoded `NFS_OPTS` and, while in there,
+found + fixed an adjacent gap: its `mount_busy()` guard didn't recognize any
+D-val process name at all, so it could force-unmount the media volume mid-
+job independent of the NFS version. Backed up the original
+(`nfs-mount-watchdog.sh.bak-pre-v3-2026-09-12`). Execution: stopped MARLONJ's
+live search workers cooperatively (set `dval:encnode:MARLONJ`, the existing
+search/encode mutex, rather than killing anything -- they self-exit on their
+own next admission check, exactly the mechanism `dval_admit()` already
+provides for this); one round tripped the (now-fixed) busy-guard against the
+*new* workers dispatch had already relaunched before the drain finished --
+mount briefly went missing, one shot recorded a degraded fixed-QP fallback
+result (self-heals: `SHOT_SEARCH_RETRY_CAP` re-queues it automatically, not
+permanent bad data) -- caught immediately and the mount was restored (as v3)
+within about a minute of going missing. Confirmed: `nfsstat -m` shows v3,
+`nfs_vnop_setattr` errors (~1150/12h before) dropped to background noise from
+the *other* still-v4 shares, all 6 fleet nodes' heartbeats stayed green
+throughout.
+
+**Fleet heartbeat (`dval:hb:node:<host>` / `dval:hb:work:<host>`)**: two
+redis KV+TTL keys per host, both self-expiring (EX 180), written every 60s by
+`dval_local_supervisor.sh` on every fleet node -- replaces the narrower
+`dval:local-super:<host>` liveness-only key from earlier tonight.
+`dval:hb:node` carries keepalive + load (`load1`/`nproc` via portable
+`getconf _NPROCESSORS_ONLN` + `/proc/loadavg` or `sysctl vm.loadavg`, no
+GNU-only `nproc` dependency) + whether the host currently holds the encode
+mutex; `dval:hb:work` carries what job is active and, for encode (which has
+`.phase` instrumentation), its actual deadline_in -- absent means genuinely
+idle, not a fault. Wired into two consumers: `dval_watchdog.sh`'s backup
+liveness check now reads `dval:hb:node` instead of the old key; `dval_dispatch.sh`'s
+STALE-encode path now checks `dval:hb:work` first (`_hb_says_alive()`) and
+skips its SSH-based liveness probe entirely when the heartbeat already
+confirms the worker is alive and on-track -- narrows how often SSH gets used
+for routine polling (the flapping the user was pointing at) without removing
+it as the fallback/remediation path; `_encode_host_eligible()` now also skips
+an already-hot host for new encode assignment (`load1/nproc` ratio, default
+threshold 1.5, `DVAL_ENCODE_MAX_LOAD_RATIO`) -- read-only courtesy throttle,
+never blocks assignment on a missing/stale heartbeat. Search-side worker
+counts use the authoritative `dval:wreg:<slug>:<host>` registration count
+(`dval_wreg_count`), not a process-table pgrep count -- confirmed live that
+pgrep overcounts 3-5x (subshells/heartbeat forks share the worker's argv,
+the same forktree_Nx miscount class this codebase has hit before); also
+found + fixed AI-PROCESSOR's canonical registration name ("AI-PROCESSOR")
+not matching its own `hostname -s` ("aiprocessor", no hyphen) via an explicit
+map, matching the same divergence `dval_watchdog.sh` already special-cased.
+Also fixed in the same pass: `dval_local_supervisor.sh`'s ivf_bytes/ivf_age
+progress diagnostic used GNU-only `stat -c`, silently reading 0/wrong on
+macOS (BSD `stat -f`) -- added a portable `_fsize`/`_fmtime` helper (same
+GNU-vs-BSD class as tonight's `timeout`/`flock`/`redis-cli` fixes). Deployed
++ verified reporting on all 6 fleet hosts. Windows (PRINCE/ELVIS) still has
+no local-supervisor port, so no heartbeat from them yet -- unchanged scope
+from earlier tonight.
+
+**`_ves_redis()`'s connect-timeout probe depended on the external `timeout`
+binary (GNU coreutils), which is NOT installed on MARLONJ (macOS) --
+regression introduced earlier the same day, self-caught during two-tier
+monitoring rollout.** `timeout N cmd || return 3` degrades silently when
+`timeout` itself is missing: the shell reports "command not found" (rc 127),
+which the `|| return 3` fallback treats identically to "redis unreachable" --
+exactly the "cheap and quiet" silent-failure shape this whole effort exists to
+eliminate, and it was live on MARLONJ for hours before being caught. Fixed by
+replacing the external-binary timeout with the same portable bash-native
+background-kill pattern `_cap_run` already uses for its own encode watchdog
+(`cmd & pid=$!; ( sleep N; kill -9 $pid ) & wd=$!; wait $pid`) -- no
+dependency beyond `sleep`, which (unlike `timeout`) is POSIX-standard and
+confirmed present on every fleet host. Verified: healthy-path `PING`/`SET`/
+`GET` round-trip and the unreachable-host timeout path (returns rc 3 in ~3s,
+not a multi-minute hang) both tested directly on MARLONJ under its actual
+production interpreter (`/opt/homebrew/bin/bash`, not the ssh-default
+`/bin/bash` 3.2 -- that distinction briefly produced a false-positive rc 127
+during manual testing: bash 3.2 doesn't support the `{fd}<>` named-descriptor
+redirect this library uses throughout, added in bash 4.1+; MARLONJ's actual
+cron/dispatch launches already invoke homebrew bash explicitly, so production
+was never on that path). Redeployed to all 6 fleet hosts. `dval:local-super:
+<host>` now confirms fresh for MJACKSON/LAYTOYAJ/aiprocessor/JJACKSON/TITOJ/
+MARLONJ -- 6/6 fleet coverage of the two-tier local-supervisor monitoring
+system (Windows/PRINCE+ELVIS still pending a PowerShell port, unchanged from
+earlier). Aside/out of scope: while chasing this, found MARLONJ is
+concurrently running an unrelated legacy per-shot-QP discovery loop
+(`worker_loop_discovery_multi.sh`, title "1917 (2019)") repeatedly failing its
+NAS status-sync (rsync rc=1, `ALERT.status-sync-failed`) and re-queuing shots
+347/348/387/388 -- a real, currently-active issue, but a plain NFS/rsync
+failure unconnected to the redis-timeout bug (no redis involved in that code
+path at all); flagged for the user, not yet investigated further.
+
+**24HPP `B_f80_F1` scored VMAF 19.66 (vs. 77-96 for its other 7 variants) --
+root-caused, fixed, and re-queued.** Same collapsed-desync signature as the
+original whole-movie index/fps bug that hit this title's `base` variant
+(23.62 raw, 96.7 corrected) earlier this session -- and confirmed the same
+class of bug resurfacing, not a new one: `_TITLE_VMAF_ALIGN` (`score()`'s
+"this title needs fps alignment" pin) was an in-memory-only variable that
+never survived a worker restart. 24HPP's `base`/`A_pershot`/`D_f90`..`D_f50`
+all scored correctly because one long session discovered the pin once and
+carried it through its own remaining variants -- but `B_f80_F1` landed in a
+THIRD, brand-new worker session (after the first hit its lifetime cap and a
+second was killed early by the `dval_worker_reap.sh` `.assembling` bug fixed
+earlier tonight) with the pin reset to empty, so it re-scored under raw index
+alignment and got the same kind of collapsed value. The in-`score()` self-heal
+guard (sample cross-check -> full fps re-measure -> adopt if clearly better)
+should have caught and corrected this within that same session; whether it
+tried and fell short, or the underlying encode from that session's rebuilt
+qpfile was itself compromised, can't be confirmed -- the diagnostic
+`encode.log` for that session was already deleted by `dval_scratch_reap.sh`'s
+normal DONE cleanup by the time this was investigated (hours before this
+session's new durable status ledger existed to prevent exactly that loss).
+- **Fix**: `_TITLE_VMAF_ALIGN` now reseeds from `$RESULT` (already seeded from
+  the durable `$RESULT_NAS` at worker startup, so it survives a host change
+  too) by scanning for a prior session's "PINNING this title to fps alignment"
+  line -- closes the gap for every title that gets reassigned mid-survey, not
+  just 24HPP.
+- **24HPP's bad data**: `B_f80_F1`'s line and the (now-incorrect)
+  `DVAL_ENCODE_DONE` marker removed from its durable result log (pre-fix
+  content preserved in a `.bak-pre-b80-fix` sibling) -- dispatch now sees 7/8
+  and will re-encode + re-score just that one variant with the persistence fix
+  in place.
+
+**UPDATE, same day: the fix above was NOT sufficient -- the 3rd attempt scored
+21.64, essentially unchanged from 19.66, proving this was never purely the
+alignment-pin bug.** The new durable status ledger (built earlier today,
+first real payoff) showed the in-`score()` guard DID run both the sample
+cross-check and the full fps re-measure this time, but neither adopted --
+meaning fps realignment genuinely does not fix this variant, unlike `base`.
+Deep-dived instead of guessing again: reproduced `B_f80_F1`'s qpfile assembly
+standalone (`assemble_qpfile_via_equal_slope_budget` run directly against
+24HPP's manifest, no full worker/encode needed -- cheap, ~seconds, vs. the
+~2h cost of another blind full re-encode cycle). **Real root cause found**:
+`B_f80_F1`'s call site was the ONLY caller of
+`assemble_qpfile_via_equal_slope_budget` anywhere in the codebase missing
+`ALLOC_MIN_SHOT_VMAF_DROP=0` -- every `D_f${fr}` sibling three lines up has
+it, as does every call in `dval_encode.sh` / `discovery_s01e02_*.sh`. Without
+it, `ves-config.sh`'s global default (6.0) activates a per-shot VMAF floor
+the fraction-budget sweep is explicitly built to run WITHOUT. Confirmed live:
+982/1744 shots (56%) pinned to a hard VMAF-94 floor, the 0.80 budget can't
+fit that many pinned shots, solver falls into its own `BUDGET_UNREACHABLE`
+path (logged: "solve overshoots by 160.2%... qpfile is the constrained best,
+not the requested size") with a degenerate `LAMBDA=1` instead of a converged
+solve -- matching the observed ~3x oversized file (2.94GB vs `D_f80`'s ~1GB)
+and, evidently, a structurally wrong encode (same VMAF-collapse signature as
+a frame-count mismatch, different root cause than the alignment bug).
+**Fixed**: added the missing override, matching the established pattern used
+everywhere else. **Verified before touching the live title again**: reran the
+standalone repro with the fix in place -- produces a solve
+byte-for-byte identical to `D_f80`'s (baseline/LAMBDA/TOTAL_BYTES/
+OVERSHOOT_PCT/FLOOR_PINNED all match exactly, zero diff). 24HPP's result log
+invalidated a 2nd time (both attempts' history preserved in
+`.bak-pre-b80-fix` / `.bak-pre-b80-fix2` siblings) and re-queued for a 3rd,
+now evidence-based attempt. Also closed the gap that cost real diagnostic
+time twice today: the `src_frames`/`enc_frames` diagnostic and the xcheck/
+full-fps sample values now go to the durable status ledger too (were
+`encode.log`-only, deleted by `dval_scratch_reap.sh` on every DONE).
+
+**The same `set -u`-vs-empty-associative-array crash found live in
+`dval_dispatch.sh` (below) also exists in `dval_prestage_pipeline.sh`**
+(`MPIDS`/`PPIDS`, both `${#ARR[@]}` on what's routinely an empty array at
+startup or whenever nothing is mid-build). Currently inert (`DVAL_PRESTAGE_AUTO`
+defaults off) so this hasn't fired, but it would have crashed this pipeline on
+its first idle pass the moment it's ever turned on. Fixed with the same
+`set +u`/`set -u`-bracketed-into-a-plain-variable pattern, computed fresh each
+inner-loop iteration (preserving the original recompute-every-slug behavior).
+Not yet swept across the rest of the tree for the same pattern -- flagged as a
+possible follow-up, not done as part of this fix.
+
+**`dval_worker_encode.sh` timeout redesign.** 24HPP got TERM'd by the worker
+**lifetime cap** at 6h03m with 7/8 variants done and its 8th's own budget still
+ample, purely because that cap was one static ceiling set from the a-priori
+`estimate_encode_budget` guess before the first byte encoded -- it had no idea
+the worker was healthy and finishing variants on schedule. Both wall-clock caps
+are now self-calibrating instead of fixed:
+- **Per-variant cap (`_VARIANT_MAX_SECS`)** -- `_cap_run` now times every
+  variant's actual encode and, on a successful (rc=0) finish, sets the cap for
+  the *next* variant to `this_one's_elapsed x 1.2` (floor `DVAL_VARIANT_MIN_SECS`,
+  default 1800s). Falls back to the a-priori estimate for variant 1 (nothing to
+  learn from yet) and is skipped entirely for `gs_*` grain variants (their own
+  `_ENC_MAXSECS` formula stays untouched) and when `DVAL_VARIANT_MAX_SECS` is
+  pinned via env.
+- **Worker lifetime cap** is now a rolling `_deadline` inside the heartbeat
+  loop, not a fixed `_WORKER_MAX_SECS` check. It starts equal to the original
+  estimate (variant 1 is exactly as protected as before) and *ratchets forward
+  only* every time a new scored-variant line lands in `$RESULT`, by that
+  variant's own span x1.2 -- never shrinks. `DVAL_ENCODE_WORKER_HARD_CAP`
+  (default `2x` the original estimate) is the absolute ceiling the ratchet can
+  never cross, so a title that "just barely" keeps finishing variants forever
+  still can't hold a node indefinitely.
+- The existing **STALL detector** (45 min of zero `.ivf` growth / zero new
+  scored lines / zero CPU-seconds) is unchanged and is what actually catches a
+  hang now -- it's byte-level, checked every 60s regardless of either cap
+  above, so making the caps generous no longer risks a longer wait on a
+  genuine wedge.
+- **New: a durable progress ledger** -- `$SHARED/state/encode-status/<cat>__
+  <slug>.status`, synced from `$WORK/status.log` on the same cadence
+  `_sync_result` already uses (plus at STALL/DEADLINE/ABORT/DONE/STOPPED).
+  `_cap_run` appends a `CHECKPOINT` line per variant (start / done+elapsed+
+  next-cap / timeout); the heartbeat appends a `TICK` line every 60s (loop
+  counter, current variant, stall counter, rolling deadline, hard cap) plus a
+  `CHECKPOINT` line each time it ratchets the lifetime deadline. `tail -f` on
+  the coordinator now answers "is this hung or just slow" without an ssh +
+  `ps`/log session on whatever host has it.
+
+**E2E unattended-operation review (2026-09-11): 3 independent internal review
+agents + 2 rounds of adversarial cross-consult (Codex + Cursor, each reading
+and pushing back on the other's proposed fixes with code citations; AGY/
+Antigravity hit an account quota mid-round-1, not yet folded in).** Converged
+items remediated now (lock-age, `.assembling` false-kill, score() observe-only);
+the dispatch-heartbeat fix (both reviewers' #1/#2 after a confirmed near-miss
+on a real fleet auto-restart) is a separate, larger change -- see below.
+- **Lock-age raised 720min(12h) -> 4320min(50h... 72h)** in three places that
+  all independently defaulted to the same now-wrong assumption:
+  `dval_worker_encode.sh` (`_lock_holder_alive`), `dval_worker_encode.ps1`
+  (`Test-DvalLockHolderAlive` -- weaker than the bash check, PID-alive only, no
+  cmdline confirmation), `dval_scratch_reap.sh` (the */30min lockdir sweep).
+  12h stopped being "longer than any real encode" once grain titles got a
+  24h/48h worker-budget fallback and dval_worker_reap.sh's 32h grain reap
+  ceiling -- a live 14h+ grain encode's lock could be deleted out from under it
+  by the scratch reaper, and a stray relaunch on the same host within that
+  window could pass the worker's own stale-lock check and start a SECOND
+  concurrent encoder of the same title. 4320 (72h) clears the documented
+  worst case (`_WORKER_HARD_CAP` = 2x the 30h budget clamp = up to 60h) with
+  real margin. Both reviewers converged: raise the constant, do NOT drop the
+  age check outright -- the empty/unreadable-cmdline branch (PID reuse by an
+  unrelated process) still needs an age-based reclaim path, and both files
+  already correctly *keep* the lock when cmdline can't be read at all.
+- **`dval_worker_reap.sh`'s `orphaned_stuck` reap now respects `.assembling`**
+  (`_assembling_now()`, existence-only check) -- it killed a real, healthy
+  24HPP session at 49 minutes during a legitimate multi-thousand-shot NFS
+  metadata read phase tonight, because the external reaper never knew about
+  the in-worker heartbeat's own `.assembling`-aware stall exemption. Scoped to
+  `orphaned_stuck` only (both reviewers explicitly against folding it into
+  `_encode_progressing()`, which `encode_hard_overage`'s separate 10h backstop
+  also consults -- would have silently widened that too). Explicitly NOT a
+  claim that assembly is now unbounded-safe: a worker genuinely wedged *while*
+  `.assembling` exists still isn't caught here; it falls through to the
+  absolute `encode_overage`/`encode_hard_overage` age ceilings instead, same
+  as before.
+- **`score()` observe-only timing** (`_timed_score_phase`, `DVAL_SCORE_SLOW_SECS`
+  default 900s) -- wraps all 5 foreground calls inside `score()` (remux, 2
+  diagnostic ffprobes, primary VMAF, the optional fps sample cross-check, the
+  optional full fps re-measure) with elapsed-time logging to the new
+  `encode-status` ledger (`SCORE_TIME`/`SCORE_SLOW` lines) and to `encode.log`.
+  No kill, no timeout enforcement yet. Confirmed live gap this targets:
+  `score()`'s ffmpeg/libvmaf calls run in the foreground with none of
+  `_cap_run`'s independent-watchdog protection -- a hang here can't be
+  interrupted by the worker's own SIGTERM-based stall/lifetime-deadline kill
+  (bash defers a trap behind a foreground pipeline, the same lesson `_cap_run`
+  already learned once). Both reviewers agreed a kill bound guessed without
+  real data risks false-failing a legitimately slow full-movie VMAF pass (4K,
+  grain, a loaded/slow host) more than it protects against a real hang -- this
+  stage exists purely to gather real p50/p99 duration data across the fleet's
+  heterogeneous hosts before any enforcement patch is written.
+
+**Deferred to the dispatch-heartbeat fix (in progress, separate from the above):**
+both reviewers ranked this #1/#2 after a live-verified near-miss --
+`ves_fleet_monitor.sh` (cron */3min, NOT `dval_watchdog.sh`) has its own
+independent, *tighter* (30min + 2-run latch) stale-`dispatch.log` detector that
+doesn't just alert, it force-restarts dispatch (killing searchwalk/research
+too) -- despite its own code comment claiming "informational only." Tonight's
+log-dedup fix (the `_LASTSKIP` change) came within one monitor cycle of
+tripping it more than once, saved only by an unrelated toggling log line
+happening to refresh `dispatch.log`'s mtime in time.
+
+### v6.0.5 (in progress) — survey knowledge base + fleet parallelism + grain synthesis (2026-09-10)
+
+**Grain-synthesis calibration** (design: `_ARCHIVE/SESSION4-DESIGN-grain-synthesis-profile.md`).
+~40% of the vintage/classic/animation corpus produces a CRF `base` >= source
+(SVT-AV1 faithfully reproducing film grain; the per-shot search then over-spends
+chasing a target grain makes unreachable). 7 of 17 surveyed titles; 5 finished
+the 8-variant survey with `winner_by_policy = None`. Three new pieces, all
+gitignored `orchestration/regional-survey/scripts/`:
+- **`dval_grain_probe.sh`** -> `knowledge/grain/<slug>.json`. Cheap, decode-only
+  (safe on the coordinator). The reliable signal is the encoder's own
+  `base_frac` (survey outcome) + `A_pershot/base` ratio; the probe folds those
+  plus a temporal-noise read + source traits into `grain_risk` (low/med/high)
+  and a `calibrate` verdict, for pre-survey routing. Backfilled: all 8
+  grain-blowup titles -> `high`; clean digital / clean anime -> `low`.
+  Merged into `dval_fingerprint.sh` as a `grain_probe` block.
+- **`dval_grain_calibrate.sh`** -> `knowledge/grain-profiles/<slug>.json`. On a
+  ~45s grainy clip, an RD grid of {keep, hqdn3d-lo/md/hi + film-grain-denoise=1
+  :film-grain=10/16/22} x {crf, +5, +10, +15}. Scores each on bytes,
+  `vmaf_src` (vs source) and `vmaf_struct` (denoise BOTH output and source ->
+  isolates non-grain fidelity). Picks the smallest point holding
+  `vmaf_struct >= tgt-1` and `vmaf_src >= tgt-GRAIN_VMAF_BUDGET` (6), that beats
+  `keep` by >= 25%. Verdict ADOPT / KEEP / SOURCE_LIMITED. Runs on a fleet node.
+- **`dval_worker_encode.sh`** -- after `base`, on a grain-eligible profile
+  (`vintage classic vtv canime wanime anime`) when `base_frac >= 0.85` or
+  `A_pershot/base >= 2`: skip the D_fXX/B sweep and instead encode `gs_base`
+  (`hqdn3d=3:2:9:9` + `film-grain-denoise=1:film-grain=16`), `gs_base_hi`
+  (heavier + `fg=24`), `gs_pershot` at the searched CRF -- the survey's own
+  `score()` + `winner_by_policy` compare them to base / A_pershot; one evidence
+  row per title -> `knowledge/grain-profiles/_calibration.log`. DONE gate = 4.
+  `DVAL_GRAIN_CALIBRATE=test`(default)|`0`; `DVAL_GS_MED_VF/_FG`, `DVAL_GS_HI_VF/_FG`
+  tunables. (The elaborate RD-grid `dval_grain_calibrate.sh` was abandoned --
+  its multi-encode grid kept truncating + desyncing its own VMAF; kept only as
+  a standalone analysis tool.) Also: the worker warm-loops its RESULT log mtime
+  so a re-encode of a title with an old log survives dispatch's dead-worker check.
+- **`dval_worker_encode.sh` `score()` -- catastrophic-desync guard.** 24HPP
+  (25fps h264, all colour metadata "unknown") scored base VMAF **23.62** on the
+  full movie while its CRF-search samples read 92-94 -- `setpts=N` index
+  alignment drifts when the encode has fewer frames than the source. Now a
+  full-movie VMAF < 40 re-measures with `fps` alignment and takes the higher.
+  Confirmed on 24HPP: 23.62 -> 96.7 (same deterministic encode).
+- **Live E2E (2026-09-10):** grain gate fired correctly on All About Eve
+  (`A_pershot/base 3.57`, tagged `src_limited`). But its `gs_base` worker WEDGED
+  (`do_wait` + an orphaned `sleep 50400` watchdog child, no encoder). Parked all
+  three grain candidates; the grain path needs a focused debug session.
+
+- **Dispatch/worker hardening (peer-consult remediation, 2026-09-10):**
+  - `dval_dispatch.sh` **SHA per-launch** -- `DVAL_WE_SHA` recomputed in
+    `_launch_encode`, not pinned at dispatch startup. Ends the
+    dispatch-restart-per-worker-edit tax (the worker is rsynced fresh on every
+    launch anyway).
+  - **Global concurrent-encode cap** -- `DVAL_MAX_CONCURRENT_ENCODES` (2 while
+    search runs, `_IDLE` 6 after `SEARCH-COMPLETE`). There was none; search + N
+    encodes drove every node to load 30+ and nothing finished.
+  - **`_host_encode_capacity_ok` / `_LOADPROBE` -> nr_running** (loadavg field
+    4), not the 1-min EWMA -- load1 lags a drain by minutes -> reserve -> drain
+    -> "over capacity" -> release thrash; and it was I/O-wait-inflated on
+    MJACKSON (load1 40 vs nr_running 8 for the owner's ML jobs).
+  - **`BUSY_SINCE` grace on the 45-min stale check** (`DVAL_ENCODE_DISPATCH_GRACE`
+    2700s) -- a freshly-dispatched re-encode can't be "stale" before its worker
+    publishes. Replaces (belt-and-braces with) the worker `_RESULT_WARM_PID`.
+  - **`_baseline_unfit_sweep` grain-aware** -- returns `no` for a title with a
+    `knowledge/grain-profiles/<slug>.json` or a `grain trigger:` line; its old
+    `BASELINE-UNFIT.log` lines are pre-grain history, not a live block. (This
+    was insta-re-quarantining every un-parked grain title.)
+  - `dval_worker_encode.sh` **`_ENC_MAXSECS`** -- `_cap_run` per-encode ceiling
+    = `min(_VARIANT_MAX_SECS/3, DVAL_GS_MAX_SECS 5h)` for `gs_*` variants
+    (`estimate_encode_budget` computes at preset-5 rates -> ~4-6x too loose at
+    preset 8). Plus **group-kill the `_cap_run` watchdog** (`kill -- -$_wd`) --
+    a bare `kill $_wd` orphaned the `sleep` and wedged the worker in `wait` for
+    the full 14h (24HPP / All About Eve, 2026-09-10).
+  - `score()` **VMAF-desync guard raised 40 -> 75** and now PINS the title:
+    `_TITLE_VMAF_ALIGN=fps` after one full fps re-measure (gated on a cheap fps
+    sample cross-check) so later variants skip it. The 40-75 band was silent
+    corruption (logged, not corrected).
+  - **`dval_dispatch.sh` dynamic-host gate log dedup** -- the "too loaded for a
+    new encode -- skipping this pass" line was the only per-pass gate in the
+    assign loop without a `_LASTSKIP` guard, so a dynamic host that sits loaded
+    (MJACKSON's ML job, or AI-PROCESSOR while it runs search workers) reprinted
+    it every ~90s and buried the real `dispatch ->` / `DONE` / `QUARANTINE`
+    lines. Now logged once per state change, matching the `cap` / `decl` /
+    `enc:` gates. Takes effect on the next dispatch restart.
+
 ### v6.0.5 (in progress) — survey knowledge base + fleet parallelism (2026-09-10)
 
 The library is ~192 titles at 4K and growing; the serial one-title-at-a-time
@@ -131,10 +593,51 @@ Shipped so far (all in `orchestration/`, gitignored):
   use). Caught 1917 + the AFGM/2001/BR trio all needing proxies.
 - **`dval_titles.sh`** rebuilt as the real canonical 74-title list.
 
-Still to build: **A3** `dval_survey_orchestrator.sh` -- replaces searchwalk's
-serial loop with 2 search lanes + a permanent encode lane, consuming
-`prestage-ready` and consulting `dval_route.sh` per title (HIGH->skip,
-MEDIUM->validate4, LOW->full8). Build + shadow-test + cut over from searchwalk.
+Chosen path (post two-pass peer review): **stage it.** Ship the prestage
+pipeline + the shared classify gate + retarget searchwalk now (removes the
+manifest-gap dead time -- the larger half of the projected 2x). Keep the
+two-lane orchestrator built and reviewed but *off* until fleet-idle
+measurement shows the second lane earns its complexity (objective 6:
+parallelism is a stopgap, the router is the real win).
+
+- **`dval_classify.sh`** (new) -- the post-search tri-state gate
+  (clean / searched-degraded / quarantine / fellshort / progressing / infra, H5
+  source-defect probe, fell-short progress guard). Extracted from
+  `dval_searchwalk.sh` -- which now **sources it** (inline copy deleted, -106
+  lines) -- and shared with the orchestrator, so the two drivers cannot diverge
+  (the 2026-09-06 mass-quarantine + the "two file-count gates" finding were both
+  duplicated-gate bugs). Peer-diffed line-by-line: behaviourally identical.
+- **`dval_searchwalk.sh`** -- sources the shared gate; writes
+  `state/search-current` so `dval_prestage_pipeline.sh` knows which title not to
+  build under it; waits for an in-flight prestage build before its destructive
+  local `rm -rf` fallback. Starts the prestage daemon itself, **opt-in via
+  `DVAL_PRESTAGE_AUTO=1`** until the co-run is reviewed.
+- **`dval_prestage_pipeline.sh`** -- `_current_searchwalk_slug` now reads the
+  `state/search-current` primitive (the old log-grep returned empty); fixed the
+  `[ -e glob ]` quarantine check (SC2144).
+- **`dval_research.sh`** -- an explicitly-set `DVAL_RESEARCH_HOSTS` that matches
+  no `HOSTS[]` entry now **exits 3** instead of silently falling back to the
+  whole fleet (which would spill a search lane onto the encode-reserved nodes --
+  review F3).
+- **`dval_survey_orchestrator.sh`** (A3, built + reviewed, **not wired in**) --
+  two per-shot search lanes on fixed disjoint node sets + an encode reservation
+  enforced by omission *and* by lane-list validation against `dval_research.sh`
+  `HOSTS[]` at startup (refuses to run on overlap / unknown host / reserved
+  host). One reap+classify+fill pass per invocation -- no internal drain loop
+  (an earlier "loop until fully drained" version wedged dispatch whenever one
+  title could never be manifested -- review F2). Shadow route consult
+  (`DVAL_ROUTE_ACT=0`). `_settle_counts` revalidates `shot-*.meta` against the
+  manifest's `shot_count=` before classifying (review F4). Drop-in via
+  `DVAL_SEARCH_DRIVER=orchestrator` (default `searchwalk`); `dval_watchdog.sh`
+  recognises either driver. `dryrun` prints the plan and writes nothing.
+
+Two-round peer review (`A3-ORCHESTRATOR-REVIEW.md`): round 1 -> "stage it";
+round 2 verified F1-F8 closed + 8 follow-ups fixed (empty/whitespace lane guard,
+dryrun side-effects, atomic lane + `search-current` writes, `_route_title` stdout
+leak, `_finish_lane` retry cap, `shot_count=` sanitize, `_prestage_building`
+bounded wait). Verdict: the staged set (classify + searchwalk retrofit + prestage
++ research F3) is safe to auto-activate on searchwalk's next pass; the orchestrator
+is clean to wire in after a fleet-idle measurement window.
 
 ### v6.0.4 — long-shot scorer density + large-title search rescue (2026-09-10)
 

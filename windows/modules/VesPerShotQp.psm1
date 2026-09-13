@@ -55,6 +55,68 @@ if (-not (Get-Module -Name VesOrganize)) {
 # only, much tighter than per-shot search staleness.
 $script:VesShotManifestBuildStaleSeconds = 1800
 
+# v6.0.7 (self-management plan, gap 5/1): per-shot phase+deadline marker,
+# the Windows port of ves-per-shot-qp.sh's _shot_phase()/_shot_phase_clear().
+# Lets dval_local_supervisor.ps1 catch a search worker wedged on ONE specific
+# shot instead of waiting out the full VES_CLAIM_TTL (2700s) passive lease
+# expiry. Written under the SAME root dval_worker_encode.ps1's own .phase
+# file already uses ($VesRoot\work\dval\...) -- NOT worker_loop_discovery_
+# multi.ps1's own work\dval-scratch/work\dval-srcstage (confirmed those
+# differ, same naming-convention mismatch already found and worked around on
+# the bash side) -- so dval_local_supervisor.ps1 only needs to know one root
+# for both worker types. Keyed by PID (this process's own $PID, stable for
+# its whole lifetime): a host runs several concurrent search workers on the
+# same slug, one file each.
+function Get-VesDvalPhaseRoot {
+    param([string]$VesRoot = '')
+    if (-not $VesRoot) {
+        if ($env:DVAL_SCRIPT_DIR) { $VesRoot = Split-Path -Parent $env:DVAL_SCRIPT_DIR }
+        if (-not $VesRoot -or -not (Test-Path (Join-Path $VesRoot 'script\modules'))) {
+            $VesRoot = (Get-ChildItem 'D:\' -Directory -Filter 'VES-*' -ErrorAction SilentlyContinue |
+                Where-Object { Test-Path (Join-Path $_.FullName 'script\modules') } |
+                Select-Object -First 1).FullName
+        }
+    }
+    if (-not $VesRoot) { return $null }
+    Join-Path $VesRoot 'work\dval'
+}
+
+# Set by Invoke-VesShotSearchClaimed right after it resolves $idx, read by
+# the $probeQp closure inside Resolve-VesPerShotQp -- same side-channel
+# pattern this module already uses for cross-scope signaling ($State in
+# Start-VesShotSearchBeat), needed here because Resolve-VesPerShotQp has no
+# idx parameter and (per its own header) must stay signature-stable.
+$script:DvalCurShotIdx = $null
+$script:DvalCurShotSlug = $null
+
+function Write-DvalShotPhase {
+    param(
+        [Parameter(Mandatory)][string]$Phase,
+        [int]$TimeoutSec = 300
+    )
+    try {
+        $root = Get-VesDvalPhaseRoot
+        if (-not $root -or -not $script:DvalCurShotSlug) { return }
+        $d = Join-Path (Join-Path $root 'search') $script:DvalCurShotSlug
+        New-Item -ItemType Directory -Path $d -Force -ErrorAction Stop | Out-Null
+        $deadline = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + $TimeoutSec
+        Set-Content -LiteralPath (Join-Path $d "$PID.phase") -Value "$Phase $deadline" -Encoding ascii -ErrorAction Stop
+    } catch { }
+}
+
+# Cleared the instant a claimed shot's work is done -- NOT left to expire on
+# its own (same reasoning as the bash version: a phase file's deadline is
+# only ever refreshed while genuinely active, so leaving it in place after
+# the shot finished risks it lapsing during a later idle-between-claims
+# window and the local supervisor wrongly killing a healthy worker).
+function Clear-DvalShotPhase {
+    try {
+        $root = Get-VesDvalPhaseRoot
+        if (-not $root -or -not $script:DvalCurShotSlug) { return }
+        Remove-Item -LiteralPath (Join-Path (Join-Path (Join-Path $root 'search') $script:DvalCurShotSlug) "$PID.phase") -Force -ErrorAction SilentlyContinue
+    } catch { }
+}
+
 function Assert-VesShotSearchParitySafe {
     <#
     .SYNOPSIS
@@ -1793,6 +1855,7 @@ function Resolve-VesPerShotQp {
     $probeQp = {
         param([int]$Q)
         if ($score.ContainsKey($Q)) { return $true }
+        Write-DvalShotPhase -Phase "search:shot=$($script:DvalCurShotIdx):qp=$Q" -TimeoutSec $(if ($mwActive) { 600 } else { 300 })
         if ($mwActive) {
             $r = Get-VesVmafScoreShotMw -Source $Source -Start $Start -End $End -Qp $Q `
                 -Codec $Codec -Model $Model -Profile $Profile `
@@ -1987,9 +2050,16 @@ function Invoke-VesShotSearchClaimed {
     )
     $mdir = Get-VesShotManifestDir -Source $Source
     $idx = [int]$Claim.Index
+    # v6.0.7 (self-management plan, gap 5/1): arm the per-shot phase marker
+    # for the whole lifetime of this claimed shot -- cleared at every exit
+    # point below, refreshed per-probe inside Resolve-VesPerShotQp.
+    $script:DvalCurShotSlug = Get-VesShotSlug -Source $Source
+    $script:DvalCurShotIdx = $idx
+    Write-DvalShotPhase -Phase "search:shot=${idx}:claim" -TimeoutSec 300
     $shotMetaPath = Join-Path $mdir ("shot-{0:D3}.meta" -f $idx)
     if (-not (Test-Path -LiteralPath $shotMetaPath)) {
         Exit-VesShotClaim -Claim $Claim
+        Clear-DvalShotPhase
         return $false
     }
 
@@ -1998,6 +2068,7 @@ function Invoke-VesShotSearchClaimed {
         $stContent = Get-Content -LiteralPath $statusFile -Raw
         if ((Get-VesShotMetaValue -Content $stContent -Key 'status') -eq 'resolved') {
             Exit-VesShotClaim -Claim $Claim
+            Clear-DvalShotPhase
             return $true
         }
     }
@@ -2083,6 +2154,7 @@ function Invoke-VesShotSearchClaimed {
     )
     Set-VesEveryoneReadWrite -Path $statusFile
     if (-not $DeferRelease) { Exit-VesShotClaim -Claim $Claim }
+    Clear-DvalShotPhase
     return $true
 }
 
@@ -2379,6 +2451,7 @@ Export-ModuleMember -Function `
     Convert-VesFleetPath, Get-VesUtcStamp, Write-VesKvFile, `
     Test-VesShotManifestAllResolved, New-VesShotManifest, `
     Get-VesShotSlug, Test-VesShotClaimRedisMode, Assert-VesShotSearchParitySafe, `
+    Get-VesDvalPhaseRoot, Write-DvalShotPhase, Clear-DvalShotPhase, `
     Start-VesShotSearchBeat, Stop-VesShotSearchBeat, Confirm-VesShotStatusOnNas, `
     Enter-VesShotClaim, Exit-VesShotClaim, `
     Clear-VesShotScratch, Invoke-VesShotSearchWorkerLoop, `
