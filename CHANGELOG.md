@@ -4,6 +4,102 @@ Detailed record of every bug found and fixed during the v5.0.9 → v5.0.28 harde
 passes. The [README](README.md) version table has one line per release; this file
 has the full story — what was wrong, why it mattered, and how it was fixed.
 
+## v6.0.7 — 2026-09-13 (branch `6.x-chunk-redesign`)
+
+**Self-management plan, all 5 gaps shipped and fleet-verified.** Full design:
+search-side phase/deadline parity, load explainability (`topcpu`), SSH-free
+remediation (`dval:killreq`), root-causing aids (auto-trace on next-to-last
+strike, fleet environment audit), and a Windows port of the local-supervisor
+tier for PRINCE/ELVIS. All additive to the existing `dval:hb:node`/
+`dval:hb:work` schema; every consumer tolerates a missing field. Three
+platform-specific bugs found only by testing on real hardware: a
+`VesPerShotQp.psm1` `Export-ModuleMember` omission; `Register-ScheduledTask
+-User` never actually firing on Windows (needs `New-ScheduledTaskPrincipal
+-LogonType S4U`); and a killreq handler reading a shot's `.phase` file
+*after* sending the kill signal, racing the dying process's own last write
+and silently never releasing the shot lease (fixed by reading before killing,
+on both the bash and PowerShell sides).
+
+**PRINCE's Windows load-probe was silently broken since 2026-09-08 -- the
+fleet's single strongest encoder had never once been assigned an encode.**
+`dval_paths.sh`'s `_dval_probe_host` win branch ran a `pwsh -Command "..."`
+string through bash-single-quote -> ssh -> Windows OpenSSH -> pwsh, a
+four-layer quoting chain that silently stripped every `$var` sigil (confirmed
+live: reproducible `ParserError` on both PRINCE and ELVIS). The `2>/dev/null`
+on that call swallowed the error, and the garbled output then failed
+`dval_rank_hosts`' numeric-field regex silently -- so the host was just
+dropped from the ranked candidates, no error anywhere. Zero PRINCE entries in
+`dispatch.log`'s entire history; zero completed titles attributed to it.
+Fixed via `-EncodedCommand` (base64 UTF-16LE), which needs no escaping
+through any of the four layers -- verified live against both hosts, then
+watched PRINCE take and complete its first real encode.
+
+**MJACKSON's desktop-app CPU use was reading as real oversubscription,**
+driving a repeating reserve->drain->launch->DECLINE->cooldown loop even
+though the box had real spare capacity once `chrome`/`firefox`/
+`QtWebEngineProc` yielded priority. Two-part fix in `dval_local_
+supervisor.sh`: reniced matching desktop processes down (`DVAL_DESKTOP_NICE`,
+default 15) every tick -- had to fall back to passwordless sudo since those
+processes run as the interactive desktop user, not the fleet's `worker`
+account -- and published their aggregate CPU as a new `desktopload` heartbeat
+field, subtracted from `nrrun`/`load1` in both `dval_dispatch.sh`'s capacity
+gate and the worker's own preflight decline check (fixing only one side would
+have just moved the false decline to the other). A companion process-name
+prefix-match fix: Linux's `ps -o comm=` truncates to 15 chars, so an
+exact-match desktop-process list silently matched nothing for Chromium's
+`Isolated Web Co`/`Isolated Servic` children -- switched to prefix matching.
+
+**Root-caused a genuine silent hang, distinct from oversubscription:**
+`_sync_result()`/`_sync_status()` (`dval_worker_encode.sh`) were the only two
+`$SHARED`-touching helpers in the whole worker without an outer `timeout` --
+every other rsync call site in this codebase already has one. rsync's own
+`--timeout=N` only bounds an idle *data-transfer socket*; against a wedged
+NAS *mount* it does nothing, since the blocked syscall is `open()`/`stat()`,
+which nothing userspace can rescue. `A Day at the Races` froze silently
+(zero CPU, zero log output) for the full 45min stall window on 4 different
+hosts, every freeze's last log line immediately preceding one of these
+calls. Fixed by wrapping every rsync/cp/touch in both functions with an
+outer `timeout`.
+
+**Three more host-identity mismatches found the same way as `aiprocessor`/
+`AI-PROCESSOR`, each confirmed live via `bash -x`, not assumed:** STING's
+`hostname -s` returns `Sting` (not the fleet's canonical `STING`) and
+AI-PROCESSOR's own local supervisor was *still* silently publishing under
+the lowercase key months into this fix's own existence -- an earlier
+narrow fix only patched one `dval_wreg_count` lookup, not the actual
+`dval:hb:node:${HOST}` publish. Fixed both at the source (correct `$HOST`
+once, at the top of `dval_local_supervisor.sh`) rather than patching every
+read site.
+
+**STING (the fleet's actual ZFS/NAS host) wired into the search-worker
+pool for the first time.** It had every search script already deployed and
+a `WORKERS[STING]=3` sizing entry, but was never actually in `dval_
+research.sh`'s `HOSTS` array -- `reconcile_host` only iterates that list, so
+the sizing entry was dead config, explaining `swk 0` on every fleet-monitor
+check all project history. Verified its load is I/O-wait, not CPU (loadavg
+~9-10 on 10 cores, ~0% aggregate CPU across every process) before adding it
+-- real spare capacity, not a box already busy. Never encodes
+(`DVAL_ENCODE_NEVER_HOSTS`, unchanged).
+
+**`DVAL_MAX_CONCURRENT_ENCODES` raised from a hardcoded 2 to a computed
+value** (`count(PRIMARY hosts)` now / `count(PRIMARY+SPILL)` once
+`SEARCH-COMPLETE`), self-updating if a host is ever added to either pool.
+The 1-encode-per-host and search-XOR-encode-per-host invariants were already
+structurally guaranteed (`BUSY[]`/`PENDING_ENC[]` keyed by hostname,
+`dval:encnode:<host>` `SET NX`) and needed no change -- verified, not
+assumed, before raising the cap.
+
+**Found via a live investigation, not yet fixed:** the frame-index/fps VMAF
+desync-detection+pinning logic `dval_worker_encode.sh`'s `score()` has (this
+same fix, `_TITLE_VMAF_ALIGN`) was never ported to `ves-vmaf-crf-search.sh`
+(the module that actually chooses a variant's CRF) or `ves-per-shot-qp.sh`'s
+per-shot scorer -- both still measure VMAF via a static, unconditional
+`setpts=N` with no fallback. `score()`'s correction runs *after* a variant
+is already encoded; it can report the truth but not retroactively fix a CRF
+chosen against corrupted readings. Root-caused via `10_Cloverfield_Lane`
+(VMAF ~70-77 vs target 94 on every variant, internally consistent/monotonic
+but globally offset low) -- fix + re-survey of affected titles planned next.
+
 ## v6.0.3 — 2026-09-08 (branch `6.x-chunk-redesign`)
 
 **Strength-ordered fleet allocation — coordinator foundation.** First slice of
