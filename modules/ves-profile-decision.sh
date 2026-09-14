@@ -168,7 +168,13 @@ is_oversized_av1() {
   # output that was correctly kept in the first place. Found in team
   # E2E review, 2026-07-20.
   if source_is_upscaled "$orig" 2>/dev/null; then
-    lim="$(effective_upscale_overshoot_pct "$orig_sz")"
+    # v6.0.10 fix (peer review): missing $orig meant this always silently
+    # fell back to the byte-only tier, never the new SD-source resolution
+    # widening -- reintroducing the exact "endless re-encode churn" bug
+    # this whole function exists to prevent, for the specific case (a
+    # genuinely SD source, correctly kept oversized under the wider limit
+    # at encode time) the widening was built for tonight.
+    lim="$(effective_upscale_overshoot_pct "$orig_sz" "$orig")"
   fi
   awk -v o="$orig_sz" -v a="$av1_sz" -v lim="$lim" \
     'BEGIN { if (o <= 0) exit 1; exit !(((a - o) / o) * 100 > lim) }'
