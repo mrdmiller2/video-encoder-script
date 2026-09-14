@@ -572,6 +572,13 @@ These aren't bugs in the script itself — they're host/OS-level things that can
 - **A hostname that resolves an IPv6 address before its IPv4 one**: an IPv4-only `hosts allow` line in `rsyncd.conf` will silently reject the connection, and rsyncd's error message ("Unknown module") looks exactly like a config typo rather than an ACL rejection. If a module works when addressed by IPv4 literal but not by hostname, this is almost certainly why.
 - **macOS's built-in `/usr/bin/rsync`** is often an old `openrsync` build without full daemon/module support — install a current rsync via Homebrew instead. On Apple Silicon, `/usr/local/sbin` may not exist at all (Homebrew uses `/opt/homebrew` exclusively) — create it first if you need to install a hook script there.
 
+This pattern is a lightweight way to keep several independent machines on
+the same script version. It's not the same thing as the full fleet
+**coordinator** system (survey-driven quality targeting, per-title work
+claiming, a production bridge from survey results to real encodes) that
+lives on the `6.x-chunk-redesign` branch under `orchestration/regional-survey/` —
+see [`docs/D-VAL-OPERATIONS.md`](docs/D-VAL-OPERATIONS.md) for that.
+
 ---
 
 ## Storage, mounts, and performance
