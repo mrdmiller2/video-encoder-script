@@ -196,6 +196,22 @@ UPSCALE_OVERSHOOT_SMALL_PCT="${CONVERT_UPSCALE_OVERSHOOT_SMALL_PCT:-100}"
 UPSCALE_OVERSHOOT_MED_MAX_MB="${CONVERT_UPSCALE_OVERSHOOT_MED_MAX_MB:-1200}"
 UPSCALE_OVERSHOOT_MED_PCT="${CONVERT_UPSCALE_OVERSHOOT_MED_PCT:-65}"
 UPSCALE_MAX_OVERSHOOT_PCT="${CONVERT_UPSCALE_MAX_OVERSHOOT_PCT:-50}"
+# v6.0.10 (2026-09-14, found live -- M.A.S.H. S03E11 quarantined at 175MB,
+# 55MB over the SMALL_MAX_MB=120 cutoff, landing it in the 65% tier when its
+# real AV1 result (82.7% growth) would have cleanly passed the 100% tier).
+# The byte-size tiers above model FIXED container/audio/metadata overhead
+# (a real effect: it dominates a small file's overshoot % far more than a
+# large one) -- but they say nothing about how much LARGER the upscale
+# target itself is than the source, which is an orthogonal, equally real
+# driver of size growth. 640x480->1920x1080 (pillarboxed to preserve 4:3) is
+# ~5x more stored pixel area than 720x1080->1920x1080's ~2.25x -- genuinely
+# more bytes are needed to hit the same VMAF target, independent of the
+# ORIGINAL file's byte size. Applied as a MAX against the size-tiered limit
+# (effective_upscale_overshoot_pct, ves-vmaf-crf-search.sh) -- widens the
+# allowance for a source this small, never tightens it below what the byte
+# tier already grants.
+UPSCALE_OVERSHOOT_SD_SOURCE_MAX_HEIGHT="${CONVERT_UPSCALE_OVERSHOOT_SD_SOURCE_MAX_HEIGHT:-480}"
+UPSCALE_OVERSHOOT_SD_SOURCE_PCT="${CONVERT_UPSCALE_OVERSHOOT_SD_SOURCE_PCT:-150}"
 # Already-encoded-source size routing: a small file is already efficient
 # enough that a sample-test isn't worth the time -- skip straight to tagging
 # it "Preexisting Desired Format". Same short-circuit logic for both codecs,
@@ -854,6 +870,7 @@ FF_AV1_HW=""            # best functional hw AV1 encoder (av1_nvenc|av1_qsv|av1_
 FF_HEVC_HW=""           # best functional hw HEVC encoder
 declare -A VMAF_CRF_CACHE=()
 declare -A UPSCALE_TARGET_CACHE=()
+declare -A UPSCALE_SRC_HEIGHT_CACHE=()  # $src -> source display height, populated by resolve_upscale_target
 UPSCALE_TARGET_HEIGHT=0
 declare -A SOURCE_TRAITS_CACHE=()  # $src -> "field_mode=<progressive|telecine|interlaced|ambiguous>;is_bw=<0|1>;field_order=<tff|bff>;frame_rate_mode=<cfr|vfr|unknown>;baseline_vmaf=<N.N>"
 NO_AUTO_DETELECINE=false           # --no-auto-detelecine: detect+log only, never insert IVTC/deinterlace filter

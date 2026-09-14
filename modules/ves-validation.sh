@@ -1540,14 +1540,60 @@ validate_mkv_mkvalidator() {
     rm -f "$errf"
     return 124
   fi
-  if [ "$rc" -ne 0 ] || grep -qE '^[\r]?ERR[0-9A-Fa-f]{3}:' "$errf" 2>/dev/null; then
+  # v6.0.10 ROOT CAUSE FIX (2026-09-14, found live -- M.A.S.H. S03E11
+  # permanently quarantined at the production stage for a defect that
+  # doesn't exist; the user caught it: "the video file plays correctly in
+  # plex, vlc and renders correctly"). ERR0E3 ("output pixels ... seem
+  # wrong NxMpx from WxHpx") is a mkvalidator v0.6.0 FALSE POSITIVE for any
+  # track using Matroska's standard aspect-ratio-mode DisplayWidth/
+  # DisplayHeight (small values like "4"/"3", not pixel counts -- confirmed
+  # via `mkvinfo`: "Display width: 4 / Display height: 3" on this exact
+  # file, a completely valid, spec-legal way to say "4:3 aspect", which
+  # ffprobe (sample_aspect_ratio=1:1, display_aspect_ratio=4:3), VLC, and
+  # Plex all interpret correctly). mkvalidator appears not to fully
+  # implement DisplayUnit=aspect-ratio-mode and compares the raw 4/3
+  # against pixel-scale expectations instead. Reproduced on 2 more
+  # unrelated, known-playable classic titles (M.A.S.H. S01E01: 640x480;
+  # Seinfeld S01E01: 704x528) -- same pattern both times, so this affects
+  # the classic/vintage 4:3 corpus broadly, not one damaged file.
+  #
+  # ERR201 ("Invalid 'X' for profile 'matroska v1'"), found the same night
+  # investigating the SAME Seinfeld file: mkvalidator enforcing a strict
+  # "matroska v1 profile" reading against 3 specific, extremely common
+  # fields (FlagEnabled, CodecDecodeAll on TrackEntry; FlagInterlaced on
+  # Video) that plenty of real-world muxers from this era set routinely.
+  # Verified independently THREE ways before allowlisting, same standard as
+  # ERR0E3: (1) `mkvmerge -J` -- the Matroska Foundation's OWN reference
+  # muxer/identifier, same org that makes mkvalidator -- reports this exact
+  # file as container.recognized=true, container.supported=true, zero
+  # complaints; (2) `ffprobe` reads every stream (video/audio/4 subtitle
+  # tracks) cleanly; (3) real playback in VLC and Plex, confirmed by the
+  # user. Scoped to these 3 specific field names only (not a blanket
+  # "ignore ERR201") -- a future ERR201 on some OTHER field is unverified
+  # and correctly still fails closed. Every OTHER ERR code (any code, any
+  # field) still fails validation exactly as before -- this carves out only
+  # the two patterns verified, with real independent evidence, to be false
+  # positives.
+  tr -d '\r' <"$errf" | grep -E '^ERR[0-9A-Fa-f]{3}:' > "${errf}.codes" 2>/dev/null
+  grep -vE "^ERR0E3:|^ERR201: Invalid '(FlagEnabled|CodecDecodeAll|FlagInterlaced)' for profile 'matroska v1'" \
+    "${errf}.codes" > "${errf}.real" 2>/dev/null
+  # Fail if: any ERR code OTHER than ERR0E3 is present (always fatal, unchanged
+  # from before) -- OR a nonzero exit with NO recognizable ERR-code output at
+  # all (an unknown failure mode, e.g. a crash -- fail closed exactly like the
+  # original code did, not forgiven just because it isn't specifically
+  # ERR0E3). Only the verified-safe case -- rc!=0 with ERR0E3 as the ONLY
+  # structured output -- is treated as non-fatal.
+  if [ -s "${errf}.real" ] || { [ "$rc" -ne 0 ] && [ ! -s "${errf}.codes" ]; }; then
     warn "Validation failed: mkvalidator reported structure errors in $dst"
-    # Show a few ERR lines (strip CR from mkvalidator output)
-    tr -d '\r' <"$errf" | grep -E '^ERR[0-9A-Fa-f]{3}:' | head -20 >&2 || cat "$errf" >&2
-    rm -f "$errf"
+    if [ -s "${errf}.real" ]; then head -20 "${errf}.real" >&2; else cat "$errf" >&2; fi
+    rm -f "$errf" "${errf}.codes" "${errf}.real"
     return 1
   fi
-  rm -f "$errf"
+  if [ -s "${errf}.codes" ]; then
+    local _fp_codes; _fp_codes="$(cut -d: -f1 "${errf}.codes" | sort -u | tr '\n' ',' | sed 's/,$//')"
+    warn "mkvalidator flagged only known false positive(s) [$_fp_codes] in $dst -- not treated as fatal"
+  fi
+  rm -f "$errf" "${errf}.codes" "${errf}.real"
   return 0
 }
 

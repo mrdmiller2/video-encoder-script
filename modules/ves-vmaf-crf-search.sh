@@ -315,18 +315,26 @@ resolve_upscale_target() {
     # fallback instead, same bias as the existing sample-test-failed path.
     if awk -v h="${dh:-0}" 'BEGIN{exit !(h>=540)}'; then decision=1080; else decision=720; fi
     warn "Upscale metrics retrieval failed/timed out — conservative ${decision}p fallback: $src"
-  elif awk -v h="$dh" -v t="$UPSCALE_HEIGHT_THRESHOLD" 'BEGIN{exit !(h>=t)}'; then
-    decision=0
-  elif awk -v h="$dh" 'BEGIN{exit !(h>0&&h<=360)}'; then
-    decision=720
-  elif awk -v b="$bpp" -v t="$UPSCALE_LOW_BPPPF" 'BEGIN{exit !(b>0&&b<t)}'; then
-    decision=720
   else
-    decision="$(upscale_sample_decision "$src" "$dh")" || {
-      # Fail conservatively: favor 1080 near the grace band, 720 for SD.
-      if awk -v h="$dh" 'BEGIN{exit !(h>=540)}'; then decision=1080; else decision=720; fi
-      warn "Upscale sample test unavailable/failed — conservative ${decision}p fallback: $src"
-    }
+    # v6.0.10: cache the source's real display height here (dh confirmed
+    # valid by the check above) -- effective_upscale_overshoot_pct() reads it
+    # back to grant a bigger overshoot allowance to a genuinely SD source
+    # being upscaled all the way to 1080p (~5x pixel-area growth), independent
+    # of the size-tiered allowance based on the original file's byte size.
+    UPSCALE_SRC_HEIGHT_CACHE[$src]="$dh"
+    if awk -v h="$dh" -v t="$UPSCALE_HEIGHT_THRESHOLD" 'BEGIN{exit !(h>=t)}'; then
+      decision=0
+    elif awk -v h="$dh" 'BEGIN{exit !(h>0&&h<=360)}'; then
+      decision=720
+    elif awk -v b="$bpp" -v t="$UPSCALE_LOW_BPPPF" 'BEGIN{exit !(b>0&&b<t)}'; then
+      decision=720
+    else
+      decision="$(upscale_sample_decision "$src" "$dh")" || {
+        # Fail conservatively: favor 1080 near the grace band, 720 for SD.
+        if awk -v h="$dh" 'BEGIN{exit !(h>=540)}'; then decision=1080; else decision=720; fi
+        warn "Upscale sample test unavailable/failed — conservative ${decision}p fallback: $src"
+      }
+    fi
   fi
   UPSCALE_TARGET_CACHE[$src]="$decision"; UPSCALE_TARGET_HEIGHT="$decision"
   case "$decision" in
@@ -356,23 +364,36 @@ source_is_upscaled() {
   [ "$UPSCALE_TARGET_HEIGHT" = 720 ] || [ "$UPSCALE_TARGET_HEIGHT" = 1080 ]
 }
 
-# Size-tiered upscale-overshoot cap (see UPSCALE_OVERSHOOT_* above).
+# Size-tiered upscale-overshoot cap (see UPSCALE_OVERSHOOT_* above), widened
+# by a resolution-aware floor for genuinely SD sources (see
+# UPSCALE_OVERSHOOT_SD_SOURCE_* above and resolve_upscale_target's caching
+# comment) -- $2 (src path) is optional so existing size-only callers still
+# work; the resolution widening simply doesn't apply without it.
 effective_upscale_overshoot_pct() {
-  local orig_sz="$1"
-  local mb=$((orig_sz / 1048576))
+  local orig_sz="$1" src="${2:-}"
+  local mb=$((orig_sz / 1048576)) size_lim
   if [ "$mb" -le "$UPSCALE_OVERSHOOT_SMALL_MAX_MB" ]; then
-    echo "$UPSCALE_OVERSHOOT_SMALL_PCT"
+    size_lim="$UPSCALE_OVERSHOOT_SMALL_PCT"
   elif [ "$mb" -le "$UPSCALE_OVERSHOOT_MED_MAX_MB" ]; then
-    echo "$UPSCALE_OVERSHOOT_MED_PCT"
+    size_lim="$UPSCALE_OVERSHOOT_MED_PCT"
   else
-    echo "$UPSCALE_MAX_OVERSHOOT_PCT"
+    size_lim="$UPSCALE_MAX_OVERSHOOT_PCT"
   fi
+  if [ -n "$src" ] && [ "${UPSCALE_TARGET_HEIGHT:-0}" = 1080 ]; then
+    local sh="${UPSCALE_SRC_HEIGHT_CACHE[$src]:-}"
+    if [ -n "$sh" ] && awk -v h="$sh" -v t="$UPSCALE_OVERSHOOT_SD_SOURCE_MAX_HEIGHT" 'BEGIN{exit !(h>0 && h<=t)}' 2>/dev/null; then
+      awk -v a="$size_lim" -v b="$UPSCALE_OVERSHOOT_SD_SOURCE_PCT" 'BEGIN{print (a>b)?a:b}'
+      return 0
+    fi
+  fi
+  echo "$size_lim"
 }
 
 size_keep_policy_av1() {
   local orig_sz="$1"
   local new_sz="$2"
   local upscaled="${3:-false}"
+  local src="${4:-}"
   local pct lim="$AV1_MAX_OVERSHOOT_PCT"
   if [ "$new_sz" -le "$orig_sz" ]; then
     echo keep
@@ -380,7 +401,7 @@ size_keep_policy_av1() {
   fi
   # Upscale adds pixels — allow more growth than normal, but still cap (size-tiered).
   if [ "$upscaled" = true ]; then
-    lim="$(effective_upscale_overshoot_pct "$orig_sz")"
+    lim="$(effective_upscale_overshoot_pct "$orig_sz" "$src")"
   fi
   pct="$(awk -v o="$orig_sz" -v n="$new_sz" 'BEGIN { if (o<=0) print 100; else print ((n-o)/o)*100 }')"
   if awk -v p="$pct" -v lim="$lim" 'BEGIN { exit !(p>lim) }'; then
@@ -394,13 +415,14 @@ size_keep_policy() {
   local orig_sz="$1"
   local new_sz="$2"
   local upscaled="${3:-false}"
+  local src="${4:-}"
   local pct lim="$SIZE_OVERSHOOT_PCT"
   if [ "$new_sz" -le "$orig_sz" ]; then
     echo keep
     return 0
   fi
   if [ "$upscaled" = true ]; then
-    lim="$(effective_upscale_overshoot_pct "$orig_sz")"
+    lim="$(effective_upscale_overshoot_pct "$orig_sz" "$src")"
   fi
   pct="$(awk -v o="$orig_sz" -v n="$new_sz" 'BEGIN { if (o<=0) print 100; else print ((n-o)/o)*100 }')"
   if awk -v p="$pct" -v lim="$lim" 'BEGIN { exit !(p>lim) }'; then
