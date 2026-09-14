@@ -235,6 +235,75 @@ guide doesn't cover yet:
   independent `resolve_upscale_target` call and has not been exercised
   against the SD-source overshoot-tier fix above — only relevant for
   genuinely long (1h+) SD-upscale titles, untested as of this writing.
+- `resolve_upscale_target()`'s metrics-retrieval-failure fallback branch
+  (`modules/ves-vmaf-crf-search.sh`) never populates
+  `UPSCALE_SRC_HEIGHT_CACHE`, so a title whose *first* metrics probe hits a
+  transient stall runs that one attempt with the byte-only overshoot tier
+  (not the SD-source widening) even if the source really is SD. Self-
+  healing on the next real retry (new process, fresh metrics probe) — not
+  fixed directly since the failure branch exists specifically to avoid
+  additional un-timeout-guarded ffprobe calls on an already-stalled mount.
+- `orchestration/` (the entire fleet-orchestration tree — `dval_dispatch.sh`,
+  `dval_worker_encode.sh`, `dval_finalize.sh`, `dval_redis_failover.sh`,
+  `dval_watchdog.sh`, everything this guide describes running) is listed in
+  `.gitignore` and has never been under version control — only top-level
+  `modules/*.sh` and `convert-v6.0.4.sh` are trackable/committed. Every fix
+  in this section below lives only on disk + whatever fleet hosts have
+  deployed, with no git history/rollback/PR record. Flagged repeatedly to
+  the repo owner; not resolved either way as of this writing — a deliberate
+  decision point, not an oversight.
+
+### 2026-09-14 peer-review pass (v6.0.10)
+
+A 3-agent parallel E2E review of that day's full diff (fingerprint router
+wiring, SD-source overshoot tier, redis HA) found and fixed, same session:
+
+- `dval_worker_encode.sh`: router confirm/disprove read its decision file
+  *after* taking the NX claim (backwards — a transient read failure left
+  the claim stuck for up to 24h); JSON `null` round-tripping through awk as
+  the string `"None"` was silently coerced to `0` instead of failing closed;
+  a DISPROVEN verdict for a non-`base` recommended scheme had no path to
+  ever produce `base`, permanently stranding the title one variant short of
+  done (new `_dval_route_backfill_base()`).
+- `dval_redis_failover.sh`: promotion (`REPLICAOF NO ONE`) result was
+  discarded — a failed promote still wrote the indicator and announced
+  success, silently taking the whole cluster read-only. Now verifies the
+  role actually changed before committing.
+- `dval_redis_failover_sync.sh`: never deployed `modules/ves-telegram.sh`
+  to STING, so `notify_telegram` was never defined there and STING's
+  independent ALERT capability — the entire reason credentials are deployed
+  there — silently no-op'd every time. Fixed + verified live
+  (`declare -F notify_telegram` now resolves on STING).
+- `dval_redis_failback.sh`: promoted RANDYJ to master *before* clearing the
+  shared indicator / cutting STING off as the client-facing target, leaving
+  a real ~1s window where a live write could land on STING and then be
+  silently discarded once STING itself became a replica. Reordered: clear
+  the indicator first (clients fail closed to a rejected write, safely
+  retried) — never promote-then-redirect.
+- `dval_watchdog.sh`: the `redis-down` alert lived entirely inside
+  `if resolved<TOTAL` with no matching else-clear (unlike the structurally
+  identical `reaper-stale` check right below it, which has one) — once a
+  survey pass finished, that alert could never clear or even re-evaluate
+  again for the rest of the pass, regardless of redis's real state.
+- `dval_finalize.sh`: the 4h phase deadline (`DVAL_FINALIZE_PHASE_SECS`)
+  was never extended by verified chunk-parallel progress — a legitimately
+  long multi-chunk title (verified count climbing every pass) still hit
+  "deadline blown: strike" the moment wall-clock crossed 4h, indistinguish-
+  able from a genuinely dead job. Now pushes the deadline out another full
+  window whenever the verified-chunk count actually increases.
+- `dval_finalize_worker.sh`: the stale-attempt collision guard's `kill -9`
+  was never verified to actually succeed before launching a second
+  instance on top of it — a D-state (NFS-wedged) process ignores `kill -9`
+  indefinitely. Now polls for real death and refuses to launch (fails
+  closed, retries next pass) if the old process won't die.
+- `modules/ves-profile-decision.sh`: `is_oversized_av1()` was missing the
+  `$src` arg on its `effective_upscale_overshoot_pct()` call, silently
+  reintroducing byte-only-tier behavior for exactly the SD-upscale case the
+  wider tier was built for that same day (the one trackable fix — see the
+  git log for the full commit).
+- `dval_research.sh`'s `_launch_win()` and `ves_fleet_tmux.sh`'s metadata
+  write both still had the apostrophe-in-single-quotes bug fixed everywhere
+  else earlier that session.
 
 ## Manual production test (bypassing the queue)
 
