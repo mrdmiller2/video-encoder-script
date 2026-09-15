@@ -252,6 +252,37 @@ guide doesn't cover yet:
   deployed, with no git history/rollback/PR record. Flagged repeatedly to
   the repo owner; not resolved either way as of this writing — a deliberate
   decision point, not an oversight.
+- The survey worker tree (`~/VES/*/script-6x/modules/` on each Linux
+  fleet host, what `dval_worker_encode.sh` actually sources) has **no
+  automated sync** — unlike `dval_finalize_sync_fleet.sh` for the
+  production path. Found 2026-09-15 dated Sep 9 on MJACKSON (missing this
+  entire session's fixes); manually pushed as a stopgap. Needs a real
+  `dval_survey_sync_fleet.sh`-style script, not yet built.
+
+### 2026-09-15 upscale policy rework (v6.0.11)
+
+User directive, after investigating why M.A.S.H. S01E01/S02E02 blew the
+size guardrail on both codecs while S03E11 didn't: isolated the cause via
+a same-content/same-CRF native-vs-upscaled A/B test — SD(640x480)->1080p
+cost ~2.9x the bytes of native at matched quality; SD->720p only ~2.25x
+pixel area. `resolve_upscale_target()` (`modules/ves-vmaf-crf-search.sh`)
+is now a plain, total 2-tier rule: `dh<720`→720p target always, `720<=dh<1080`
+→1080p, `dh>=1080`→native. No VMAF sample-test, no bitrate-starved
+exception — those left gaps for odd/non-standard resolutions. The
+already-VES-processed skip is unaffected (upstream of this decision
+entirely). `effective_upscale_overshoot_pct()`'s widening is now computed
+from the *real* pixel-area ratio (actual cached width+height) instead of
+flat height-bucket percentages, so a 240p→720p source gets correspondingly
+more headroom than a 540p→720p one.
+
+**Also found while building this**: `UPSCALE_HEIGHT_THRESHOLD` /
+`UPSCALE_LOW_BPPPF` / `UPSCALE_SAMPLE_SECS` were hardcoded only in
+`convert-v6.0.4.sh`, never in a sourced module — every survey-phase
+variant encode (`dval_worker_encode.sh`, which never touches
+`convert-v6.0.4.sh`) ran with all three unset, silently forcing native
+resolution for every survey encode regardless of real production
+behavior. Moved into `modules/ves-config.sh` so both paths agree — see
+Known gaps above for the remaining fleet-sync gap this exposed.
 
 ### 2026-09-14 peer-review pass (v6.0.10)
 
