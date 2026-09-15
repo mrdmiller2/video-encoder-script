@@ -349,23 +349,61 @@ failure handling.
   yet. Real threshold numbers should wait for a larger KB, or fall back to
   a coarser era-class grouping (vintage/classic/modern) in the meantime.
 
+## Resolved 2026-09-15 (policy decisions + real data)
+
+- **Storage/retention policy: human-driven, not automated.** No cleanup
+  script, no TTL. The human reviews the original/intermediate/final set as
+  part of QC and decides — swap the upscaled version in, or delete the
+  intermediate — per title. The pipeline's job is to keep all three
+  available for that review, not to decide for itself when to clean up.
+- **GPU-pool fairness: real utilization pulled, not assumed.** Live
+  snapshot, 2026-09-15:
+
+  | Host | GPU | Utilization |
+  |---|---|---|
+  | MJACKSON | RTX 5080 | 6% |
+  | MJACKSON | RTX A4500 | 0% |
+  | PRINCE | RTX 4070 Laptop | 0% |
+  | ELVIS | GTX 1650 | 0% |
+  | JJACKSON | RX 7600 | 0% (sysfs `gpu_busy_percent`) |
+
+  Confirms the working assumption: only MJACKSON carries any real current
+  load, and even that is light — PRINCE/ELVIS/JJACKSON are essentially
+  fully idle GPU-wise right now. This changes the fairness picture from
+  "cap Queue B against several contended hosts" to a narrower concern:
+  **the only host where Queue B could plausibly starve Queue A is MJACKSON**
+  (it's both the strongest GPU *and* a dedicated encode-tier host doing
+  real regular-pipeline work). No fairness cap needed on PRINCE/JJACKSON/
+  ELVIS given current load; a cap on MJACKSON specifically is still worth
+  having once Queue B is live, since this is a point-in-time snapshot, not
+  a long-term utilization guarantee.
+
 ## Still open
 
 - **Western-animation bakeoff not run** — no model chosen yet for `wanim-*`.
-- **QTGMC->Real-ESRGAN combined chain not tested** — needs a genuinely
-  interlaced title (M.A.S.H. doesn't qualify, see above); candidates from
-  the vintage-tv bucket (I Spy, Perry Mason, Twilight Zone) haven't been
-  probed yet.
+- **QTGMC->Real-ESRGAN combined chain: conclusively no qualifying candidate
+  in this library right now** — not "haven't looked hard enough." A
+  targeted search (filename patterns `*tvrip*`/`*vhs*`/`*dvdrip*`, 612
+  matches in the Television library alone), a 25-file diverse-show `idet`
+  batch sweep, and 12 direct probes all came back progressive, *including*
+  the strongest possible signal (a literal `[VHSRip]`-tagged Law & Order
+  episode). That one file did show real field-interlace at one sample
+  window (200s: TFF 5 + BFF 8 of 288 frames) but not another (300s: 1 of
+  360) — applying the pipeline's own real classifier thresholds
+  (`ves-source-traits.sh`: `avg_prog>=0.95`->progressive checked first,
+  `avg_interlace>=0.10`->interlaced) to both windows averages to ~97.6%
+  progressive, comfortably above the classifier's own progressive cutoff.
+  **The pipeline itself would never route this file through QTGMC.**
+  Container `field_order` metadata was also checked in bulk but came back
+  `unknown` uniformly (a real limitation of old XviD/AVI files, not
+  evidence either way). Working conclusion, not just a gap: this library
+  appears to have been curated/ripped with IVTC or deinterlacing already
+  applied as standard practice — the QTGMC-chain benefit isn't testable
+  here until a source that actually crosses the 10% threshold turns up.
 - **`target_vmaf=94.0` recalibration** — less urgent now that sharpness is
   confirmed to survive compression, but still an open calibration question:
   whether 94.0 against an AI-sharpened reference maps to the same
   subjective bar as 94.0 against a normal source.
-- **Storage/retention policy** for the 3 kept files per title (original/
-  intermediate/final) is undecided beyond "keep them for now."
-- **GPU-pool fairness cap** — no explicit time-budget limit yet on how much
-  of MJACKSON/PRINCE's capacity Queue B can consume before it's considered
-  to be starving Queue A; currently just "waits if busy," which could still
-  mean long Queue A delays if Queue B backs up.
 - **`ves-pipeline-scan.sh` WORK exclusion** not yet built (see Plex section).
 - **Fleet deployment for the new tooling** (`realesrgan-ncnn-vulkan` binary
   + model files) needs its own sync mechanism to the 4 GPU hosts specifically
