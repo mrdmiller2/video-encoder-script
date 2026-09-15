@@ -309,38 +309,45 @@ resolve_upscale_target() {
   metrics="$(video_display_metrics "$src")"; read -r dw dh fps br bpp <<<"$metrics"
   if [ -z "$dh" ] || ! [[ "$dh" =~ ^[0-9]+(\.[0-9]+)?$ ]] || awk -v h="$dh" 'BEGIN{exit !(h<=0)}'; then
     # Metrics retrieval itself failed or timed out (e.g. a stalled network
-    # mount) — do not fall through to upscale_sample_decision(), which runs
-    # several un-timeout-guarded run_ffmpeg calls against the same source
-    # and could hang indefinitely on the same stall. Conservative height-only
-    # fallback instead, same bias as the existing sample-test-failed path.
-    if awk -v h="${dh:-0}" 'BEGIN{exit !(h>=540)}'; then decision=1080; else decision=720; fi
-    warn "Upscale metrics retrieval failed/timed out — conservative ${decision}p fallback: $src"
+    # mount) -- can't apply the height-tier rule below without a real
+    # height. Conservative fallback: 720p (never skip an upscale outright
+    # just because the probe failed -- the user's directive here is to
+    # capture every sub-1080p source, not risk silently leaving one native).
+    decision=720
+    warn "Upscale metrics retrieval failed/timed out — conservative 720p fallback: $src"
   else
-    # v6.0.10: cache the source's real display height here (dh confirmed
-    # valid by the check above) -- effective_upscale_overshoot_pct() reads it
-    # back to grant a bigger overshoot allowance to a genuinely SD source
-    # being upscaled all the way to 1080p (~5x pixel-area growth), independent
-    # of the size-tiered allowance based on the original file's byte size.
+    # v6.0.11 (2026-09-15, user policy directive, superseding the v6.0.10
+    # VMAF-sample-test design after live measurement on M.A.S.H. S01E01/
+    # S02E02): a plain two-tier height rule, deliberately with NO sample
+    # test and NO bitrate-starved exception -- those both left gaps ("near
+    # 700p" fell through untested; odd/non-standard resolutions like a
+    # 360x244 rip could dodge the old h<=360 special-case and land in a
+    # fuzzy middle band). This rule cannot miss any height:
+    #   dh >= 1080  -> native, already HD, no upscale (decision=0)
+    #   720 <= dh < 1080 -> upscale to 1080p (a source basically already
+    #       at 720p; the 720->1080 jump is the cheaper one -- confirmed
+    #       ~2.25x pixel area vs. ~5x for SD->1080p directly)
+    #   dh < 720 -> upscale to 720p, ALWAYS -- covers every SD and
+    #       sub-SD/odd resolution (540p, 480p, 360p, 240p, non-standard
+    #       crops like 360x244) uniformly, never straight to 1080p.
+    # Cache both dimensions (not just height) -- effective_upscale_overshoot_pct()
+    # needs the real aspect ratio (not an assumed 4:3/16:9) to size the
+    # overshoot allowance correctly for odd/non-standard source shapes.
     UPSCALE_SRC_HEIGHT_CACHE[$src]="$dh"
-    if awk -v h="$dh" -v t="$UPSCALE_HEIGHT_THRESHOLD" 'BEGIN{exit !(h>=t)}'; then
+    UPSCALE_SRC_WIDTH_CACHE[$src]="$dw"
+    if awk -v h="$dh" 'BEGIN{exit !(h>=1080)}'; then
       decision=0
-    elif awk -v h="$dh" 'BEGIN{exit !(h>0&&h<=360)}'; then
-      decision=720
-    elif awk -v b="$bpp" -v t="$UPSCALE_LOW_BPPPF" 'BEGIN{exit !(b>0&&b<t)}'; then
-      decision=720
+    elif awk -v h="$dh" 'BEGIN{exit !(h>=720)}'; then
+      decision=1080
     else
-      decision="$(upscale_sample_decision "$src" "$dh")" || {
-        # Fail conservatively: favor 1080 near the grace band, 720 for SD.
-        if awk -v h="$dh" 'BEGIN{exit !(h>=540)}'; then decision=1080; else decision=720; fi
-        warn "Upscale sample test unavailable/failed — conservative ${decision}p fallback: $src"
-      }
+      decision=720
     fi
   fi
   UPSCALE_TARGET_CACHE[$src]="$decision"; UPSCALE_TARGET_HEIGHT="$decision"
   case "$decision" in
-    0) log "Upscale decision: native (display ${dw}x${dh}, near-720p grace band)" ;;
-    720) log "Upscale decision: 1280x720 (display ${dw}x${dh}, bpppf=$bpp)" ;;
-    1080) log "Upscale decision: 1920x1080 (display ${dw}x${dh}, sample test)" ;;
+    0) log "Upscale decision: native (display ${dw}x${dh}, already >=1080p)" ;;
+    720) log "Upscale decision: 1280x720 (display ${dw}x${dh}, source <720p)" ;;
+    1080) log "Upscale decision: 1920x1080 (display ${dw}x${dh}, source 720p-1079p)" ;;
   esac
 }
 
@@ -365,10 +372,36 @@ source_is_upscaled() {
 }
 
 # Size-tiered upscale-overshoot cap (see UPSCALE_OVERSHOOT_* above), widened
-# by a resolution-aware floor for genuinely SD sources (see
-# UPSCALE_OVERSHOOT_SD_SOURCE_* above and resolve_upscale_target's caching
-# comment) -- $2 (src path) is optional so existing size-only callers still
-# work; the resolution widening simply doesn't apply without it.
+# by a resolution-aware floor computed from the REAL pixel-area ratio
+# between the source and its upscale target -- $2 (src path) is optional so
+# existing size-only callers still work; the resolution widening simply
+# doesn't apply without it.
+#
+# v6.0.11 (2026-09-15, user directive): replaced the earlier two flat
+# height-bucket constants (one PCT for "SD->1080", one for "SD->720") with
+# one continuous formula. Under the new resolve_upscale_target() policy, a
+# 720p target now covers EVERY source under 720p -- 540p, 480p, 360p, a
+# non-standard 240p or 360x244 crop, all the way down -- and a flat percent
+# calibrated against one 640x480 measurement badly under-allows a much
+# smaller source (a 240p->720p upscale is a ~9x pixel-area jump, nearly
+# double 640x480's ~2.25x to the same target) while over-allowing one right
+# at the boundary. Uses the REAL cached width+height (not an assumed 4:3/
+# 16:9) so a genuinely non-standard aspect ratio is sized correctly too.
+#
+# Calibration: the only real live measurement so far (M.A.S.H. S02E02,
+# 640x480, same CRF/content/settings) found SD->1080p (~5.06x pixel area)
+# cost ~2.9x the output bytes of native (i.e. growth% = 191% against a
+# 406%-pixel-area-growth) -- a sub-linear relationship (much of the extra
+# canvas is smooth/interpolated detail that compresses far cheaper per
+# pixel than the original, plus pillarbox bars are nearly free). Modeled
+# as growth% = (pixel_ratio - 1) * 100 * UPSCALE_OVERSHOOT_RATIO_SCALE, with
+# the scale constant fit to that one data point (191/406 ~= 0.47). Applied
+# as a MAX against the byte-size tier, same as before -- this only widens,
+# never tightens, so an inaccurate formula in either direction degrades
+# gracefully: too generous just means occasionally keeping an AV1 output
+# that could've gone x265 instead; too tight just means an unnecessary x265
+# fallback -- neither is a correctness failure, both already have the
+# existing fallback chain as a backstop.
 effective_upscale_overshoot_pct() {
   local orig_sz="$1" src="${2:-}"
   local mb=$((orig_sz / 1048576)) size_lim
@@ -379,10 +412,22 @@ effective_upscale_overshoot_pct() {
   else
     size_lim="$UPSCALE_MAX_OVERSHOOT_PCT"
   fi
-  if [ -n "$src" ] && [ "${UPSCALE_TARGET_HEIGHT:-0}" = 1080 ]; then
-    local sh="${UPSCALE_SRC_HEIGHT_CACHE[$src]:-}"
-    if [ -n "$sh" ] && awk -v h="$sh" -v t="$UPSCALE_OVERSHOOT_SD_SOURCE_MAX_HEIGHT" 'BEGIN{exit !(h>0 && h<=t)}' 2>/dev/null; then
-      awk -v a="$size_lim" -v b="$UPSCALE_OVERSHOOT_SD_SOURCE_PCT" 'BEGIN{print (a>b)?a:b}'
+  local target="${UPSCALE_TARGET_HEIGHT:-0}"
+  if [ -n "$src" ] && { [ "$target" = 720 ] || [ "$target" = 1080 ]; }; then
+    local sw="${UPSCALE_SRC_WIDTH_CACHE[$src]:-}" sh="${UPSCALE_SRC_HEIGHT_CACHE[$src]:-}"
+    if [ -n "$sw" ] && [ -n "$sh" ]; then
+      awk -v sw="$sw" -v sh="$sh" -v th="$target" -v lim="$size_lim" -v k="$UPSCALE_OVERSHOOT_RATIO_SCALE" '
+        BEGIN {
+          if (sw <= 0 || sh <= 0) { print lim; exit }
+          src_area = sw * sh
+          canvas_w = th * 16 / 9
+          ar = sw / sh
+          if (ar <= 16/9) { tgt_w = th * ar; tgt_area = tgt_w * th }
+          else            { tgt_h = canvas_w / ar; tgt_area = canvas_w * tgt_h }
+          ratio = tgt_area / src_area
+          widened = (ratio > 1) ? (ratio - 1) * 100 * k : 0
+          print (widened > lim) ? widened : lim
+        }' 2>/dev/null
       return 0
     fi
   fi

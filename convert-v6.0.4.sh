@@ -1006,11 +1006,13 @@ SUBTITLE_SYNC_TAIL_GAP_PCT=25
 REAL_SUBTITLE_MAP_ARGS=()
 
 # Phase F two-stage SD upscale decision. 0 means native/no upscale.
-UPSCALE_HEIGHT_THRESHOLD=700
-# Midpoint of the independently recommended 0.06-0.07 low-information band:
-# conservative enough to avoid spending 1080p pixels on bitrate-starved SD.
-UPSCALE_LOW_BPPPF=0.065
-UPSCALE_SAMPLE_SECS=10
+# v6.0.11: UPSCALE_HEIGHT_THRESHOLD / UPSCALE_LOW_BPPPF / UPSCALE_SAMPLE_SECS
+# moved to modules/ves-config.sh (sourced above) -- they used to live ONLY
+# here, which meant dval_worker_encode.sh's survey-variant encodes (which
+# source modules/ves-*.sh directly and never touch this script) ran
+# resolve_upscale_target() with all three unset, silently forcing native
+# resolution on every survey encode regardless of the real production
+# decision. See ves-config.sh's own comment for the full story.
 
 
 

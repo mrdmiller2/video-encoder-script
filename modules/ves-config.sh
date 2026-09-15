@@ -196,22 +196,46 @@ UPSCALE_OVERSHOOT_SMALL_PCT="${CONVERT_UPSCALE_OVERSHOOT_SMALL_PCT:-100}"
 UPSCALE_OVERSHOOT_MED_MAX_MB="${CONVERT_UPSCALE_OVERSHOOT_MED_MAX_MB:-1200}"
 UPSCALE_OVERSHOOT_MED_PCT="${CONVERT_UPSCALE_OVERSHOOT_MED_PCT:-65}"
 UPSCALE_MAX_OVERSHOOT_PCT="${CONVERT_UPSCALE_MAX_OVERSHOOT_PCT:-50}"
-# v6.0.10 (2026-09-14, found live -- M.A.S.H. S03E11 quarantined at 175MB,
-# 55MB over the SMALL_MAX_MB=120 cutoff, landing it in the 65% tier when its
-# real AV1 result (82.7% growth) would have cleanly passed the 100% tier).
-# The byte-size tiers above model FIXED container/audio/metadata overhead
-# (a real effect: it dominates a small file's overshoot % far more than a
-# large one) -- but they say nothing about how much LARGER the upscale
-# target itself is than the source, which is an orthogonal, equally real
-# driver of size growth. 640x480->1920x1080 (pillarboxed to preserve 4:3) is
-# ~5x more stored pixel area than 720x1080->1920x1080's ~2.25x -- genuinely
-# more bytes are needed to hit the same VMAF target, independent of the
-# ORIGINAL file's byte size. Applied as a MAX against the size-tiered limit
-# (effective_upscale_overshoot_pct, ves-vmaf-crf-search.sh) -- widens the
-# allowance for a source this small, never tightens it below what the byte
-# tier already grants.
-UPSCALE_OVERSHOOT_SD_SOURCE_MAX_HEIGHT="${CONVERT_UPSCALE_OVERSHOOT_SD_SOURCE_MAX_HEIGHT:-480}"
-UPSCALE_OVERSHOOT_SD_SOURCE_PCT="${CONVERT_UPSCALE_OVERSHOOT_SD_SOURCE_PCT:-150}"
+# v6.0.11 (2026-09-15, user policy directive, superseding v6.0.10's
+# height-bucket design after the M.A.S.H. S01E01/S02E02 investigation):
+# resolve_upscale_target() (ves-vmaf-crf-search.sh) is now a plain 2-tier
+# rule with no exceptions -- dh>=1080 native, 720<=dh<1080 ->1080p,
+# dh<720 ->720p ALWAYS (every SD/sub-SD/odd resolution, never straight to
+# 1080p). Because a 720p target now spans a much wider source range than
+# the old design (540p down through 240p and non-standard crops), the
+# overshoot allowance below is computed from the REAL measured pixel-area
+# ratio (source w*h vs target w*h, real aspect ratio -- not an assumed
+# 4:3/16:9 bucket) rather than a flat per-height-bucket percent, so a
+# 240p->720p source (a much bigger jump than 480p->720p) gets a
+# correspondingly bigger allowance instead of the same flat number.
+# Calibrated from the one real live measurement so far (M.A.S.H. S02E02,
+# 640x480, same CRF/content/settings both ways): SD->1080p (~5.06x pixel
+# area) cost ~2.9x the bytes of native, i.e. growth% (191%) came out to
+# ~0.47x the pixel-area growth% (406%) -- a sub-linear relationship (much
+# of the extra canvas is smooth/interpolated detail, cheap to encode, plus
+# pillarbox bars are nearly free). Applied as a MAX against the byte-size
+# tier above (effective_upscale_overshoot_pct, ves-vmaf-crf-search.sh) --
+# only ever widens, never tightens below what the byte tier already grants.
+UPSCALE_OVERSHOOT_RATIO_SCALE="${CONVERT_UPSCALE_OVERSHOOT_RATIO_SCALE:-0.47}"
+declare -A UPSCALE_SRC_WIDTH_CACHE=()
+# v6.0.11 fix: UPSCALE_HEIGHT_THRESHOLD / UPSCALE_LOW_BPPPF /
+# UPSCALE_SAMPLE_SECS were previously hardcoded ONLY in convert-v6.0.4.sh
+# (never sourced here before this move) -- dval_worker_encode.sh (the real
+# survey-variant encoder) sources modules/ves-*.sh directly and never
+# touches convert-v6.0.4.sh at all, so resolve_upscale_target() ran with
+# all three UNSET for every survey encode: awk coerces the empty string to
+# 0, so a height-threshold check like `h>=UPSCALE_HEIGHT_THRESHOLD` (h>=0)
+# was always true and EVERY survey variant encode silently ran at native
+# resolution, never upscaling -- while real production (convert-v6.0.4.sh,
+# which DID have these) does upscale. The survey's whole premise (predict
+# what production will do) was silently broken for every upscale-eligible
+# title. UPSCALE_HEIGHT_THRESHOLD/UPSCALE_LOW_BPPPF are no longer read by
+# the v6.0.11 rule above (kept only so an old override doesn't error);
+# UPSCALE_SAMPLE_SECS is still used by upscale_sample_decision(), now
+# dead code (no caller) but left in place rather than deleted.
+UPSCALE_HEIGHT_THRESHOLD="${CONVERT_UPSCALE_HEIGHT_THRESHOLD:-700}"
+UPSCALE_LOW_BPPPF="${CONVERT_UPSCALE_LOW_BPPPF:-0.065}"
+UPSCALE_SAMPLE_SECS="${CONVERT_UPSCALE_SAMPLE_SECS:-10}"
 # Already-encoded-source size routing: a small file is already efficient
 # enough that a sample-test isn't worth the time -- skip straight to tagging
 # it "Preexisting Desired Format". Same short-circuit logic for both codecs,
