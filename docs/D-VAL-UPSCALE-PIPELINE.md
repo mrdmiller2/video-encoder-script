@@ -288,29 +288,80 @@ claims, `notify_telegram` for ALERT/RESOLVED-shaped messages. The upscale
 stage is a new *place* strikes/heartbeats apply, not a new *kind* of
 failure handling.
 
-## Known gaps / open items (not yet resolved)
+## Validated 2026-09-15 (real tests, evidence below)
+
+- **Sharper-survives-compression: CONFIRMED.** Built a matched pair — the
+  same M.A.S.H. S02E02 window upscaled to the real 720p pillarbox target
+  two ways (Real-ESRGAN x4plus, and plain lanczos matching current
+  production behavior), both containerized losslessly (x264 `qp=0`), both
+  encoded through a *real* SVT-AV1 pass at CRF 27 (matching what production
+  actually chose for this content) with identical grain-synth settings.
+  Direct crop comparison of the two **final compressed deliverables**
+  (not the lossless intermediates) shows the AI path is still clearly,
+  visibly sharper than the lanczos path after matched-CRF compression —
+  jacket texture, collar edges, fine detail all more defined. VMAF of each
+  final output against its own uncompressed intermediate came out nearly
+  identical (AI 93.89 vs. lanczos 93.87) — both paths preserve a similar
+  *relative* fraction of their own reference under compression, and the
+  AI path's absolute sharpness advantage survives on top of that. This was
+  the single biggest open risk in the whole plan and it resolved
+  favorably.
+- **Temporal-consistency ("flicker") risk: real but modest, now
+  quantified.** Measured adjacent-frame PSNR (a proxy for frame-to-frame
+  consistency) across the same window: native ground truth 30.33dB,
+  lanczos 31.57dB, Real-ESRGAN 29.76dB — the AI path is ~1.8dB less
+  consistent frame-to-frame than lanczos, ~0.6dB less than the real
+  original. Real effect, confirms the concern wasn't theoretical, but it's
+  a modest, *uniform* shift (variance across frame-pairs was actually
+  slightly lower for AI, not spikier) rather than wild per-shot outliers.
+  Informs the confirm-pass design: its anomaly threshold should be tuned
+  to catch shifts meaningfully larger than this ~1.8dB baseline, not flag
+  every shot for a shift this size being normal.
+- **`vsmlrt` (VapourSynth unified-chain path): real compatibility problem
+  found, recommendation revised.** Checked the actual release assets —
+  `vs-mlrt`'s Linux builds are `vsmlrt-cuda` (NVIDIA/CUDA+TensorRT only)
+  or `vsmlrt-hip` (AMD/ROCm only); there is no Vulkan-based Linux build.
+  Unlike the standalone `realesrgan-ncnn-vulkan` binary (already proven
+  working, zero extra runtime dependencies beyond Vulkan, one binary
+  across both vendors), unifying QTGMC+Real-ESRGAN into one VapourSynth
+  filter graph would mean installing a full vendor-specific ML runtime per
+  GPU vendor (CUDA+TensorRT on MJACKSON, ROCm on JJACKSON) — heavy,
+  version-fragile, on top of an already-delicate QTGMC install that
+  deliberately avoids certain modern plugin combinations due to a
+  documented crash history on this fleet. **Revised recommendation: keep
+  the standalone ncnn-vulkan tool.** For interlaced sources, run QTGMC's
+  existing separate output *into* the same frame-extract/upscale/
+  reassemble workflow, rather than fusing them into one filter graph.
+- **M.A.S.H. confirmed NOT interlaced** (idet probe: 359/360 progressive
+  frames, 0 detected interlaced, on a real 15s window) — so it can't be
+  used to validate the QTGMC-chain benefit. That test needs a genuinely
+  interlaced title instead (see below).
+- **Queue C Tier 1 threshold: confirmed peer-relative design is right, but
+  the KB is currently too small to calibrate it.** Pulled the real
+  `pct_src` (base-variant size as % of original) distribution across all
+  18 titles with KB data: ranges from 33% (modern digital sources) to
+  225% (a 1937 vintage upscale) — driven almost entirely by content
+  era/type, not encoding inefficiency. Confirms a single absolute
+  threshold would be wrong (it would flag every vintage/grain title while
+  missing genuinely inefficient modern content) — the per-profile-peer
+  design from the original plan is correct. But with only 18 total KB
+  entries, most profile buckets have 1-2 peers at most, too thin to trust
+  yet. Real threshold numbers should wait for a larger KB, or fall back to
+  a coarser era-class grouping (vintage/classic/modern) in the meantime.
+
+## Still open
 
 - **Western-animation bakeoff not run** — no model chosen yet for `wanim-*`.
-- **QTGMC->Real-ESRGAN combined chain not tested** — unknown how much clean
-  deinterlaced input improves results over raw frames.
-- **Sharper-survives-compression not validated** — the bakeoff measured
-  PNG-to-PNG quality only; unconfirmed the sharpness holds up after a real
-  VMAF-targeted SVT-AV1/x265 encode, which could preferentially erode fine
-  AI-invented detail under bitrate pressure.
-- **`target_vmaf=94.0` recalibration** — calibrated against normal-source
-  content; whether the same number means the same subjective bar against an
-  AI-sharpened reference is unverified.
-- **`vsmlrt` (VapourSynth Real-ESRGAN plugin) compatibility unverified** —
-  the existing QTGMC install deliberately avoids certain modern plugin
-  combinations (`akarin`) due to a documented crash history on this fleet;
-  whether `vsmlrt` is safe alongside the pinned install needs a real test.
-- **Scene-detection drift under AI upscale not measured** — the confirm-pass
-  design (above) is the mitigation, but its actual trigger thresholds need
-  real data from a test run to calibrate.
+- **QTGMC->Real-ESRGAN combined chain not tested** — needs a genuinely
+  interlaced title (M.A.S.H. doesn't qualify, see above); candidates from
+  the vintage-tv bucket (I Spy, Perry Mason, Twilight Zone) haven't been
+  probed yet.
+- **`target_vmaf=94.0` recalibration** — less urgent now that sharpness is
+  confirmed to survive compression, but still an open calibration question:
+  whether 94.0 against an AI-sharpened reference maps to the same
+  subjective bar as 94.0 against a normal source.
 - **Storage/retention policy** for the 3 kept files per title (original/
   intermediate/final) is undecided beyond "keep them for now."
-- **Queue C's Tier 1/2 thresholds** ("how bloated is bloated") need real
-  numbers derived from the KB's actual bpppf distribution, not assumed.
 - **GPU-pool fairness cap** — no explicit time-budget limit yet on how much
   of MJACKSON/PRINCE's capacity Queue B can consume before it's considered
   to be starving Queue A; currently just "waits if busy," which could still
