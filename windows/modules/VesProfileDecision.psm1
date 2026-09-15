@@ -434,61 +434,43 @@ function Test-VesIsDiskSource {
 function Resolve-VesUpscaleTarget {
     <#
     .SYNOPSIS
-    Port of resolve_upscale_target()'s fast paths (native/near-720p grace
-    band, SD-native, low-bpppf). Returns 0 (no upscale), 720, or 1080.
-    When none of the fast paths apply, a genuine sample-encode-based
-    decision (upscale_sample_decision, not ported) would normally run --
-    this falls back to the bash version's OWN documented conservative
-    default for that case (1080 near the grace band, 720 for SD) rather
-    than inventing new behavior.
+    Port of resolve_upscale_target() -- v6.0.11 policy (2026-09-15 user
+    directive, D-VAL-UPSCALE-PIPELINE.md), NOT the earlier sample-test-based
+    design this function used to mirror. Superseded: the bash side dropped
+    the VMAF-sample-test entirely in favor of one flat, total height rule
+    with no exceptions (found to leave gaps for odd/non-standard
+    resolutions). This port was stale relative to that change until now --
+    found while building Windows parity for the upscale pipeline
+    (2026-09-15) -- a real, separate parity gap from the Queue B worker
+    itself. Returns 0 (no upscale), 720, or 1080:
+      height >= 1080        -> 0 (native)
+      720 <= height < 1080  -> 1080
+      height < 720          -> 720, ALWAYS (every SD/sub-SD/odd
+                                resolution -- 540p, 480p, 360p, 240p,
+                                non-standard crops -- never straight to
+                                1080p)
     #>
     param(
         [Parameter(Mandatory)][string]$Source,
-        [Parameter(Mandatory)][string]$FfprobePath,
-        [int]$HeightThreshold = 700,
-        [double]$LowBpppf = 0.065
+        [Parameter(Mandatory)][string]$FfprobePath
     )
     if (Test-VesIsDiskSource -Source $Source) { return 0 }
 
     $height = 0
-    $bpppf = 0.0
     try {
         $h = Invoke-VesProfileFfprobe -FfprobePath $FfprobePath -ProbeArgs @('-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=height', '-of', 'default=noprint_wrappers=1:nokey=1', $Source)
         if ($h) { $height = [int]$h.Trim() }
     } catch { }
 
     if ($height -le 0) {
-        Write-Warning "Upscale metrics retrieval failed/timed out -- conservative fallback: $Source"
+        # Metrics retrieval failed -- conservative fallback per the bash
+        # version's own comment: never skip an upscale outright just
+        # because the probe failed.
+        Write-Warning "Upscale metrics retrieval failed/timed out -- conservative 720p fallback: $Source"
         return 720
     }
-    if ($height -ge $HeightThreshold) { return 0 }
-    if ($height -gt 0 -and $height -le 360) { return 720 }
-
-    # bpppf needs bitrate/fps too -- if those probes fail, fall through to
-    # the same conservative default the bash version uses when the sample
-    # test itself is unavailable/fails.
-    try {
-        $brOut = Invoke-VesProfileFfprobe -FfprobePath $FfprobePath -ProbeArgs @('-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=bit_rate', '-of', 'default=noprint_wrappers=1:nokey=1', $Source)
-        $fpsOut = Invoke-VesProfileFfprobe -FfprobePath $FfprobePath -ProbeArgs @('-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=avg_frame_rate', '-of', 'default=noprint_wrappers=1:nokey=1', $Source)
-        $br = 0.0
-        if ($brOut -and $brOut.Trim() -match '^\d+$') { $br = [double]$brOut.Trim() }
-        $fpsNum = 0.0
-        if ($fpsOut -match '^(\d+)/(\d+)$' -and [double]$Matches[2] -gt 0) { $fpsNum = [double]$Matches[1] / [double]$Matches[2] }
-        $widthOut = Invoke-VesProfileFfprobe -FfprobePath $FfprobePath -ProbeArgs @('-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width', '-of', 'default=noprint_wrappers=1:nokey=1', $Source)
-        $width = if ($widthOut) { [double]$widthOut.Trim() } else { 0 }
-
-        if ($br -gt 0 -and $width -gt 0 -and $height -gt 0 -and $fpsNum -gt 0) {
-            $bpppf = $br / ($width * $height * $fpsNum)
-        }
-    } catch { }
-
-    if ($bpppf -gt 0 -and $bpppf -lt $LowBpppf) { return 720 }
-
-    if ($height -ge 540) {
-        Write-Warning "Upscale sample test unavailable (not ported) -- conservative 1080p fallback: $Source"
-        return 1080
-    }
-    Write-Warning "Upscale sample test unavailable (not ported) -- conservative 720p fallback: $Source"
+    if ($height -ge 1080) { return 0 }
+    if ($height -ge 720) { return 1080 }
     return 720
 }
 
