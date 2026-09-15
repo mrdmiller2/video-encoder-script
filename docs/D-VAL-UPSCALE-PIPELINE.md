@@ -6,10 +6,10 @@ is the single source of truth for the design — implementation follows it,
 and it's kept updated as the build evolves (matching the standing-update
 convention already used for [D-VAL-OPERATIONS.md](D-VAL-OPERATIONS.md)).
 Core mechanisms (sidecar/resolve/tagging/triage/tool availability on all 4
-GPU hosts) are live-smoke-tested against real files; a full end-to-end
-~5hr title through the whole chain has not been run yet. See "Known gaps"
-at the end for exactly what's still open, including no PowerShell port
-yet for the PRINCE/ELVIS Windows GPU hosts.
+GPU hosts, **including the Windows port for PRINCE/ELVIS**) are
+live-smoke-tested against real files; a full end-to-end ~5hr title through
+the whole chain has not been run yet. See "Known gaps" at the end for
+exactly what's still open.
 
 ## Why this exists
 
@@ -461,13 +461,38 @@ zero-byte), already-done detection, WORK-dir + `.plexignore` creation,
 model/scale-filter selection, and the realesrgan tool itself on all 4 GPU
 hosts — all against real files/hardware, not just syntax-checked.
 
+**Windows parity (PRINCE/ELVIS), also built and live-verified**:
+`windows/modules/DvalUpscaleLib.psm1` (PowerShell port of
+`dval_upscale_lib.sh`, native `ConvertTo-Json`/`ConvertFrom-Json` instead
+of the bash side's python3 subprocess for the sidecar), a
+`dval_upscale_worker.ps1` mirroring `dval_worker_encode.ps1`'s own
+conventions (`Convert-VesFleetPath`, the encnode mutex, S4U-scheduled-task
+detached execution), and `dval_win_launch.ps1`/`dval_win_encode_ctl.ps1`
+extended with an `upscale` mode alongside their existing `search`/`encode`
+ones. Two real, separate parity gaps found and closed along the way, not
+just the missing worker script itself:
+- `Resolve-VesUpscaleTarget` (`VesProfileDecision.psm1`) was still running
+  the *old* (pre-v6.0.11) VMAF-sample-test-based policy — the bash side
+  moved to the flat height-only rule days before this, and the PS port had
+  silently fallen behind. Fixed to match exactly.
+- **MKVToolNix wasn't installed on either Windows GPU host at all** —
+  `mkvpropedit.exe`/`mkvmerge.exe` didn't exist there, so no Windows
+  process could ever have written a `VES_UPSCALED` (or, for that matter, a
+  `VES_PROCESSED`) tag. Installed v75.0.0 to `D:\VES-PRINCE\tools\bin` and
+  `D:\VES-ELVIS\tools\bin`.
+
+A third bug surfaced only by testing the *real* tag write-then-read
+round-trip, not just each half in isolation: the first `Test-DvalUpscaledTagPresent`
+used `mkvmerge -J` to read the tag back, but `mkvmerge -J`'s `global_tags`
+field only reports a count (`{"num_entries": N}`), never the actual tag
+content — it always returned false even immediately after a verified
+successful write. Fixed to use `ffprobe`'s `format_tags` read instead,
+matching the bash side's real mechanism; confirmed live afterward
+(write → read now correctly round-trips, including the version-prefix
+match). Full sidecar/resolve/triage/tag suite re-verified on both PRINCE
+and ELVIS.
+
 **Real gaps found during the build, not yet closed**:
-- **No PowerShell port for PRINCE/ELVIS.** Both Windows GPU hosts have the
-  tool deployed (confirmed working), but `dval_upscale_worker.ps1` doesn't
-  exist — Queue B can only actually dispatch to MJACKSON/JJACKSON today.
-  `dval_dispatch.sh`'s upscale-dispatch loop detects this (no connection
-  entry for a Windows host in its lookup) and skips rather than fails, but
-  it means half the GPU pool is currently inert.
 - **The upscale-dispatch subshell can't see the main loop's real-time
   encode backlog** (it runs in a separate subshell forked before that
   value is computed each pass) — its floater-busy check always reads as
