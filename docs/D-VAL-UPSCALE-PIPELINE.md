@@ -1,0 +1,339 @@
+# D-val Upscale Pipeline — Design Doc
+
+Status: **design confirmed, not yet built** (as of 2026-09-15). This document
+is the single source of truth for the design — implementation should follow
+it, and it should be kept updated if the design changes during the build
+(matching the standing-update convention already used for
+[D-VAL-OPERATIONS.md](D-VAL-OPERATIONS.md)).
+
+## Why this exists
+
+Investigating why M.A.S.H. S01E01/S02E02 blew the production size guardrail
+on both AV1 and x265 (see `D-VAL-OPERATIONS.md`'s v6.0.11 changelog entry)
+led to a live A/B measurement: upscaling SD content straight to 1080p costs
+~2.9x the output bytes of native at matched quality, vs. ~2.25x for SD->720p
+— which is why the resolution policy was revised (v6.0.11: SD always caps at
+a 720p target, never straight to 1080p). That same investigation opened a
+second question: since any interpolation-based upscale (lanczos) necessarily
+*softens* the image (it invents no new detail, just spreads existing pixels
+over more area), should this pipeline instead target genuinely *sharper*
+output using AI super-resolution (Real-ESRGAN), accepting that it trades
+strict fidelity-to-source for perceptual quality? A real bakeoff (M.A.S.H.
+S02E02, downscale-then-reconstruct methodology, VMAF against real ground
+truth) confirmed the tradeoff is real: Real-ESRGAN scored *lower* on VMAF
+(75.7 vs. lanczos's 92.3) despite being **visibly sharper and more detailed**
+on direct crop comparison — a well-documented property of GAN-based
+super-resolution (the "perception-distortion tradeoff"). Given the stated
+goal is a sharper *look*, not strict pixel fidelity to a soft SD source, this
+pipeline is worth building.
+
+The real cost: ~0.48s/frame on an RTX 5080 for the AI upscale pass alone —
+roughly **5 hours per 25-minute episode** before the final encode even
+starts. That cost is the reason this is its own pipeline stage with its own
+GPU-aware scheduling, not a filter swapped into the existing default path.
+
+## Architecture overview: 3 queues
+
+Every title gets triaged, cheaply, before the expensive manifest+search
+phase starts:
+
+- **Queue A — no upscale needed** (source already >=1080p). Highest
+  priority. Unchanged from the current pipeline in every respect.
+- **Queue B — needs upscale** (source <1080p). Medium priority for the
+  *shared* GPU hosts; guaranteed baseline throughput via one reserved
+  floater host regardless of what else is queued.
+- **Queue C — already AV1** (checked last, lowest priority). Covers both
+  this pipeline's own past output *and* third-party AV1 files that entered
+  the library pre-encoded. A tiered, cheap-first check decides whether a
+  full re-survey is even worth attempting.
+
+This is a scheduling/ordering overlay on the existing `dval_dispatch.sh`
+loop, not three separate pipelines — Queue A's processing is completely
+unchanged; Queue B and C add pre-stages in front of the same existing
+survey+production machinery.
+
+## Flow diagram
+
+```mermaid
+flowchart TD
+    T[Title enters triage] --> C{Codec probe +\nresolve_upscale_target}
+    C -->|already AV1| QC[Queue C: already-AV1]
+    C -->|height >= 1080p| QA[Queue A: no upscale]
+    C -->|height < 1080p| QB[Queue B: needs upscale]
+
+    QA --> SURVEY[Existing search + 8-variant survey + quality gate]
+    SURVEY --> PROD[Production encode]
+
+    QC --> T0{Tier 0: VES_PROCESSED tag\npresent + not drifted?}
+    T0 -->|yes, current| SKIP[Skip — leave alone]
+    T0 -->|no tag, or drifted| T1{Tier 1: bpppf vs.\nKB peer distribution}
+    T1 -->|efficient already| SKIP
+    T1 -->|looks bloated| T2{Tier 2: 2-3 sample windows,\npaired AV1/x265 probe}
+    T2 -->|no real predicted gain| SKIP
+    T2 -->|meaningful predicted gain| T3[Tier 3: full 8-variant survey]
+    T3 --> PROD
+
+    QB --> TAGCHK{VES_UPSCALED tag\nalready present?}
+    TAGCHK -->|yes| SURVEY2[Skip re-upscale,\nsrc already redirected]
+    TAGCHK -->|no| ROUTE[Route to GPU pool\nfloater first, then shared]
+    ROUTE --> DEINT{Genuinely\ninterlaced?}
+    DEINT -->|yes| QTGMC[QTGMC deinterlace\nves-qtgmc.sh]
+    DEINT -->|no| MODEL
+    QTGMC --> MODEL{Select model\nby profile}
+    MODEL -->|live-action| RE1[realesrgan-x4plus]
+    MODEL -->|anime| RE2[realesrgan-x4plus-anime /\nanimevideov3]
+    MODEL -->|western animation| RE3[TBD — needs its own bakeoff]
+    RE1 --> CONTAINERIZE[Containerize: lossless x264\nqp=0, preset ultrafast]
+    RE2 --> CONTAINERIZE
+    RE3 --> CONTAINERIZE
+    CONTAINERIZE --> TAGWRITE[Write VES_UPSCALED tag\n+ sidecar JSON src-redirect]
+    TAGWRITE --> CONFIRM[Confirm pass: recompute\nper-shot complexity on\nexisting manifest boundaries,\ncheck for AI temporal drift]
+    CONFIRM --> SURVEY2
+    SURVEY2 --> SURVEY3[Survey targets VMAF against\nthe upscaled intermediate,\nnot the raw original]
+    SURVEY3 --> PROD2[Production encode ->\nfinalUS.mkv]
+```
+
+## Queue B detail
+
+### Pre-check
+Before anything else: does the title's sidecar JSON (see below) already
+show a `VES_UPSCALED` stage? If so, skip straight to survey using the
+already-redirected `src` — never re-upscale.
+
+### GPU-aware routing and scheduling
+Upscale work is restricted to the fleet's 4 GPU-capable hosts, confirmed
+live 2026-09-15:
+
+| Host | GPU(s) | Tier |
+|---|---|---|
+| MJACKSON | RTX 5080 + RTX A4500 (NVIDIA) | Strong — measured ~0.48s/frame |
+| PRINCE | RTX 4070 Laptop (NVIDIA) | Strong |
+| JJACKSON | Radeon RX 7600 (AMD) | Mid |
+| ELVIS | GTX 1650 (NVIDIA, 4GB) | Weak — entry-level, avoid for full episodes |
+
+Non-GPU hosts (AI-PROCESSOR, LAYTOYAJ, STING, RANDYJ, MARLONJ) are excluded
+entirely — a CPU/software-Vulkan fallback technically exists but is
+impractically slow.
+
+**Priority**: Queue A (non-upscale) is the highest priority in the whole
+system. Queue B is medium priority on the *shared* GPU hosts (MJACKSON,
+PRINCE, ELVIS in this design) — it waits if one of those is busy with
+higher-priority work. But **one GPU host is a dedicated upscale floater**
+so there's always guaranteed baseline throughput for Queue B regardless of
+what else is queued: **JJACKSON**, chosen because it's *already* the
+existing encode-tier floater in `dval_paths.sh`'s strength-tiered model
+(`DVAL_ENCODE_TIER_FLOATER`) — extending its existing 2-state
+survey/encode logic to a 3rd (upscale) state is the lowest-risk fit, not a
+new mechanism. When Queue B is empty, JJACKSON reverts to its current
+encode/survey behavior exactly as today — the floater is dynamic, not a
+permanently siloed machine.
+
+Tool choice: `realesrgan-ncnn-vulkan` specifically (not a CUDA/PyTorch
+build) — it's Vulkan-based and works across both NVIDIA and AMD hardware
+via one binary, required given the fleet mixes both vendors.
+
+### Deinterlace-first for genuinely interlaced sources
+If a title's `field_mode` is confidently `interlaced`, route through the
+existing QTGMC/VapourSynth chain (`modules/ves-qtgmc.sh`, already proven
+live on MJACKSON) *before* the AI upscale step, rather than feeding raw
+interlaced frames to the upscaler. **Not yet validated how much this
+helps** — flagged as an open item below.
+
+### Model selection by content profile
+| Profile bucket | Model |
+|---|---|
+| Classic/vintage TV, movies, concerts, standup (live-action) | `realesrgan-x4plus` |
+| Anime / Japanese animation (`anime-*`, `anime-modern-*`) | `realesrgan-x4plus-anime` or `realesr-animevideov3` |
+| Western animation (`wanim-*`) | **Undecided — needs its own bakeoff.** Neither the live-action nor the Japanese-anime-tuned model is a confident fit (different texture: film grain, painted backgrounds, thicker linework). |
+
+### Containerizing the upscale output
+Real-ESRGAN outputs a sequence of lossless PNG frames. Reassemble with
+**lossless x264** (`ffmpeg -c:v libx264 -preset ultrafast -qp 0`) — see
+rationale above: mathematically lossless, fast (no rate-control search),
+fully standard/compatible with every other ffmpeg/ffprobe operation this
+pipeline already does, and keeps the total lossy-generation count at 2
+(source, final encode) instead of 3.
+
+### Source redirect: sidecar JSON
+Given a source `/path/Title (Year)/Title (Year).ext`, a same-named sidecar
+`/path/Title (Year)/Title (Year).json` redirects consumers to the WORK
+subfolder:
+
+```json
+{
+  "stage": "pending | upscaled | surveying | final",
+  "method": "realesrgan-x4plus-720p | realesrgan-x4plus-anime-720p | lanczos-720p | ...",
+  "intermediate": "/path/Title (Year)/WORK/Title (Year)-intUS.mkv",
+  "final": "/path/Title (Year)/WORK/Title (Year)-finalUS.mkv",
+  "created_utc": "...",
+  "updated_utc": "..."
+}
+```
+
+Every consumer (searchwalk, dispatch, worker_encode, finalize,
+finalize_worker) resolves through one new helper, e.g.
+`_dval_resolve_src(path)`, which checks for the sidecar and returns the
+redirected path if present — resolved fresh every call, never a cached or
+mutated copy of `dval_titles.sh`'s static entries. This avoids the
+half-migrated-state risk of trying to atomically rewrite state across
+manifests/fingerprints/KB/redis.
+
+**Retention**: original source, upscaled intermediate, and final encode are
+all deliberately kept for comparison. No cleanup policy defined yet — a
+real, ongoing storage cost, not free. Temp PNG frame dumps used *during*
+processing (distinct from the 3 retained files) do need their own cleanup
+and are not part of the retention decision.
+
+### Reusing the existing shot manifest, plus a confirm pass
+Upscaling doesn't change duration or frame count, so the existing shot/cut
+*boundaries* (timestamps) from the original search should still be valid —
+full scene redetection is not needed. But frame-independent AI upscalers
+(Real-ESRGAN included) are a known source of frame-to-frame **temporal
+flicker** in fine hallucinated detail, which could corrupt per-shot
+complexity/motion scoring even though cut *locations* never move. The
+confirm pass is scoped narrowly to that specific risk: recompute just the
+per-shot complexity signal on the upscaled version at the existing boundary
+timestamps, compare against the original's per-shot signal, flag anomalous
+shifts. Not a full re-search.
+
+### Re-entering survey
+Once tagged and confirmed, the title re-enters the normal 8-variant survey
++ quality gate — unchanged machinery, just pointed at the upscaled
+intermediate (via the sidecar redirect) instead of the raw original. This
+is also the mechanism that makes "sharper is the goal" actually work: VMAF
+targets are now measured against the sharpened intermediate, not the
+original soft source, so the CRF search isn't fighting the sharpening.
+**Not yet validated** that the sharper look survives a real VMAF-targeted
+compression pass — see open items.
+
+## Queue C detail: already-AV1 improvability check
+
+Covers two sub-cases with different available evidence:
+- **This pipeline's own past output** — has KB/tag history, can compare
+  against a recorded original.
+- **Third-party AV1** (entered the library pre-encoded) — no `VES_PROCESSED`
+  tag, no original to compare against, only the file itself as evidence.
+
+A tiered, cheapest-first escalation, each tier only running if the previous
+one didn't resolve the question:
+
+- **Tier 0 (near-free, metadata only)**: `VES_PROCESSED` tag present and
+  current (via the existing `mkv_ves_tag_tools_drifted()` version-drift
+  check)? Skip entirely. Third-party files have no tag, so they always fall
+  through to Tier 1 — this is expected, not a failure.
+- **Tier 1 (cheap, ffprobe only, no decode)**: compute real bits-per-pixel-
+  per-frame from container metadata, compare against the KB's existing
+  distribution of real bpppf values for similar profile/content-type
+  (already have this data across 190+ titles' `outcomes/*.json`). Bloated
+  relative to peers -> continue; already efficient -> skip.
+- **Tier 2 (minutes, 2-3 sample windows)**: reuse
+  `find_complexity_sample_points()` plus a paired AV1-vs-x265 sample encode
+  (same style as the existing `upscale_sample_decision()`), extrapolate
+  size/VMAF, compare against the file's real numbers. This is the only tier
+  that can actually answer "would x265 beat this AV1" — no metadata
+  shortcut exists for that question.
+- **Tier 3 (expensive)**: the full 8-variant survey, only if Tier 2 showed
+  a real predicted improvement.
+
+## Tagging
+
+Two tags, same underlying `_mkv_write_single_tag()`-style embed (Matroska
+`<Simple>` tag via mkvpropedit), no collision risk since they land on three
+separate physical files:
+
+- `VES_PROCESSED` (existing, unchanged) — on the final encoded output.
+- `VES_UPSCALED` (new) — on the WORK-dir intermediate, records which
+  method/model produced it (e.g. `"VES ${VERSION} Upscaled -
+  realesrgan-x4plus-720p"`) so a future model change (e.g. after the
+  western-animation bakeoff lands) can identify which existing intermediates
+  used an outdated method and are candidates for redo — mirrors
+  `mkv_ves_tag_tools_drifted()`'s existing drift-detection pattern.
+
+## Plex exclusion
+
+The intermediate keeps the source's original file extension (it's upscaled,
+not yet encoded to AV1/x265), so Plex has no natural way to distinguish it
+from real content without an explicit exclude. Directory-level exclusion via
+`.plexignore` (gitignore-style glob, natively supported by Plex), not a
+filename regex:
+
+- The pipeline writes a `.plexignore` file containing `*` as the **first**
+  action when creating a title's `WORK/` folder — before any real content
+  lands in it, closing the race where a scan could discover a file before
+  the exclusion exists.
+- One-time manual backstop: a `.plexignore` at each Plex library root (e.g.
+  `/mnt/BigMomma/Media/`, `/mnt/BabyBear/Media/`) with a recursive pattern
+  like `**/WORK/`, covering any `WORK/` folder even outside this pipeline's
+  own code path.
+- Separately, **not yet built**: `ves-pipeline-scan.sh`'s own recursive
+  library scan has no exclusion for `WORK/` either — needs the same
+  treatment as the existing `.AV1.mkv`/`.x265.mkv` derived-output exclusion,
+  or the scanner will mistake intermediates for new unconverted source.
+
+## Monitoring / tracking
+
+Unchanged from the existing, working scheme — no new mechanism. Small
+tracking/dedup artifacts (status, heartbeat, stage markers, "already
+notified" flags) go through redis, matching the v6.0.9 redis-native state
+migration already in place everywhere else in this pipeline. Verbose raw
+output (ffmpeg/`realesrgan-ncnn-vulkan` progress logs) stays as files, same
+as `dval_encode_<slug>_<host>.log` does today — redis isn't a log
+aggregator, and nothing else in this pipeline uses it that way.
+
+## Failure/retry
+
+Reuses the existing model exactly — no new mechanism: `DVAL_MAX_STRIKES`-style
+strike/quarantine, the existing heartbeat-renewal pattern for host mutex
+claims, `notify_telegram` for ALERT/RESOLVED-shaped messages. The upscale
+stage is a new *place* strikes/heartbeats apply, not a new *kind* of
+failure handling.
+
+## Known gaps / open items (not yet resolved)
+
+- **Western-animation bakeoff not run** — no model chosen yet for `wanim-*`.
+- **QTGMC->Real-ESRGAN combined chain not tested** — unknown how much clean
+  deinterlaced input improves results over raw frames.
+- **Sharper-survives-compression not validated** — the bakeoff measured
+  PNG-to-PNG quality only; unconfirmed the sharpness holds up after a real
+  VMAF-targeted SVT-AV1/x265 encode, which could preferentially erode fine
+  AI-invented detail under bitrate pressure.
+- **`target_vmaf=94.0` recalibration** — calibrated against normal-source
+  content; whether the same number means the same subjective bar against an
+  AI-sharpened reference is unverified.
+- **`vsmlrt` (VapourSynth Real-ESRGAN plugin) compatibility unverified** —
+  the existing QTGMC install deliberately avoids certain modern plugin
+  combinations (`akarin`) due to a documented crash history on this fleet;
+  whether `vsmlrt` is safe alongside the pinned install needs a real test.
+- **Scene-detection drift under AI upscale not measured** — the confirm-pass
+  design (above) is the mitigation, but its actual trigger thresholds need
+  real data from a test run to calibrate.
+- **Storage/retention policy** for the 3 kept files per title (original/
+  intermediate/final) is undecided beyond "keep them for now."
+- **Queue C's Tier 1/2 thresholds** ("how bloated is bloated") need real
+  numbers derived from the KB's actual bpppf distribution, not assumed.
+- **GPU-pool fairness cap** — no explicit time-budget limit yet on how much
+  of MJACKSON/PRINCE's capacity Queue B can consume before it's considered
+  to be starving Queue A; currently just "waits if busy," which could still
+  mean long Queue A delays if Queue B backs up.
+- **`ves-pipeline-scan.sh` WORK exclusion** not yet built (see Plex section).
+- **Fleet deployment for the new tooling** (`realesrgan-ncnn-vulkan` binary
+  + model files) needs its own sync mechanism to the 4 GPU hosts specifically
+  — ties into the already-logged, separate gap that the survey-worker tree
+  has no automated sync at all (see `D-VAL-OPERATIONS.md`'s Known gaps).
+
+## Recommended build sequence
+
+1. `.plexignore` write-on-WORK-creation + `ves-pipeline-scan.sh` WORK
+   exclusion (self-contained, no dependencies, closes a real bug risk).
+2. Triage classifier (3-queue sort, cheap, reuses `resolve_upscale_target()`).
+3. Sidecar JSON + `_dval_resolve_src()` redirect resolver — everything else
+   depends on this being right.
+4. `VES_UPSCALED` tag write/check functions (sibling of the existing
+   `VES_PROCESSED` ones).
+5. GPU-pool routing + JJACKSON floater wiring into the existing
+   `dval_paths.sh` strength-tiered model.
+6. Live-action upscale path end-to-end (tool deploy, lossless containerize,
+   confirm pass, survey re-entry) — validate on M.A.S.H. before generalizing.
+7. Queue C tiered check.
+8. Western-animation bakeoff + QTGMC-chain test — resolve before wiring
+   those specific profile branches.

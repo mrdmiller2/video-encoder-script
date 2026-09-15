@@ -6,6 +6,10 @@ sits in front of `convert-v6.0.4.sh` — not the standalone single-machine
 `convert-v6.0.4.sh` usage, which is documented via its own `--help` and the
 main [README](../README.md).
 
+The AI-upscale pre-processing stage (3-queue triage, GPU-pool scheduling,
+Real-ESRGAN integration) is designed but not yet built — see
+[D-VAL-UPSCALE-PIPELINE.md](D-VAL-UPSCALE-PIPELINE.md) for that design.
+
 ## What this system is
 
 Two halves, one pipeline:
