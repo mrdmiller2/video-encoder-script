@@ -1,10 +1,15 @@
 # D-val Upscale Pipeline — Design Doc
 
-Status: **design confirmed, not yet built** (as of 2026-09-15). This document
-is the single source of truth for the design — implementation should follow
-it, and it should be kept updated if the design changes during the build
-(matching the standing-update convention already used for
-[D-VAL-OPERATIONS.md](D-VAL-OPERATIONS.md)).
+Status: **built and deployed, feature-gated off by default** (as of
+2026-09-15, v6.0.12 — `DVAL_UPSCALE_ENABLE=1` to turn it on). This document
+is the single source of truth for the design — implementation follows it,
+and it's kept updated as the build evolves (matching the standing-update
+convention already used for [D-VAL-OPERATIONS.md](D-VAL-OPERATIONS.md)).
+Core mechanisms (sidecar/resolve/tagging/triage/tool availability on all 4
+GPU hosts) are live-smoke-tested against real files; a full end-to-end
+~5hr title through the whole chain has not been run yet. See "Known gaps"
+at the end for exactly what's still open, including no PowerShell port
+yet for the PRINCE/ELVIS Windows GPU hosts.
 
 ## Why this exists
 
@@ -430,10 +435,57 @@ a genuinely anime-appropriate use case cares about throughput.
   whether 94.0 against an AI-sharpened reference maps to the same
   subjective bar as 94.0 against a normal source.
 - **`ves-pipeline-scan.sh` WORK exclusion** not yet built (see Plex section).
-- **Fleet deployment for the new tooling** (`realesrgan-ncnn-vulkan` binary
-  + model files) needs its own sync mechanism to the 4 GPU hosts specifically
-  — ties into the already-logged, separate gap that the survey-worker tree
-  has no automated sync at all (see `D-VAL-OPERATIONS.md`'s Known gaps).
+- **Fleet deployment for the new tooling**: RESOLVED — `dval_upscale_tools_sync.sh`
+  built and run; `realesrgan-ncnn-vulkan` confirmed live via Vulkan on all
+  4 GPU hosts (MJACKSON/PRINCE: NVIDIA, JJACKSON: AMD RX 7700S via RADV,
+  ELVIS: NVIDIA GTX 1650).
+
+## Built 2026-09-15 (v6.0.12) — what shipped and what's still open
+
+Implemented per this doc: `dval_upscale_lib.sh` (sidecar read/write,
+`_dval_resolve_src`, triage, model selection, GPU-pool/floater),
+`dval_upscale_worker.sh` (Queue B execution), `dval_upscale_confirm.py`
+(the confirm pass), `dval_queue_c_check.sh` (the tiered already-AV1
+check), `dval_upscale_tools_sync.sh` (fleet tool deploy), the
+`VES_UPSCALED` tag pair in `modules/ves-validation.sh`, WORK/ exclusion
+in `modules/ves-sharded-scan.sh` + a `.plexignore` write-first on WORK/
+creation, and `_dval_resolve_src()` wired into
+`dval_dispatch.sh`/`dval_searchwalk.sh`/`dval_worker_encode.sh`/
+`dval_finalize_worker.sh`. Feature-gated behind `DVAL_UPSCALE_ENABLE`
+(default 0) — off means byte-identical dispatch behavior to before this
+shipped.
+
+**Verified live**: sidecar write/read/resolve round-trip (including the
+fail-safe-to-original behavior when the target file is missing or
+zero-byte), already-done detection, WORK-dir + `.plexignore` creation,
+model/scale-filter selection, and the realesrgan tool itself on all 4 GPU
+hosts — all against real files/hardware, not just syntax-checked.
+
+**Real gaps found during the build, not yet closed**:
+- **No PowerShell port for PRINCE/ELVIS.** Both Windows GPU hosts have the
+  tool deployed (confirmed working), but `dval_upscale_worker.ps1` doesn't
+  exist — Queue B can only actually dispatch to MJACKSON/JJACKSON today.
+  `dval_dispatch.sh`'s upscale-dispatch loop detects this (no connection
+  entry for a Windows host in its lookup) and skips rather than fails, but
+  it means half the GPU pool is currently inert.
+- **The upscale-dispatch subshell can't see the main loop's real-time
+  encode backlog** (it runs in a separate subshell forked before that
+  value is computed each pass) — its floater-busy check always reads as
+  "not busy." Not a correctness bug (the encnode mutex claim is the real
+  safety net; a genuine conflict is declined, not silently double-booked)
+  but it means the floater-reservation logic is currently a best-effort
+  approximation, not a precise read of real contention.
+- **A full end-to-end run has not been executed** — every mechanism piece
+  (sidecar, tagging, triage, tool availability) is live-verified in
+  isolation, but no title has actually gone through the whole ~5hr chain
+  (extract -> upscale -> reassemble -> tag -> confirm -> survey ->
+  production) start to finish yet. That's the natural next validation
+  step before flipping `DVAL_UPSCALE_ENABLE=1` for real.
+- **Queue C's `dval_queue_c_check.sh` Tier 2** does a real short-clip
+  dual-codec sample encode (not just a metadata inference) but hasn't been
+  run against a real already-AV1 file yet — logic is sound and reuses
+  proven `resolve_crf_for_encode`/sample-extraction machinery, but
+  untested end-to-end.
 
 ## Recommended build sequence
 
