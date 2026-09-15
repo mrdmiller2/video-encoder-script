@@ -28,6 +28,13 @@ MULTIPART_PART_REGEX='^(.*[^ ._-])[ ._-]*([Pp][Aa][Rr][Tt]|[Pp][Tt]|[Cc][Dd]|[Dd
 # lettered phases never invalidate a file already tagged by the same major line.
 VES_TAG_NAME="VES_PROCESSED"
 VES_MAJOR="${VERSION%%.*}"
+# v6.0.12 (D-VAL-UPSCALE-PIPELINE.md): separate tag NAME, not a different
+# value under VES_TAG_NAME -- these two tags live on different physical
+# files (the WORK-dir upscale intermediate vs. the final encoded output),
+# so there's no collision, but using a distinct Simple/Name keeps a stray
+# manual mkvpropedit inspection unambiguous about which stage produced
+# which tag.
+VES_UPSCALE_TAG_NAME="VES_UPSCALED"
 SEARCH_PATH="."
 DRY_RUN=false
 DO_ORGANIZE=true

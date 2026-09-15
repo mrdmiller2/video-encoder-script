@@ -417,6 +417,11 @@ _xml_escape() {
 # block above profile_svt_params for the probe/caching functions.
 _mkv_write_single_tag() {
   local f="$1" tag_value="$2"
+  # v6.0.12: optional 3rd arg, defaults to VES_TAG_NAME so every existing
+  # call site (2 args) behaves byte-identically to before -- lets
+  # write_ves_upscaled_tag() below reuse this instead of duplicating the
+  # mkvpropedit/XML plumbing for a second tag NAME.
+  local tag_name="${3:-$VES_TAG_NAME}"
   [ -f "$f" ] || return 0
   [ ! -L "$f" ] || { warn "Refusing to tag — $f is a symlink (possible race)"; return 0; }
 
@@ -432,7 +437,7 @@ _mkv_write_single_tag() {
   <Tag>
     <Targets></Targets>
     <Simple>
-      <Name>${VES_TAG_NAME}</Name>
+      <Name>${tag_name}</Name>
       <String>${tag_value}</String>
     </Simple>
   </Tag>
@@ -445,6 +450,33 @@ XML
     warn "Failed to write VES tag: $f"
   fi
   rm -f "$tagfile"
+}
+
+# Cheap, tag-only check mirroring mkv_ves_tag_present() above but for the
+# upscale-intermediate marker -- same "survives renames/moves, embedded in
+# the container" rationale. Used by Queue B's pre-check (also backed by
+# the sidecar JSON's own stage field -- this is the durability fallback if
+# the sidecar itself is ever lost, matching this codebase's existing
+# "second, defense-in-depth skip signal" pattern).
+mkv_ves_upscale_tag_present() {
+  local f="$1"
+  case "${f,,}" in *.mkv) ;; *) return 1 ;; esac
+  [ -f "$f" ] || return 1
+  run_ffprobe -v error -show_entries "format_tags=${VES_UPSCALE_TAG_NAME}" \
+    -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null | grep -qF "VES ${VES_MAJOR}."
+}
+
+# Writes the upscale-intermediate marker onto the WORK-dir file --
+# $1=intermediate mkv path, $2=method string (e.g.
+# "realesrgan-x4plus-720p", "lanczos-720p") recorded verbatim so a future
+# model change can identify which existing intermediates used an outdated
+# method (mirrors mkv_ves_tag_tools_drifted()'s existing drift-detection
+# pattern for the production tag).
+write_ves_upscaled_tag() {
+  local mkv="$1" method="$2"
+  [ -f "$mkv" ] || return 0
+  [ ! -L "$mkv" ] || { warn "Refusing to tag — $mkv is a symlink (possible race)"; return 0; }
+  _mkv_write_single_tag "$mkv" "VES ${VERSION} Upscaled - ${method}" "$VES_UPSCALE_TAG_NAME"
 }
 
 write_ves_processed_tag() {

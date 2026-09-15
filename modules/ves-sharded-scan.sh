@@ -79,7 +79,7 @@ get_scan_roots() {
       if name_glob_matches "$base" "$NAME_GLOB"; then
         _roots+=("$shard")
       fi
-    done < <(find "$SEARCH_PATH" -mindepth "$depth" -maxdepth "$depth" -type d -not -name 'ffmpeg-logs' -not -name 'Deferred' -not -name '.*' 2>/dev/null | LC_ALL=C sort)
+    done < <(find "$SEARCH_PATH" -mindepth "$depth" -maxdepth "$depth" -type d -not -name 'ffmpeg-logs' -not -name 'Deferred' -not -name 'WORK' -not -name '.*' 2>/dev/null | LC_ALL=C sort)
 
     if [ "${#_roots[@]}" -eq 0 ]; then
       err "No directories under $SEARCH_PATH match name-glob '$NAME_GLOB' (shard-depth=$depth)"
@@ -93,7 +93,7 @@ get_scan_roots() {
     return 0
   fi
 
-  # -not -name 'ffmpeg-logs' -not -name 'Deferred' -not -name '.*': this
+  # -not -name 'ffmpeg-logs' -not -name 'Deferred' -not -name 'WORK' -not -name '.*': this
   # script's own sidecar dirs (ffmpeg-logs/ for per-title stderr logs,
   # .convert-v5-filecache/ and any other hidden dir for caches/flags) plus
   # Deferred/ (where flag_bad_source_for_human parks files for a human --
@@ -106,11 +106,16 @@ get_scan_roots() {
   # "0 video(s)" on the next run. Deferred/ needs the same exclusion for a
   # different reason: without it, a deferred file would be silently
   # rediscovered and reprocessed on every subsequent scan instead of staying
-  # parked for a person to look at.
+  # parked for a person to look at. WORK/ (v6.0.12, D-VAL-UPSCALE-PIPELINE.md)
+  # holds the AI-upscale intermediate/final files, which keep the SOURCE's
+  # original extension (not yet encoded to AV1/x265) -- without this
+  # exclusion the scanner would mistake an in-progress upscale intermediate
+  # for a brand-new, unconverted source file sitting right next to the real
+  # one it was derived from.
   while IFS= read -r shard; do
     [ -n "$shard" ] || continue
     _roots+=("$shard")
-  done < <(find "$SEARCH_PATH" -mindepth "$SHARD_DEPTH" -maxdepth "$SHARD_DEPTH" -type d -not -name 'ffmpeg-logs' -not -name 'Deferred' -not -name '.*' 2>/dev/null | LC_ALL=C sort)
+  done < <(find "$SEARCH_PATH" -mindepth "$SHARD_DEPTH" -maxdepth "$SHARD_DEPTH" -type d -not -name 'ffmpeg-logs' -not -name 'Deferred' -not -name 'WORK' -not -name '.*' 2>/dev/null | LC_ALL=C sort)
 
   if [ "${#_roots[@]}" -eq 0 ]; then
     _roots=("$SEARCH_PATH")
@@ -251,7 +256,7 @@ find_videos_under() {
   local -a pred=()
   build_find_video_pred pred
   find "$root" -type f "${pred[@]}" \
-    ! -iname '*.AV1.mkv' ! -iname '*.x265.mkv' ! -path '*/Deferred/*' 2>/dev/null
+    ! -iname '*.AV1.mkv' ! -iname '*.x265.mkv' ! -path '*/Deferred/*' ! -path '*/WORK/*' 2>/dev/null
 }
 
 find_convert_videos_under() {
@@ -278,7 +283,7 @@ find_videos_at_root() {
 
 find_isos_under() {
   local root="$1"
-  find "$root" -type f -iname '*.iso' ! -path '*/Deferred/*' 2>/dev/null
+  find "$root" -type f -iname '*.iso' ! -path '*/Deferred/*' ! -path '*/WORK/*' 2>/dev/null
 }
 
 find_isos_at_root() {
@@ -288,7 +293,7 @@ find_isos_at_root() {
 
 find_bluray_roots_under() {
   local root="$1"
-  find "$root" -type d -name BDMV ! -path '*/Deferred/*' 2>/dev/null | while IFS= read -r bdmv; do
+  find "$root" -type d -name BDMV ! -path '*/Deferred/*' ! -path '*/WORK/*' 2>/dev/null | while IFS= read -r bdmv; do
     [ -n "$bdmv" ] || continue
     dirname "$bdmv"
   done | LC_ALL=C sort -u
@@ -342,7 +347,7 @@ root = sys.argv[1]
 # changed -- exclude them here too, and prune descent into them entirely
 # since nothing under them is ever relevant to this cache.
 SKIP_PATTERNS = (
-    'Deferred', '.convert-stage-*', '.convert-multipart-*',
+    'Deferred', 'WORK', '.convert-stage-*', '.convert-multipart-*',
     '.convert-finalize-*', '.convert-streamopt-*', '.convert-hbprog-*',
 )
 def is_skip(name):
@@ -412,11 +417,11 @@ find_convert_videos_under_cached() {
   build_find_video_pred pred
 
   while IFS= read -r d; do [ -n "$d" ] && subdirs+=("$d"); done \
-    < <(find "$root" -mindepth 1 -maxdepth 1 -type d ! -name 'Deferred' ! -name '.*' 2>/dev/null | LC_ALL=C sort)
+    < <(find "$root" -mindepth 1 -maxdepth 1 -type d ! -name 'Deferred' ! -name 'WORK' ! -name '.*' 2>/dev/null | LC_ALL=C sort)
 
   if [ "${#subdirs[@]}" -eq 0 ]; then
     while IFS= read -r f; do [ -n "$f" ] && raw+=("$f"); done \
-      < <(find "$root" -type f "${pred[@]}" ! -path '*/Deferred/*' 2>/dev/null)
+      < <(find "$root" -type f "${pred[@]}" ! -path '*/Deferred/*' ! -path '*/WORK/*' 2>/dev/null)
     [ "${#raw[@]}" -eq 0 ] || printf '%s\n' "${raw[@]}"
     return 0
   fi
@@ -435,7 +440,7 @@ find_convert_videos_under_cached() {
       mark_folder_inprogress "$d"
       local -a sub_files=()
       while IFS= read -r f; do [ -n "$f" ] && sub_files+=("$f"); done \
-        < <(find "$d" -type f "${pred[@]}" ! -path '*/Deferred/*' 2>/dev/null)
+        < <(find "$d" -type f "${pred[@]}" ! -path '*/Deferred/*' ! -path '*/WORK/*' 2>/dev/null)
       filecache_put "$d" sub_files
       raw+=("${sub_files[@]}")
     fi
