@@ -144,7 +144,7 @@ helps** — flagged as an open item below.
 |---|---|
 | Classic/vintage TV, movies, concerts, standup (live-action) | `realesrgan-x4plus` |
 | Anime / Japanese animation (`anime-*`, `anime-modern-*`) | `realesrgan-x4plus-anime` or `realesr-animevideov3` |
-| Western animation (`wanim-*`) | **Undecided — needs its own bakeoff.** Neither the live-action nor the Japanese-anime-tuned model is a confident fit (different texture: film grain, painted backgrounds, thicker linework). |
+| Western animation (`wanim-*`) | `realesrgan-x4plus` (live-action model) — see below, resolved 2026-09-15. |
 
 ### Containerizing the upscale output
 Real-ESRGAN outputs a sequence of lossless PNG frames. Reassemble with
@@ -378,9 +378,34 @@ failure handling.
   having once Queue B is live, since this is a point-in-time snapshot, not
   a long-term utilization guarantee.
 
+## Resolved 2026-09-15: western-animation bakeoff
+
+Ran the full proven methodology (downscale/reconstruct/VMAF-vs-ground-truth
++ visual crops) against The Black Cauldron (1985), testing both candidate
+models — real result, not assumed:
+
+| Method | VMAF vs. real ground truth |
+|---|---|
+| `realesrgan-x4plus` (live-action) | **77.09** |
+| `realesrgan-x4plus-anime` | 73.27 |
+| lanczos baseline | 94.08 |
+
+Visual crop comparison makes the *why* obvious and decisive, not just the
+number: on flat color areas (a character's sleeve, painted background),
+both native and the live-action model preserve the real film-grain texture
+authentic to hand-painted cels shot on film — the anime model erases it
+completely, leaving flat, plasticky, posterized color. The anime model is
+trained on clean digital anime and treats real film grain as noise to
+denoise away, actively destroying legitimate source texture rather than
+enhancing it — exactly the wrong-tool failure mode this bakeoff existed to
+catch. **`realesrgan-x4plus` (live-action) is the correct model for
+`wanim-*`, not a third undecided case.** Bonus finding: the anime model
+processed the same frame count roughly 1.8x faster (78s vs. 140s for 241
+frames) — irrelevant here since it's the wrong model, but worth knowing if
+a genuinely anime-appropriate use case cares about throughput.
+
 ## Still open
 
-- **Western-animation bakeoff not run** — no model chosen yet for `wanim-*`.
 - **QTGMC->Real-ESRGAN combined chain: conclusively no qualifying candidate
   in this library right now** — not "haven't looked hard enough." A
   targeted search (filename patterns `*tvrip*`/`*vhs*`/`*dvdrip*`, 612
@@ -424,5 +449,7 @@ failure handling.
 6. Live-action upscale path end-to-end (tool deploy, lossless containerize,
    confirm pass, survey re-entry) — validate on M.A.S.H. before generalizing.
 7. Queue C tiered check.
-8. Western-animation bakeoff + QTGMC-chain test — resolve before wiring
-   those specific profile branches.
+8. Western-animation branch wiring (`realesrgan-x4plus`, model choice now
+   resolved — no longer a blocker). QTGMC-chain integration deferred, not
+   blocking: no qualifying interlaced source currently exists in the
+   library to build/validate it against; revisit if one turns up.
