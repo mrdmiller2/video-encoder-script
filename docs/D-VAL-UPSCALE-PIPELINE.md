@@ -440,6 +440,40 @@ a genuinely anime-appropriate use case cares about throughput.
   4 GPU hosts (MJACKSON/PRINCE: NVIDIA, JJACKSON: AMD RX 7700S via RADV,
   ELVIS: NVIDIA GTX 1650).
 
+## Resolved 2026-09-15: real-time encode backlog, visible to all via redis
+
+The upscale-dispatch floater-busy check's "always reads as not busy"
+limitation is closed, and — found while fixing it — it wasn't actually
+Queue-B-specific: `dval_dispatch.sh`'s own pre-existing encode-tier floater
+logic (`dval_active_encode_hosts`, unrelated to this whole upscale
+feature) referenced `"${_ENCODE_BACKLOG:-0}"` as if it were shared with
+`dval_finalize.sh`'s process — it never was (two separate processes), so
+that logic has silently evaluated against 0 since it was written, not
+just in the new subshell.
+
+Real fix, user-directed ("visible to all via redis"): `dval_finalize.sh`
+(the sole real computor of `_ENCODE_BACKLOG`/`_SURVEY_BACKLOG`, once per
+its own pass) now publishes both to redis (`dval:backlog:encode`,
+`dval:backlog:survey`, 300s TTL — a crashed/stalled `dval_finalize.sh`
+degrades to "unknown -> 0" within 5 minutes rather than serving a stale
+number forever, same fail-safe posture as everything else in this
+floater model). Two new reader functions in `dval_paths.sh`
+(`dval_get_encode_backlog`/`dval_get_survey_backlog`) try whichever
+redis-read primitive the calling script actually has sourced — `_ves_redis`
+(portable, no `redis-cli` dependency, what fleet workers use) or
+`_dval_state_r` (`redis-cli`-based, coordinator/RANDYJ-only, what
+`dval_dispatch.sh` uses since it deliberately doesn't source
+`ves-dval-claim-lib.sh` — see that file's own header comment on why) —
+so the same two functions work correctly regardless of which script
+calls them, not just within this upscale feature. Both dispatch call
+sites (the pre-existing encode-tier one and the new Queue-B one) now go
+through these instead of a same-process variable.
+
+Live-verified end-to-end: wrote via `_ves_redis` (dval_finalize.sh's real
+mechanism), read back correctly via both `_ves_redis` and `_dval_state_r`
+(simulating dval_dispatch.sh's actual context), confirmed real values
+round-trip in both directions, not just syntax-checked.
+
 ## Built 2026-09-15 (v6.0.12) — what shipped and what's still open
 
 Implemented per this doc: `dval_upscale_lib.sh` (sidecar read/write,
@@ -493,13 +527,6 @@ match). Full sidecar/resolve/triage/tag suite re-verified on both PRINCE
 and ELVIS.
 
 **Real gaps found during the build, not yet closed**:
-- **The upscale-dispatch subshell can't see the main loop's real-time
-  encode backlog** (it runs in a separate subshell forked before that
-  value is computed each pass) — its floater-busy check always reads as
-  "not busy." Not a correctness bug (the encnode mutex claim is the real
-  safety net; a genuine conflict is declined, not silently double-booked)
-  but it means the floater-reservation logic is currently a best-effort
-  approximation, not a precise read of real contention.
 - **A full end-to-end run has not been executed** — every mechanism piece
   (sidecar, tagging, triage, tool availability) is live-verified in
   isolation, but no title has actually gone through the whole ~5hr chain
